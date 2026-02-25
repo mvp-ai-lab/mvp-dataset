@@ -14,8 +14,13 @@ def map_samples[T, U](data: Iterable[T], fn: Callable[[T], U]) -> Iterator[U]:
 
 
 def _pop_random[T](buffer: list[T], rng: random.Random) -> T:
+    # O(1) removal: swap picked slot with the last slot, then pop tail.
+    # This keeps shuffle semantics while avoiding O(n) middle-pop cost.
     index = rng.randrange(len(buffer))
-    return buffer.pop(index)
+    picked = buffer[index]
+    buffer[index] = buffer[-1]
+    buffer.pop()
+    return picked
 
 
 def shuffle_samples[T](

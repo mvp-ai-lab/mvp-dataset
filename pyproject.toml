@@ -3,7 +3,7 @@ requires = ["hatchling>=1.25.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "mm-loader"
+name = "mvp-dataset"
 version = "0.1.0"
 description = "Maintainable and extensible multimodal data loading core"
 readme = "README.md"
