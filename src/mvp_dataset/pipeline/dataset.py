@@ -23,12 +23,7 @@ from ..core.types import (
 from ..sources import iter_jsonls, iter_tars
 from ..utils.sharding import iter_items
 from ..utils.url import normalize_paths
-from .ops import (
-    batch_samples,
-    map_samples,
-    shuffle_samples,
-    unbatch_samples,
-)
+from .ops import batch_samples, map_samples, shuffle_samples, unbatch_samples
 
 SourceKind = Literal["jsonl", "tars"]
 SourceStore = list[str] | list[Sample] | list[GroupedSample]
@@ -98,16 +93,10 @@ class Dataset(torch_iterabledataset_class()):
                         try:
                             parsed = json.loads(line)
                         except json.JSONDecodeError as exc:
-                            msg = (
-                                "[InvalidJsonLine] "
-                                f"file={file!r} line={i + 1} reason={exc.msg}"
-                            )
+                            msg = f"[InvalidJsonLine] file={file!r} line={i + 1} reason={exc.msg}"
                             raise ValueError(msg) from exc
                         if not isinstance(parsed, dict):
-                            msg = (
-                                "[InvalidJsonSample] "
-                                f"file={file!r} line={i + 1} expected object row"
-                            )
+                            msg = f"[InvalidJsonSample] file={file!r} line={i + 1} expected object row"
                             raise ValueError(msg)
                         sample: Sample = dict(parsed)
                         sample["__index_in_file__"] = i
@@ -122,10 +111,7 @@ class Dataset(torch_iterabledataset_class()):
             source_kind = "tars"
             source_shape = "tar_paths"
         else:
-            msg = (
-                "[InvalidSourceType] all inputs must be .jsonl or all must be .tar, "
-                f"got={normalized_shards!r}"
-            )
+            msg = f"[InvalidSourceType] all inputs must be .jsonl or all must be .tar, got={normalized_shards!r}"
             raise ValueError(msg)
 
         return cls(

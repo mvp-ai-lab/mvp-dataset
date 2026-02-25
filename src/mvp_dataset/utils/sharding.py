@@ -25,10 +25,7 @@ def iter_items[T](
 
     ordered_base = list(items)
     if len(ordered_base) == 0:
-        msg = (
-            "[InsufficientItemsForSlot] "
-            f"items=0 total_slots={context.total_slots} slot={context.slot}"
-        )
+        msg = f"[InsufficientItemsForSlot] items=0 total_slots={context.total_slots} slot={context.slot}"
         raise ValueError(msg)
 
     slot = context.slot

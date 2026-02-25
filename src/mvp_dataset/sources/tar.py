@@ -115,11 +115,7 @@ def _require_sample_key(sample: Sample, *, shard_path: PathLikeStr, source_name:
 
     key = sample.get("__key__")
     if not isinstance(key, str):
-        msg = (
-            "[InvalidSampleKey] "
-            f"source={source_name!r} shard={str(shard_path)!r} "
-            "sample missing string '__key__'"
-        )
+        msg = f"[InvalidSampleKey] source={source_name!r} shard={str(shard_path)!r} sample missing string '__key__'"
         raise ValueError(msg)
     return key
 
@@ -152,8 +148,7 @@ def iter_tars(
         # Build one iterator per sidecar alongside the main iterator.
         main_iter = iter_tar(shard_path, key_dot_level=key_dot_level)
         sidecar_iters: list[tuple[str, Iterator[Sample]]] = [
-            (name, iter_tar(fn(shard_path), key_dot_level=key_dot_level))
-            for name, fn in sidecars
+            (name, iter_tar(fn(shard_path), key_dot_level=key_dot_level)) for name, fn in sidecars
         ]
         all_iters = [main_iter, *(it for _, it in sidecar_iters)]
 

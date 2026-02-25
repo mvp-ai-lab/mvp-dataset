@@ -32,6 +32,9 @@ A minimal, high-performance data loading library for multimodal training pipelin
 Python requirement: `>=3.12,<3.13`
 
 ```bash
+uv pip install "git+https://github.com/mvp-ai-lab/mvp-dataset.git"
+
+# For development:
 uv pip install -e .
 ```
 
@@ -61,6 +64,31 @@ for batch in loader:
     train_step(batch)
 ```
 
+### Joint TAR pipeline
+
+```python
+from mvp_dataset import Dataset, TorchLoader
+
+dataset = (
+    Dataset.from_source("/data/images/shard_{000000..000006}.tar", resample=True)
+    .join([
+      ("depth", lambda s: s.replace("image", "depth))
+    ])
+    .shuffle(buffer_size=1024)
+    .map(lambda s: s)
+)
+
+loader = (
+    TorchLoader(dataset, num_workers=8, batch_size=32, collate_fn=lambda x: x)
+    .unbatch()
+    .shuffle(buffer_size=4096)
+    .batch(batch_size=64)
+)
+
+for batch in loader:
+    train_step(batch)
+```
+
 ### JSONL + TAR reference pipeline
 
 ```python
@@ -75,6 +103,22 @@ dataset = (
 
 for sample in dataset:
     consume(sample)
+```
+
+### Demo
+
+Generate demo shards and metadata:
+
+Read image/depth tar shards:
+
+```bash
+python3 examples/tar.py examples/demo_data/image/shard_{000000..000003}.tar --max-batches 2
+```
+
+Read JSONL with `tar://` references:
+
+```bash
+python3 examples/jsonl.py examples/demo_data/samples.jsonl --max-batches 2
 ```
 
 ## Data conventions

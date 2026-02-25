@@ -5,10 +5,18 @@ build-backend = "hatchling.build"
 [project]
 name = "mvp-dataset"
 version = "0.1.0"
-description = "Maintainable and extensible multimodal data loading core"
+description = "Maintainable and extensible multimodal data loading core."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
+authors = [
+  { name = "MVP AI Lab" }
+]
+license = { file = "LICENSE" }
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/mvp-ai-lab/mvp-dataset"
+Repository = "https://github.com/mvp-ai-lab/mvp-dataset"
 
 [project.optional-dependencies]
 dev = [
@@ -23,7 +31,7 @@ addopts = "-q"
 
 [tool.ruff]
 target-version = "py312"
-line-length = 100
+line-length = 120
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]

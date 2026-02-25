@@ -130,9 +130,9 @@ def main() -> None:
     args = parser.parse_args()
 
     ref_fields: Sequence[tuple[str, str]] = [("image", ".")]
-    dataset = Dataset.from_source(args.files, resample=True).group_by("image").resolve_refs(
-        ref_fields
-    ).map(summarize_sample)
+    dataset = (
+        Dataset.from_source(args.files, resample=True).group_by("image").resolve_refs(ref_fields).map(summarize_sample)
+    )
     loader = build_loader(dataset, args)
 
     print(
@@ -152,12 +152,7 @@ def main() -> None:
         total_samples += len(batch)
 
         if batch_index % 10 == 0:
-            print(
-                f"batch={batch_index} "
-                f"size={len(batch)} "
-                f"total_samples={total_samples} "
-                f"total_batches={total_batches} "
-            )
+            print(f"batch={batch_index} size={len(batch)} total_samples={total_samples} total_batches={total_batches} ")
         if batch_index + 1 >= args.max_batches:
             break
 

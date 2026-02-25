@@ -100,9 +100,7 @@ class TarManager:
             msg = f"[InvalidCacheSize] cache_size must be >= 1, got={cache_size}"
             raise ValueError(msg)
         # OrderedDict used as an LRU map: most-recently-used entry is at the end.
-        self._cache: OrderedDict[str, tuple[tarfile.TarFile, dict[str, tarfile.TarInfo]]] = (
-            OrderedDict()
-        )
+        self._cache: OrderedDict[str, tuple[tarfile.TarFile, dict[str, tarfile.TarInfo]]] = OrderedDict()
         self._cache_size = cache_size
 
     # ------------------------------------------------------------------
@@ -182,17 +180,11 @@ class TarManager:
         tf, member_index = self._get_tar_entry(tar_ref.shard_path)
         member = member_index.get(member_name)
         if member is None:
-            msg = (
-                f"[TarMemberNotFound] member={member_name!r} "
-                f"shard={tar_ref.shard_path!r} uri={tar_ref.raw_uri!r}"
-            )
+            msg = f"[TarMemberNotFound] member={member_name!r} shard={tar_ref.shard_path!r} uri={tar_ref.raw_uri!r}"
             raise KeyError(msg)
         extracted = tf.extractfile(member)
         if extracted is None:
-            msg = (
-                f"[TarExtractError] member={member_name!r} "
-                f"shard={tar_ref.shard_path!r} uri={tar_ref.raw_uri!r}"
-            )
+            msg = f"[TarExtractError] member={member_name!r} shard={tar_ref.shard_path!r} uri={tar_ref.raw_uri!r}"
             raise tarfile.ExtractError(msg)
         return extracted.read()
 
@@ -233,18 +225,12 @@ def iter_jsonls(
                 continue
             value = sample[field]
             if not isinstance(value, str):
-                msg = (
-                    f"[InvalidRefField] expected string URI in "
-                    f"field={field!r} got={type(value).__name__}"
-                )
+                msg = f"[InvalidRefField] expected string URI in field={field!r} got={type(value).__name__}"
                 raise ValueError(msg)
             try:
                 tar_ref = parse_tar_uri(value, base_dir=base_dir, key_dot_level=key_dot_level)
             except ValueError as exc:
-                msg = (
-                    f"[InvalidRefField] failed to parse tar URI in "
-                    f"field={field!r} value={value!r} reason={exc}"
-                )
+                msg = f"[InvalidRefField] failed to parse tar URI in field={field!r} value={value!r} reason={exc}"
                 raise ValueError(msg) from exc
             resolved[field] = manager.read(tar_ref)
         return resolved

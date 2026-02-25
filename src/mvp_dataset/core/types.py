@@ -35,6 +35,7 @@ RefFieldSpec = tuple[str, PathLikeStr]
 Stage = Callable[[Iterable[object]], Iterable[object]]
 """One lazy transformation stage in the iterator pipeline."""
 
+
 def _read_torch_runtime_values() -> tuple[int | None, int | None, int | None, int | None]:
     """Read rank/world_size/worker_id/num_workers from PyTorch runtime if available."""
 
@@ -127,9 +128,7 @@ class RuntimeContext:
         num_workers = int(source.get("NUM_WORKERS", "1"))
 
         if prefer_torch:
-            torch_rank, torch_world_size, torch_worker_id, torch_num_workers = (
-                _read_torch_runtime_values()
-            )
+            torch_rank, torch_world_size, torch_worker_id, torch_num_workers = _read_torch_runtime_values()
             if torch_rank is not None:
                 rank = torch_rank
             if torch_world_size is not None:
