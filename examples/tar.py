@@ -141,7 +141,7 @@ def main() -> None:
     args = parser.parse_args()
 
     annotate: Callable[[object], object] = partial(annotate_sample, decode_jpg=args.decode_jpg)
-    dataset = Dataset.from_source(args.shards, resample=True).map(annotate)
+    dataset = Dataset.from_tars(args.shards, resample=True).map(annotate)
     loader = build_loader(dataset, args)
 
     total_samples = 0

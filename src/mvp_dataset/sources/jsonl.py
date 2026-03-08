@@ -1,15 +1,17 @@
-"""JSONL source utilities and tar reference parsing."""
+"""JSONL source utilities, spill sharding, and tar reference parsing."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import tarfile
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 
-from ..core.types import GroupedSample, PathLikeStr, RefFieldSpec, Sample
+from ..core.types import PathLikeStr, RefFieldSpec, Sample
 
 _TAR_URI_PREFIX = "tar://"
 
@@ -30,12 +32,7 @@ def parse_tar_uri(
     base_dir: PathLikeStr,
     key_dot_level: int = 1,
 ) -> TarRef:
-    """Parse URI with grammar ``tar://<shard>#<key>.<field>``.
-
-    ``key_dot_level`` follows the same rule as tar record parsing:
-    - key: first ``key_dot_level`` dot-separated segments
-    - field: remaining segments
-    """
+    """Parse URI with grammar ``tar://<shard>#<key>.<field>``."""
 
     if not uri.startswith(_TAR_URI_PREFIX):
         msg = f"[InvalidTarUri] uri={uri!r} expected_prefix={_TAR_URI_PREFIX!r}"
@@ -80,32 +77,14 @@ def parse_tar_uri(
 
 
 class TarManager:
-    """Cache-aware reader for tar-referenced field payloads.
-
-    Opens tar archives in seekable mode (``r:*``) so that individual member
-    lookup is possible without reading the entire shard into memory.  Member
-    metadata is indexed once per opened shard so repeated lookups do not call
-    ``getmember`` repeatedly. Up to
-    ``cache_size`` shard handles are kept open simultaneously; the
-    least-recently-used handle is closed and evicted when the cache is full.
-
-    Use as a context manager to ensure all handles are closed on exit::
-
-        with TarManager(cache_size=8) as mgr:
-            data = mgr.read(tar_ref)
-    """
+    """Cache-aware reader for tar-referenced field payloads."""
 
     def __init__(self, cache_size: int = 8) -> None:
         if cache_size < 1:
             msg = f"[InvalidCacheSize] cache_size must be >= 1, got={cache_size}"
             raise ValueError(msg)
-        # OrderedDict used as an LRU map: most-recently-used entry is at the end.
         self._cache: OrderedDict[str, tuple[tarfile.TarFile, dict[str, tarfile.TarInfo]]] = OrderedDict()
         self._cache_size = cache_size
-
-    # ------------------------------------------------------------------
-    # Context-manager support
-    # ------------------------------------------------------------------
 
     def __enter__(self) -> TarManager:
         return self
@@ -119,7 +98,6 @@ class TarManager:
         self.close()
 
     def close(self) -> None:
-        """Close all cached tar file handles."""
         for tf, _member_index in self._cache.values():
             try:
                 tf.close()
@@ -127,20 +105,10 @@ class TarManager:
                 pass
         self._cache.clear()
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
     def _get_tar_entry(
         self,
         shard_path: str,
     ) -> tuple[tarfile.TarFile, dict[str, tarfile.TarInfo]]:
-        """Return cached ``(TarFile, member_index)`` for *shard_path*.
-
-        If the shard is already cached its entry is promoted to the
-        most-recently-used position.  When the cache is full the
-        least-recently-used entry is closed and removed first.
-        """
         if shard_path in self._cache:
             self._cache.move_to_end(shard_path)
             return self._cache[shard_path]
@@ -152,30 +120,16 @@ class TarManager:
             except Exception:  # noqa: BLE001
                 pass
 
-        # Open in seekable mode and build an O(1) member-name index once.
         tf = tarfile.open(shard_path, mode="r:*")
         members = tf.getmembers()
-        # Preserve tarfile.getmember duplicate-name semantics: later entries
-        # overwrite earlier ones, equivalent to searching from the end.
         member_index = {member.name: member for member in members}
         entry = (tf, member_index)
         self._cache[shard_path] = entry
         return entry
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     def read(self, tar_ref: TarRef) -> bytes:
-        """Read and return the raw bytes payload described by *tar_ref*.
+        """Read and return the raw bytes payload described by *tar_ref*."""
 
-        The tar member name is reconstructed as ``<key>.<field>``, which
-        matches the naming convention produced by :func:`iter_tar`.
-
-        Raises:
-            KeyError: when the member is not found inside the shard.
-            tarfile.ExtractError: when the member cannot be extracted.
-        """
         member_name = f"{tar_ref.key}.{tar_ref.field}"
         tf, member_index = self._get_tar_entry(tar_ref.shard_path)
         member = member_index.get(member_name)
@@ -189,36 +143,120 @@ class TarManager:
         return extracted.read()
 
 
+def materialize_jsonl_shards(
+    files: Sequence[str],
+    *,
+    group_key: str | None,
+    num_shards: int | None,
+    target_samples_per_shard: int | None,
+    spill_buckets: int,
+    output_dir: PathLikeStr | None,
+) -> list[str]:
+    """Spill raw JSONL rows into balanced local shard files."""
+
+    if spill_buckets <= 0:
+        msg = f"[InvalidSpillBucketCount] spill_buckets must be > 0, got={spill_buckets}"
+        raise ValueError(msg)
+    if num_shards is not None and num_shards <= 0:
+        msg = f"[InvalidShardCount] num_shards must be > 0, got={num_shards}"
+        raise ValueError(msg)
+    if target_samples_per_shard is not None and target_samples_per_shard <= 0:
+        msg = f"[InvalidTargetSamplesPerShard] target_samples_per_shard must be > 0, got={target_samples_per_shard}"
+        raise ValueError(msg)
+
+    fingerprint = _jsonl_shard_plan_fingerprint(
+        files=files,
+        group_key=group_key,
+        num_shards=num_shards,
+        target_samples_per_shard=target_samples_per_shard,
+        spill_buckets=spill_buckets,
+    )
+    root = Path(output_dir) if output_dir is not None else Path(".mvp_dataset_jsonl_shards")
+    dataset_dir = root / fingerprint
+    manifest_path = dataset_dir / "manifest.json"
+    if manifest_path.is_file():
+        with manifest_path.open(encoding="utf-8") as handle:
+            payload = json.load(handle)
+        shard_paths = payload.get("shards")
+        if isinstance(shard_paths, list) and all(isinstance(path, str) for path in shard_paths):
+            return [str(dataset_dir / path) for path in shard_paths]
+
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    bucket_dir = dataset_dir / "buckets"
+    bucket_dir.mkdir(parents=True, exist_ok=True)
+
+    bucket_handles: dict[int, object] = {}
+    bucket_counts = [0] * spill_buckets
+    total_rows = 0
+    try:
+        for file in files:
+            with open(file, encoding="utf-8") as handle:
+                for i, line in enumerate(handle):
+                    sample = _parse_jsonl_line(file, i, line)
+                    bucket_id = _bucket_id_for_sample(sample, group_key=group_key, spill_buckets=spill_buckets)
+                    bucket_counts[bucket_id] += 1
+                    total_rows += 1
+                    bucket_handle = bucket_handles.get(bucket_id)
+                    if bucket_handle is None:
+                        bucket_path = bucket_dir / f"bucket_{bucket_id:05d}.jsonl"
+                        bucket_handle = bucket_path.open("w", encoding="utf-8")
+                        bucket_handles[bucket_id] = bucket_handle
+                    bucket_handle.write(json.dumps(sample, ensure_ascii=True) + "\n")
+    finally:
+        for handle in bucket_handles.values():
+            handle.close()
+
+    if total_rows == 0:
+        msg = "[EmptyJsonlSource] no rows found in input files"
+        raise ValueError(msg)
+
+    final_shard_count = _resolve_final_shard_count(
+        total_rows=total_rows,
+        num_shards=num_shards,
+        target_samples_per_shard=target_samples_per_shard,
+    )
+    shard_targets = _balanced_shard_targets(total_rows=total_rows, shard_count=final_shard_count)
+
+    shard_paths = [dataset_dir / f"shard_{index:05d}.jsonl" for index in range(final_shard_count)]
+    shard_handles = [path.open("w", encoding="utf-8") for path in shard_paths]
+    try:
+        current_shard = 0
+        rows_in_current_shard = 0
+        for bucket_id in sorted(_non_empty_bucket_ids(bucket_counts)):
+            bucket_path = bucket_dir / f"bucket_{bucket_id:05d}.jsonl"
+            with bucket_path.open(encoding="utf-8") as handle:
+                for line in handle:
+                    if current_shard < final_shard_count - 1 and rows_in_current_shard >= shard_targets[current_shard]:
+                        current_shard += 1
+                        rows_in_current_shard = 0
+                    shard_handles[current_shard].write(line)
+                    rows_in_current_shard += 1
+        manifest = {
+            "files": list(files),
+            "group_key": group_key,
+            "num_shards": final_shard_count,
+            "target_samples_per_shard": target_samples_per_shard,
+            "spill_buckets": spill_buckets,
+            "shards": [path.name for path in shard_paths],
+        }
+        with manifest_path.open("w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, ensure_ascii=True, indent=2, sort_keys=True)
+    finally:
+        for handle in shard_handles:
+            handle.close()
+
+    return [str(path) for path in shard_paths]
+
+
 def iter_jsonls(
-    stream: Iterator[Sample | GroupedSample],
+    shard_paths: Iterator[PathLikeStr],
     ref_fields: tuple[RefFieldSpec, ...],
     key_dot_level: int = 1,
     tar_cache_size: int = 8,
 ) -> Iterator[Sample]:
-    """Resolve tar data references in JSONL samples on-the-fly.
-
-    Accepts an upstream stream of either flat :class:`Sample` dicts or grouped
-    ``list[Sample]`` items (produced by a ``group_by`` stage).  Grouped items
-    are flattened: each sample in the group is resolved and yielded
-    individually, so the output is always a flat stream of :class:`Sample`.
-
-    For every resolved field, a ``tar://`` URI is replaced in-place with the
-    raw :class:`bytes` payload read from the referenced tar member.  A shared
-    :class:`TarManager` is kept alive for the lifetime of the iteration so that
-    frequently accessed shards are not repeatedly opened and closed.
-
-    Args:
-        stream: Upstream iterator of flat samples or grouped sample lists.
-        ref_fields: Sequence of ``(field_name, base_dir)`` pairs identifying
-            fields that may contain ``tar://`` URIs.
-        key_dot_level: Number of dot-separated segments that form the key
-            inside a tar shard (forwarded to :func:`parse_tar_uri`).
-        tar_cache_size: Maximum number of tar shard handles to keep open
-            simultaneously (forwarded to :class:`TarManager`).
-    """
+    """Resolve tar data references while streaming JSONL shard files."""
 
     def _resolve_one(sample: Sample, manager: TarManager) -> Sample:
-        """Resolve all ref fields in a single sample dict."""
         resolved = dict(sample)
         for field, base_dir in ref_fields:
             if field not in sample:
@@ -236,15 +274,101 @@ def iter_jsonls(
         return resolved
 
     with TarManager(cache_size=tar_cache_size) as manager:
-        for item in stream:
-            if isinstance(item, list):
-                # Grouped path: flatten the group and yield each resolved
-                # sample individually.
-                for sample in item:
-                    if not isinstance(sample, dict):
-                        msg = "[InvalidGroupedSample] expected sample dict in grouped JSONL stream"
-                        raise ValueError(msg)
+        for shard_path in shard_paths:
+            with open(shard_path, encoding="utf-8") as handle:
+                for line_index, line in enumerate(handle):
+                    sample = _parse_jsonl_line(str(shard_path), line_index, line, allow_preannotated=True)
                     yield _resolve_one(sample, manager)
-            else:
-                # Flat path: resolve and yield a single sample.
-                yield _resolve_one(item, manager)
+
+
+def _bucket_id_for_sample(sample: Sample, *, group_key: str | None, spill_buckets: int) -> int:
+    if group_key is None:
+        key = str(sample["__key__"])
+    else:
+        value = sample.get(group_key)
+        if not isinstance(value, str):
+            msg = f"[InvalidGroupKey] sample missing string key for group_key={group_key!r}"
+            raise ValueError(msg)
+        key = value.split("#", 1)[0]
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return int(digest[:16], 16) % spill_buckets
+
+
+def _jsonl_shard_plan_fingerprint(
+    *,
+    files: Sequence[str],
+    group_key: str | None,
+    num_shards: int | None,
+    target_samples_per_shard: int | None,
+    spill_buckets: int,
+) -> str:
+    payload = {
+        "files": [(file, Path(file).stat().st_mtime_ns, Path(file).stat().st_size) for file in files],
+        "group_key": group_key,
+        "num_shards": num_shards,
+        "target_samples_per_shard": target_samples_per_shard,
+        "spill_buckets": spill_buckets,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _non_empty_bucket_ids(bucket_counts: Sequence[int]) -> Iterator[int]:
+    for bucket_id, count in enumerate(bucket_counts):
+        if count > 0:
+            yield bucket_id
+
+
+def _parse_jsonl_line(
+    file: str,
+    index_in_file: int,
+    line: str,
+    *,
+    allow_preannotated: bool = False,
+) -> Sample:
+    try:
+        parsed = json.loads(line)
+    except json.JSONDecodeError as exc:
+        msg = f"[InvalidJsonLine] file={file!r} line={index_in_file + 1} reason={exc.msg}"
+        raise ValueError(msg) from exc
+    if not isinstance(parsed, dict):
+        msg = f"[InvalidJsonSample] file={file!r} line={index_in_file + 1} expected object row"
+        raise ValueError(msg)
+
+    sample: Sample = dict(parsed)
+    if allow_preannotated and _has_jsonl_metadata(sample):
+        return sample
+
+    sample["__index_in_file__"] = index_in_file
+    sample["__file__"] = file
+    sample["__key__"] = f"{file}:{index_in_file}"
+    return sample
+
+
+def _has_jsonl_metadata(sample: Sample) -> bool:
+    return (
+        isinstance(sample.get("__index_in_file__"), int)
+        and isinstance(sample.get("__file__"), str)
+        and isinstance(sample.get("__key__"), str)
+    )
+
+
+def _resolve_final_shard_count(
+    *,
+    total_rows: int,
+    num_shards: int | None,
+    target_samples_per_shard: int | None,
+) -> int:
+    if num_shards is not None:
+        return num_shards
+    if target_samples_per_shard is None:
+        return 1
+    return max(1, (total_rows + target_samples_per_shard - 1) // target_samples_per_shard)
+
+
+def _balanced_shard_targets(*, total_rows: int, shard_count: int) -> list[int]:
+    """Return per-shard row targets whose totals differ by at most one."""
+
+    base = total_rows // shard_count
+    remainder = total_rows % shard_count
+    return [base + (1 if index < remainder else 0) for index in range(shard_count)]

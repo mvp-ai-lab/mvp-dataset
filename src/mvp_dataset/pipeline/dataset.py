@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib
-import json
 import os
 import random
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -11,23 +10,16 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Literal, cast
 
-from ..core.types import (
-    GroupedSample,
-    RefFieldSpec,
-    RuntimeContext,
-    Sample,
-    ShardInput,
-    SidecarSpec,
-    Stage,
-)
+from ..core.types import RefFieldSpec, RuntimeContext, ShardInput, SidecarSpec, Stage
 from ..sources import iter_jsonls, iter_tars
+from ..sources.jsonl import materialize_jsonl_shards
 from ..utils.sharding import iter_items
 from ..utils.url import normalize_paths
 from .ops import batch_samples, map_samples, shuffle_samples, unbatch_samples
 
 SourceKind = Literal["jsonl", "tars"]
-SourceStore = list[str] | list[Sample] | list[GroupedSample]
-SourceShape = Literal["tar_paths", "jsonl_flat", "jsonl_grouped"]
+SourceStore = list[str]
+SourceShape = Literal["tar_paths", "jsonl_paths"]
 
 
 def torch_iterabledataset_class(
@@ -49,11 +41,16 @@ def torch_iterabledataset_class(
 
 @dataclass(frozen=True, slots=True)
 class Dataset(torch_iterabledataset_class()):
-    """Chainable dataset built from lazy iterator stages.
+    """Chainable iterable dataset built from local shard sources.
+
+    A :class:`Dataset` is immutable: every transformation returns a new dataset
+    instance while leaving the previous one unchanged. Source data is loaded
+    lazily during iteration, then passed through the appended iterator stages in
+    declaration order.
 
     The dataset stores one of two source backends:
     - ``"tars"``: a list of tar shard paths
-    - ``"jsonl"``: in-memory JSONL rows (flat or grouped)
+    - ``"jsonl"``: a list of JSONL shard paths
     """
 
     context: RuntimeContext
@@ -63,10 +60,112 @@ class Dataset(torch_iterabledataset_class()):
     _source_shape: SourceShape
     _stages: tuple[Stage, ...]
     _resample: bool
-
     _sidecar_specs: tuple[SidecarSpec, ...]
     _ref_fields: tuple[RefFieldSpec, ...]
-    _group_by: str | None
+
+    @classmethod
+    def from_tars(
+        cls,
+        shards: ShardInput | Sequence[ShardInput],
+        context: RuntimeContext | None = None,
+        resample: bool = False,
+    ) -> Dataset:
+        """Build a dataset from local tar shard paths.
+
+        Args:
+            shards: One or more file paths, glob specs, or brace-expansion specs.
+            context: Optional execution context. If omitted, inferred from runtime.
+            resample: Whether to loop shards indefinitely across rounds.
+
+        Returns:
+            A dataset whose source is the normalized tar shard path list.
+
+        Raises:
+            ValueError: If any input path does not end with ``.tar``.
+        """
+        runtime_context = RuntimeContext.from_runtime() if context is None else context
+        normalized_shards = normalize_paths(shards)
+        if not all(path.endswith(".tar") for path in normalized_shards):
+            msg = f"[InvalidSourceType] expected .tar inputs, got={normalized_shards!r}"
+            raise ValueError(msg)
+        return cls._build_dataset(
+            source=normalized_shards,
+            source_shape="tar_paths",
+            context=runtime_context,
+            source_kind="tars",
+            resample=resample,
+        )
+
+    @classmethod
+    def from_jsonl(
+        cls,
+        files: ShardInput | Sequence[ShardInput],
+        context: RuntimeContext | None = None,
+        resample: bool = False,
+        *,
+        group_key: str | None = None,
+        num_shards: int | None = None,
+        target_samples_per_shard: int | None = None,
+        spill_buckets: int = 128,
+        output_dir: str | os.PathLike[str] | None = None,
+    ) -> Dataset:
+        """Build a dataset from local JSONL files.
+
+        When only ``files`` is provided, the dataset reads the JSONL files
+        directly during iteration. When any sharding argument is supplied, the
+        input files are first materialized into local JSONL shard files so that
+        later reads can be scheduled shard-by-shard, similar to tar sources.
+
+        Args:
+            files: One or more JSONL file paths, globs, or brace-expansion specs.
+            context: Optional execution context. If omitted, inferred from runtime.
+            resample: Whether to loop JSONL shard inputs indefinitely across rounds.
+            group_key: Optional string field used to improve locality while
+                spilling rows into temporary buckets. For ``tar://...#...``
+                references, the portion before ``#`` is used for grouping.
+            num_shards: Optional exact number of final local JSONL shards to
+                materialize before iteration.
+            target_samples_per_shard: Optional target shard size used to derive
+                the final shard count when ``num_shards`` is not provided.
+            spill_buckets: Number of temporary bucket files used during spill
+                sharding. Higher values reduce per-bucket size at the cost of
+                more temporary files.
+            output_dir: Optional directory used to store materialized JSONL
+                shard files. When omitted, a cache directory under the current
+                working directory is used.
+
+        Returns:
+            A dataset backed by normalized JSONL shard paths.
+
+        Raises:
+            ValueError: If any input path does not end with ``.jsonl`` or if the
+                sharding parameters are invalid.
+        """
+
+        runtime_context = RuntimeContext.from_runtime() if context is None else context
+        normalized_files = normalize_paths(files)
+        if not all(path.endswith(".jsonl") for path in normalized_files):
+            msg = f"[InvalidSourceType] expected .jsonl inputs, got={normalized_files!r}"
+            raise ValueError(msg)
+
+        shard_paths = normalized_files
+        if group_key is not None or num_shards is not None or target_samples_per_shard is not None:
+            shard_paths = materialize_jsonl_shards(
+                normalized_files,
+                group_key=group_key,
+                num_shards=num_shards,
+                target_samples_per_shard=target_samples_per_shard,
+                spill_buckets=spill_buckets,
+                output_dir=output_dir,
+            )
+
+        return cls._build_dataset(
+            source=shard_paths,
+            source_shape="jsonl_paths",
+            context=runtime_context,
+            source_kind="jsonl",
+            resample=resample,
+        )
 
     @classmethod
     def from_source(
@@ -74,60 +173,129 @@ class Dataset(torch_iterabledataset_class()):
         shards: ShardInput | Sequence[ShardInput],
         context: RuntimeContext | None = None,
         resample: bool = False,
+        *,
+        group_key: str | None = None,
+        num_shards: int | None = None,
+        target_samples_per_shard: int | None = None,
+        spill_buckets: int = 128,
+        output_dir: str | os.PathLike[str] | None = None,
     ) -> Dataset:
-        """Build a dataset from local JSONL files or tar shards.
+        """Build a dataset from local tar or JSONL inputs.
+
+        This compatibility constructor dispatches to :meth:`from_tars` when all
+        inputs end with ``.tar`` and to :meth:`from_jsonl` when all inputs end
+        with ``.jsonl``.
 
         Args:
-            shards: One or more file paths, glob specs, or brace-expansion specs.
+            shards: One or more tar or JSONL paths, globs, or brace-expansion specs.
             context: Optional execution context. If omitted, inferred from runtime.
-            resample: Whether to loop shards indefinitely across rounds.
+            resample: Whether to loop the selected source shards indefinitely.
+            group_key: JSONL-only spill sharding key forwarded to
+                :meth:`from_jsonl`.
+            num_shards: JSONL-only exact shard count forwarded to
+                :meth:`from_jsonl`.
+            target_samples_per_shard: JSONL-only target shard size forwarded to
+                :meth:`from_jsonl`.
+            spill_buckets: JSONL-only temporary spill bucket count forwarded to
+                :meth:`from_jsonl`.
+            output_dir: JSONL-only output directory for materialized shard files.
+
+        Returns:
+            A dataset backed by tar shard paths or JSONL shard paths.
+
+        Raises:
+            ValueError: If inputs mix extensions, use an unsupported extension,
+                or pass JSONL-only sharding arguments for tar sources.
         """
+
         runtime_context = RuntimeContext.from_runtime() if context is None else context
         normalized_shards = normalize_paths(shards)
 
         if all(path.endswith(".jsonl") for path in normalized_shards):
-            jsonl_samples: list[Sample] = []
-            for file in normalized_shards:
-                with open(file, encoding="utf-8") as f:
-                    for i, line in enumerate(f):
-                        try:
-                            parsed = json.loads(line)
-                        except json.JSONDecodeError as exc:
-                            msg = f"[InvalidJsonLine] file={file!r} line={i + 1} reason={exc.msg}"
-                            raise ValueError(msg) from exc
-                        if not isinstance(parsed, dict):
-                            msg = f"[InvalidJsonSample] file={file!r} line={i + 1} expected object row"
-                            raise ValueError(msg)
-                        sample: Sample = dict(parsed)
-                        sample["__index_in_file__"] = i
-                        sample["__file__"] = file
-                        sample["__key__"] = f"{file}:{i}"
-                        jsonl_samples.append(sample)
-            source: SourceStore = jsonl_samples
-            source_kind = "jsonl"
-            source_shape: SourceShape = "jsonl_flat"
-        elif all(path.endswith(".tar") for path in normalized_shards):
-            source = normalized_shards
-            source_kind = "tars"
-            source_shape = "tar_paths"
-        else:
-            msg = f"[InvalidSourceType] all inputs must be .jsonl or all must be .tar, got={normalized_shards!r}"
+            return cls.from_jsonl(
+                normalized_shards,
+                context=runtime_context,
+                resample=resample,
+                group_key=group_key,
+                num_shards=num_shards,
+                target_samples_per_shard=target_samples_per_shard,
+                spill_buckets=spill_buckets,
+                output_dir=output_dir,
+            )
+        if all(path.endswith(".tar") for path in normalized_shards):
+            if (
+                group_key is not None
+                or num_shards is not None
+                or target_samples_per_shard is not None
+                or spill_buckets != 128
+                or output_dir is not None
+            ):
+                msg = "JSONL sharding arguments are not supported for tar sources"
+                raise ValueError(msg)
+            return cls.from_tars(normalized_shards, context=runtime_context, resample=resample)
+
+        msg = f"[InvalidSourceType] all inputs must be .jsonl or all must be .tar, got={normalized_shards!r}"
+        raise ValueError(msg)
+
+    @classmethod
+    def _build_dataset(
+        cls,
+        *,
+        source: SourceStore,
+        source_shape: SourceShape,
+        context: RuntimeContext,
+        source_kind: SourceKind,
+        resample: bool,
+    ) -> Dataset:
+        """Build one dataset instance from normalized source metadata.
+
+        Args:
+            source: Normalized source payload stored by the dataset.
+            source_shape: Concrete shape of ``source``.
+            context: Runtime execution context to attach to the dataset.
+            source_kind: High-level source backend kind.
+            resample: Whether the dataset should produce infinite shuffled rounds.
+
+        Returns:
+            A fully initialized :class:`Dataset`.
+
+        Raises:
+            ValueError: If ``source_shape`` and ``source_kind`` do not match.
+        """
+
+        if source_shape == "tar_paths" and source_kind != "tars":
+            msg = f"[InvalidSourceShape] tar_paths requires source_kind='tars', got={source_kind!r}"
+            raise ValueError(msg)
+        if source_shape == "jsonl_paths" and source_kind != "jsonl":
+            msg = f"[InvalidSourceShape] jsonl_paths requires source_kind='jsonl', got={source_kind!r}"
             raise ValueError(msg)
 
         return cls(
             _source=source,
             _source_shape=source_shape,
             _stages=(),
-            context=runtime_context,
+            context=context,
             source_kind=source_kind,
             _resample=resample,
             _sidecar_specs=(),
             _ref_fields=(),
-            _group_by=None,
         )
 
     def join(self, sidecars: Sequence[SidecarSpec]) -> Dataset:
-        """Attach sidecar tar specs for shard-level field merges."""
+        """Attach sidecar tar specs for shard-level field merges.
+
+        Args:
+            sidecars: Sequence of ``(name, path_resolver)`` pairs. Each
+                ``path_resolver`` receives a main tar shard path and must return
+                the matching sidecar tar shard path.
+
+        Returns:
+            A new dataset that merges sidecar fields into each main tar sample
+            during iteration.
+
+        Raises:
+            ValueError: If the dataset source is not tar-based.
+        """
 
         if self.source_kind != "tars":
             msg = "`join` currently supports only tar sources."
@@ -141,11 +309,22 @@ class Dataset(torch_iterabledataset_class()):
             _resample=self._resample,
             _sidecar_specs=self._sidecar_specs + tuple(sidecars),
             _ref_fields=self._ref_fields,
-            _group_by=self._group_by,
         )
 
     def resolve_refs(self, ref_fields: Sequence[RefFieldSpec]) -> Dataset:
-        """Resolve ``tar://`` URIs in selected JSONL fields during iteration."""
+        """Resolve ``tar://`` URIs in selected JSONL fields during iteration.
+
+        Args:
+            ref_fields: Sequence of ``(field_name, base_dir)`` pairs that
+                identify JSONL fields containing ``tar://`` references.
+
+        Returns:
+            A new dataset that replaces selected URI fields with raw bytes read
+            from the referenced tar members at iteration time.
+
+        Raises:
+            ValueError: If the dataset source is not JSONL-based.
+        """
 
         if self.source_kind != "jsonl":
             msg = "`resolve_refs` currently supports only jsonl sources."
@@ -159,47 +338,18 @@ class Dataset(torch_iterabledataset_class()):
             _resample=self._resample,
             _sidecar_specs=self._sidecar_specs,
             _ref_fields=self._ref_fields + tuple(ref_fields),
-            _group_by=self._group_by,
-        )
-
-    def group_by(self, field: str) -> Dataset:
-        """Group JSONL rows by a string field (``#`` suffix ignored)."""
-
-        if self.source_kind != "jsonl":
-            msg = "`group_by` currently supports only jsonl sources."
-            raise ValueError(msg)
-        if self._group_by is not None:
-            msg = "multiple group_by stages are not supported"
-            raise ValueError(msg)
-        if self._source_shape != "jsonl_flat":
-            msg = "[InvalidSourceShape] group_by expects flat jsonl source"
-            raise TypeError(msg)
-
-        grouped_source: dict[str, list[Sample]] = {}
-        flat_source = cast(list[Sample], self._source)
-        for sample in flat_source:
-            raw_value = sample.get(field)
-            if not isinstance(raw_value, str):
-                msg = f"[InvalidGroupKey] sample missing string key for group_by field={field!r}"
-                raise ValueError(msg)
-            key = raw_value.split("#", 1)[0]
-            grouped_source.setdefault(key, []).append(sample)
-        groups = list(grouped_source.values())
-
-        return Dataset(
-            _source=groups,
-            _source_shape="jsonl_grouped",
-            _stages=self._stages,
-            context=self.context,
-            source_kind=self.source_kind,
-            _resample=self._resample,
-            _sidecar_specs=self._sidecar_specs,
-            _ref_fields=self._ref_fields,
-            _group_by=field,
         )
 
     def _append_stage(self, stage: Stage) -> Dataset:
-        """Return a new dataset with one extra lazy stage."""
+        """Return a new dataset with one extra lazy stage.
+
+        Args:
+            stage: Iterator transformation applied after source loading.
+
+        Returns:
+            A dataset that shares the same source and context but appends
+            ``stage`` to the pipeline.
+        """
 
         return Dataset(
             _source=self._source,
@@ -210,11 +360,17 @@ class Dataset(torch_iterabledataset_class()):
             _resample=self._resample,
             _sidecar_specs=self._sidecar_specs,
             _ref_fields=self._ref_fields,
-            _group_by=self._group_by,
         )
 
     def map(self, fn: Callable[[object], object]) -> Dataset:
-        """Append a lazy map stage."""
+        """Append a lazy map stage.
+
+        Args:
+            fn: Callable applied to each sample yielded by the upstream stage.
+
+        Returns:
+            A new dataset that applies ``fn`` lazily during iteration.
+        """
 
         def stage(data: Iterable[object]) -> Iterable[object]:
             return map_samples(data, fn)
@@ -222,7 +378,17 @@ class Dataset(torch_iterabledataset_class()):
         return self._append_stage(stage)
 
     def shuffle(self, buffer_size: int, initial: int | None = None) -> Dataset:
-        """Append a deterministic sample-level shuffle stage."""
+        """Append a deterministic sample-level shuffle stage.
+
+        Args:
+            buffer_size: Maximum number of samples to keep in the randomization
+                buffer.
+            initial: Minimum number of buffered samples before the stage starts
+                yielding values. Defaults to ``buffer_size``.
+
+        Returns:
+            A new dataset with bounded-memory shuffling applied lazily.
+        """
 
         def stage(data: Iterable[object]) -> Iterable[object]:
             seed = self.context.sample_shuffle_seed
@@ -237,7 +403,17 @@ class Dataset(torch_iterabledataset_class()):
         drop_last: bool = False,
         collate_fn: Callable[[list[object]], object] | None = None,
     ) -> Dataset:
-        """Append a batching stage."""
+        """Append a batching stage.
+
+        Args:
+            batch_size: Number of samples per yielded batch.
+            drop_last: Whether to drop the final incomplete batch.
+            collate_fn: Optional callable that transforms each list of samples
+                into a user-defined batch object.
+
+        Returns:
+            A new dataset that yields batches instead of individual samples.
+        """
 
         def stage(data: Iterable[object]) -> Iterable[object]:
             return batch_samples(
@@ -250,7 +426,12 @@ class Dataset(torch_iterabledataset_class()):
         return self._append_stage(stage)
 
     def unbatch(self) -> Dataset:
-        """Append an unbatching stage."""
+        """Append an unbatching stage.
+
+        Returns:
+            A new dataset that expands list, tuple, or dict-style batches back
+            into individual samples during iteration.
+        """
 
         def stage(data: Iterable[object]) -> Iterable[object]:
             return unbatch_samples(data)
@@ -258,7 +439,12 @@ class Dataset(torch_iterabledataset_class()):
         return self._append_stage(stage)
 
     def __iter__(self) -> Iterator[object]:
-        """Materialize and run the full lazy pipeline."""
+        """Materialize and run the full lazy pipeline.
+
+        Returns:
+            An iterator over samples or batch objects produced by the dataset's
+            source backend followed by all appended pipeline stages.
+        """
 
         context = self.context.resolve_current_process()
         stream: Iterable[object]
@@ -278,24 +464,13 @@ class Dataset(torch_iterabledataset_class()):
             )
         else:
             tar_cache_size = int(os.environ.get("LOADER_JSONL_TAR_CACHE_SIZE", 8))
-            if self._group_by is None:
-                flat_stream = iter_items(
-                    self._as_flat_jsonl_source(),
-                    context=context,
-                    resample=self._resample,
-                    grouped=False,
-                )
-                jsonl_stream: Iterator[Sample | GroupedSample] = flat_stream
-            else:
-                grouped_stream = iter_items(
-                    self._as_grouped_jsonl_source(),
-                    context=context,
-                    resample=self._resample,
-                    grouped=True,
-                )
-                jsonl_stream = grouped_stream
+            shard_stream = iter_items(
+                self._as_jsonl_source(),
+                context=context,
+                resample=self._resample,
+            )
             stream = iter_jsonls(
-                jsonl_stream,
+                shard_stream,
                 ref_fields=self._ref_fields,
                 key_dot_level=tar_key_dot_level,
                 tar_cache_size=tar_cache_size,
@@ -307,25 +482,31 @@ class Dataset(torch_iterabledataset_class()):
         yield from stream
 
     def _as_tar_source(self) -> list[str]:
-        """Return tar shard paths with O(1) source-shape check."""
+        """Return tar shard paths with O(1) source-shape validation.
+
+        Returns:
+            The underlying tar shard path list.
+
+        Raises:
+            TypeError: If this dataset is not backed by tar shard paths.
+        """
 
         if self._source_shape != "tar_paths":
             msg = "[InvalidSourceShape] expected tar_paths source shape"
             raise TypeError(msg)
         return cast(list[str], self._source)
 
-    def _as_flat_jsonl_source(self) -> list[Sample]:
-        """Return flat JSONL samples with O(1) source-shape check."""
+    def _as_jsonl_source(self) -> list[str]:
+        """Return JSONL shard paths with O(1) source-shape validation.
 
-        if self._source_shape != "jsonl_flat":
-            msg = "[InvalidSourceShape] expected jsonl_flat source shape"
+        Returns:
+            The underlying JSONL shard path list.
+
+        Raises:
+            TypeError: If this dataset is not backed by JSONL shard paths.
+        """
+
+        if self._source_shape != "jsonl_paths":
+            msg = "[InvalidSourceShape] expected jsonl_paths source shape"
             raise TypeError(msg)
-        return cast(list[Sample], self._source)
-
-    def _as_grouped_jsonl_source(self) -> list[GroupedSample]:
-        """Return grouped JSONL samples with O(1) source-shape check."""
-
-        if self._source_shape != "jsonl_grouped":
-            msg = "[InvalidSourceShape] expected jsonl_grouped source shape"
-            raise TypeError(msg)
-        return cast(list[GroupedSample], self._source)
+        return cast(list[str], self._source)

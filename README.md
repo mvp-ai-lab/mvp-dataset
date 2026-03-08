@@ -13,7 +13,9 @@ A minimal, high-performance data loading library for multimodal training pipelin
 
 ## Features
 
-- `Dataset.from_source(...)` for local `.tar` or `.jsonl` shard inputs
+- `Dataset.from_tars(...)` for local `.tar` shard inputs
+- `Dataset.from_jsonl(...)` for local `.jsonl` inputs
+- `Dataset.from_source(...)` as a compatibility dispatcher for mixed call sites
 - Chainable pipeline ops:
   - `.map(...)`
   - `.shuffle(buffer_size, initial=...)`
@@ -24,7 +26,7 @@ A minimal, high-performance data loading library for multimodal training pipelin
   - optional sidecar merge via `.join([...])`. In this way, you can store different modalities in separate tars and join them on the fly via member naming conventions.
 - JSONL workflows:
   - optional `tar://` reference resolution via `.resolve_refs([...])`. In this way, you can use JSONL to store data like conversations and reference external image data in tar shards.
-  - optional grouping via `.group_by(field)` for faster reference resolution and TAR joining.
+  - optional spill sharding via `from_jsonl(..., group_key=..., num_shards=...)` for bounded-memory preprocessing and better tar locality.
 - `TorchLoader` for PyTorch `DataLoader` integration with post-merge stages
 
 ## Installation
@@ -48,7 +50,7 @@ If you use `TorchLoader`, install PyTorch separately.
 from mvp_dataset import Dataset, TorchLoader
 
 dataset = (
-    Dataset.from_source("/data/shards/shard_{000000..000006}.tar", resample=True)
+    Dataset.from_tars("/data/shards/shard_{000000..000006}.tar", resample=True)
     .shuffle(buffer_size=1024)
     .map(lambda s: s)
 )
@@ -70,7 +72,7 @@ for batch in loader:
 from mvp_dataset import Dataset, TorchLoader
 
 dataset = (
-    Dataset.from_source("/data/images/shard_{000000..000006}.tar", resample=True)
+    Dataset.from_tars("/data/images/shard_{000000..000006}.tar", resample=True)
     .join([
       ("depth", lambda s: s.replace("image", "depth))
     ])
@@ -95,8 +97,12 @@ for batch in loader:
 from mvp_dataset import Dataset
 
 dataset = (
-    Dataset.from_source("/data/meta/train.jsonl", resample=True)
-    .group_by("image")
+    Dataset.from_jsonl(
+        "/data/meta/train.jsonl",
+        resample=True,
+        group_key="image",
+        num_shards=64,
+    )
     .resolve_refs([("image", "/data")])  # tar://... URI base dir
     .map(lambda s: s)
 )
@@ -155,12 +161,15 @@ tar://examples/data/tars/shard_000000.tar#image_001.jpg
 - Source behavior:
   - `LOADER_TAR_KEY_DOT_LEVEL` (default: `1`)
   - `LOADER_JSONL_TAR_CACHE_SIZE` (default: `8`)
+- JSONL preprocessing:
+  - `from_jsonl(..., group_key=..., num_shards=..., spill_buckets=..., output_dir=...)`
 
 ## Performance notes
 
 - Iterator pipeline is lazy; data transforms are applied on demand.
 - Shuffle uses bounded buffer memory (`buffer_size`, optional `initial`).
 - JSONL reference resolution uses LRU tar-handle caching.
+- `from_jsonl(...)` can pre-materialize balanced local JSONL shards so workers shard by file instead of holding the full JSONL in memory.
 - Recommended high-throughput pattern with PyTorch:
   1. worker micro-batch (`batch_size` on `TorchLoader` + identity collate)
   2. `.unbatch()`

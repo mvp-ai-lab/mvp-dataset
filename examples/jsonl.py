@@ -75,6 +75,8 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Resolve tar references from JSONL rows")
     parser.add_argument("files", nargs="+", help="JSONL file paths or patterns")
+    parser.add_argument("--group-key", default="image", help="Field used to spill rows into local JSONL shards")
+    parser.add_argument("--num-shards", type=int, default=8, help="Number of local JSONL shards to materialize")
     parser.add_argument("--seed", type=int, default=0, help="Global seed")
     parser.add_argument("--epoch", type=int, default=0, help="Epoch index")
     parser.add_argument("--tar-cache-size", type=int, default=8, help="LRU tar cache size")
@@ -131,7 +133,14 @@ def main() -> None:
 
     ref_fields: Sequence[tuple[str, str]] = [("image", ".")]
     dataset = (
-        Dataset.from_source(args.files, resample=True).group_by("image").resolve_refs(ref_fields).map(summarize_sample)
+        Dataset.from_jsonl(
+            args.files,
+            resample=True,
+            group_key=args.group_key,
+            num_shards=args.num_shards,
+        )
+        .resolve_refs(ref_fields)
+        .map(summarize_sample)
     )
     loader = build_loader(dataset, args)
 

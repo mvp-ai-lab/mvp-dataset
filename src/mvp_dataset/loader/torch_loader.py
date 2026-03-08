@@ -15,7 +15,14 @@ LoaderStage = Callable[[Iterable[object]], Iterable[object]]
 
 
 def _torch_dataloader_class() -> type:
-    """Return ``torch.utils.data.DataLoader`` or raise a clear runtime error."""
+    """Return ``torch.utils.data.DataLoader`` or raise a clear runtime error.
+
+    Returns:
+        The imported ``torch.utils.data.DataLoader`` class.
+
+    Raises:
+        RuntimeError: If PyTorch is not installed in the current environment.
+    """
 
     try:
         torch_utils_data = importlib.import_module("torch.utils.data")
@@ -52,8 +59,25 @@ class TorchLoader:
     ) -> None:
         """Initialize a PyTorch-backed loader wrapper.
 
-        ``loader_kwargs`` is forwarded to ``torch.utils.data.DataLoader`` so
-        callers can opt into backend-specific options without changing this API.
+        Args:
+            dataset: Upstream iterable dataset or iterator source.
+            num_workers: Number of PyTorch worker processes.
+            batch_size: Optional worker-side batch size passed to DataLoader.
+            pin_memory: Forwarded to DataLoader.
+            persistent_workers: Forwarded to DataLoader when workers are used.
+            prefetch_factor: Forwarded to DataLoader when workers are used.
+            multiprocessing_context: Optional multiprocessing context name passed
+                to DataLoader.
+            collate_fn: Optional worker-side collate function.
+            drop_last: Whether to drop the final incomplete worker batch when
+                ``batch_size`` is set.
+            _stages: Internal tuple of post-merge loader stages.
+            **loader_kwargs: Additional keyword arguments forwarded to
+                ``torch.utils.data.DataLoader``.
+
+        Raises:
+            RuntimeError: If PyTorch is unavailable.
+            ValueError: If worker-related arguments are invalid.
         """
 
         _torch_dataloader_class()
@@ -80,7 +104,15 @@ class TorchLoader:
         self._stages = tuple() if _stages is None else _stages
 
     def _append_stage(self, stage: LoaderStage) -> TorchLoader:
-        """Return a new loader with one additional post-merge stage."""
+        """Return a new loader with one additional post-merge stage.
+
+        Args:
+            stage: Post-merge iterator transformation to append.
+
+        Returns:
+            A new :class:`TorchLoader` sharing the same DataLoader settings and
+            upstream dataset.
+        """
 
         return TorchLoader(
             self._dataset,
@@ -97,7 +129,11 @@ class TorchLoader:
         )
 
     def _build_torch_dataloader(self) -> Iterable[object]:
-        """Build the underlying ``torch.utils.data.DataLoader`` instance."""
+        """Build the underlying ``torch.utils.data.DataLoader`` instance.
+
+        Returns:
+            A configured DataLoader ready to iterate over the upstream dataset.
+        """
 
         DataLoader = _torch_dataloader_class()
         kwargs: dict[str, object] = {
@@ -119,7 +155,12 @@ class TorchLoader:
         return DataLoader(**kwargs)
 
     def _default_shuffle_seed(self) -> int:
-        """Derive a deterministic seed from dataset runtime context when present."""
+        """Derive a deterministic shuffle seed from dataset runtime context.
+
+        Returns:
+            ``context.seed + context.rank`` when the upstream dataset exposes a
+            :class:`RuntimeContext`; otherwise ``0``.
+        """
 
         context = getattr(self._dataset, "context", None)
         if isinstance(context, RuntimeContext):
@@ -131,6 +172,10 @@ class TorchLoader:
 
         This stage is typically used with worker micro-batches to reduce IPC overhead
         while keeping downstream sample-level transforms unchanged.
+
+        Returns:
+            A new loader that expands merged batches back into samples before
+            any later loader-side stages run.
         """
 
         def stage(data: Iterable[object]) -> Iterable[object]:
@@ -144,7 +189,18 @@ class TorchLoader:
         initial: int | None = None,
         seed: int | None = None,
     ) -> TorchLoader:
-        """Append a global (post-merge) sample-level shuffle stage."""
+        """Append a global (post-merge) sample-level shuffle stage.
+
+        Args:
+            buffer_size: Maximum number of samples held in the shuffle buffer.
+            initial: Minimum buffered sample count before yielding values.
+            seed: Optional explicit shuffle seed. When omitted, a deterministic
+                seed is derived from the upstream dataset context.
+
+        Returns:
+            A new loader that performs bounded-memory global shuffling after
+            worker output has been merged.
+        """
 
         def stage(data: Iterable[object]) -> Iterable[object]:
             rng_seed = self._default_shuffle_seed() if seed is None else seed
@@ -159,7 +215,18 @@ class TorchLoader:
         drop_last: bool = False,
         collate_fn: Callable[[list[object]], object] | None = None,
     ) -> TorchLoader:
-        """Append a batch stage at loader side."""
+        """Append a batch stage at loader side.
+
+        Args:
+            batch_size: Number of post-merge samples per yielded batch.
+            drop_last: Whether to drop the final incomplete batch.
+            collate_fn: Optional callable that converts each list of samples into
+                a user-defined batch object.
+
+        Returns:
+            A new loader that batches the merged sample stream in the main
+            process.
+        """
 
         def stage(data: Iterable[object]) -> Iterable[object]:
             return batch_samples(
@@ -172,7 +239,12 @@ class TorchLoader:
         return self._append_stage(stage)
 
     def __iter__(self) -> Iterator[object]:
-        """Iterate the merged stream after applying all loader-side stages."""
+        """Iterate the merged stream after applying all loader-side stages.
+
+        Returns:
+            An iterator over the DataLoader output after all appended loader-side
+            stages have been applied in order.
+        """
 
         stream: Iterable[object] = self._build_torch_dataloader()
         for stage in self._stages:
