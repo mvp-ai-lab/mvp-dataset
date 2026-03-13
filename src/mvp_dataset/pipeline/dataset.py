@@ -661,7 +661,8 @@ class Dataset(torch_iterabledataset_class()):
             sidecars=self._sidecar_specs,
             field_prefixes=(key,),
         ):
-            return len(sample_fields(cast(dict[str, object], sample))) > 0
+            if len(sample_fields(cast(dict[str, object], sample))) > 0:
+                return True
         return False
 
     def _cache_has_selected_key(
@@ -681,7 +682,8 @@ class Dataset(torch_iterabledataset_class()):
             key_dot_level=key_dot_level,
             field_prefixes=(key,),
         ):
-            return len(sample_fields(cast(dict[str, object], sample))) > 0
+            if len(sample_fields(cast(dict[str, object], sample))) > 0:
+                return True
         return False
 
     def _materialize_select_cache(
