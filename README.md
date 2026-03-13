@@ -18,11 +18,13 @@ A minimal, high-performance data loading library for multimodal training pipelin
 - `Dataset.from_source(...)` as a compatibility dispatcher for mixed call sites
 - Chainable pipeline ops:
   - `.map(...)`
+  - `.select(keys, preprocessors=...)`
   - `.shuffle(buffer_size, initial=...)`
   - `.batch(batch_size, drop_last=..., collate_fn=...)`
   - `.unbatch()`
 - Tar workflows:
   - sample parsing from shard members
+  - optional field-group selection via `.select([...])`
   - optional sidecar merge via `.join([...])`. In this way, you can store different modalities in separate tars and join them on the fly via member naming conventions.
 - JSONL workflows:
   - optional `tar://` reference resolution via `.resolve_refs([...])`. In this way, you can use JSONL to store data like conversations and reference external image data in tar shards.
@@ -51,6 +53,7 @@ from mvp_dataset import Dataset, TorchLoader
 
 dataset = (
     Dataset.from_tars("/data/shards/shard_{000000..000006}.tar", resample=True)
+    .select(["image", "depth"], preprocessors={"depth": build_depth})
     .shuffle(buffer_size=1024)
     .map(lambda s: s)
 )
@@ -65,6 +68,30 @@ loader = (
 for batch in loader:
     train_step(batch)
 ```
+
+### TAR select + cache pipeline
+
+```python
+from mvp_dataset import Dataset
+
+def build_depth(sample):
+    # Return either bytes for "depth" or explicit field payloads.
+    return {"depth.png": run_preprocessing(sample["image.png"])}
+
+dataset = Dataset.from_tars("/data/shards/shard_{000000..000006}.tar").select(
+    ["image", "depth"],
+    preprocessors={"depth": build_depth},
+)
+
+for sample in dataset:
+    consume(sample["image.png"], sample["depth.png"])
+```
+
+`select(...)` matches field groups by prefix. For example, selecting `"image"` loads
+fields like `image.png`. If a requested key is missing from the tar source and no
+cached sidecar named `shard_000000_<key>.tar` exists yet, the corresponding
+preprocessor is run once per sample to create that cache tar. Later runs reuse the
+cached tar automatically.
 
 ### Joint TAR pipeline
 

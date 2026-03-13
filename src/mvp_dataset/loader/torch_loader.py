@@ -26,8 +26,11 @@ def _torch_dataloader_class() -> type:
 
     try:
         torch_utils_data = importlib.import_module("torch.utils.data")
-    except ModuleNotFoundError as exc:
-        msg = "[TorchUnavailable] install torch to use TorchLoader"
+    except (ModuleNotFoundError, ImportError) as exc:
+        msg = (
+            "[TorchUnavailable] failed to import 'torch.utils.data'; "
+            "ensure PyTorch is installed and importable to use TorchLoader"
+        )
         raise RuntimeError(msg) from exc
     return torch_utils_data.DataLoader
 

@@ -32,6 +32,12 @@ SidecarSpec = tuple[str, PathResolver]
 RefFieldSpec = tuple[str, PathLikeStr]
 """Reference resolver spec as ``(field_name, base_dir)``."""
 
+TarSelectValue = bytes | bytearray | Mapping[str, bytes | bytearray]
+"""Payload returned by a tar select preprocessor."""
+
+TarSelectPreprocessor = Callable[[Sample], TarSelectValue]
+"""Callable that materializes one requested tar field group for a sample."""
+
 Stage = Callable[[Iterable[object]], Iterable[object]]
 """One lazy transformation stage in the iterator pipeline."""
 
@@ -49,7 +55,7 @@ def _read_torch_runtime_values() -> tuple[int | None, int | None, int | None, in
         if torch_dist.is_available() and torch_dist.is_initialized():
             rank = int(torch_dist.get_rank())
             world_size = int(torch_dist.get_world_size())
-    except ModuleNotFoundError:
+    except Exception:  # noqa: BLE001
         pass
 
     try:
@@ -58,7 +64,7 @@ def _read_torch_runtime_values() -> tuple[int | None, int | None, int | None, in
         if worker_info is not None:
             worker_id = int(worker_info.id)
             num_workers = int(worker_info.num_workers)
-    except ModuleNotFoundError:
+    except Exception:  # noqa: BLE001
         pass
 
     return rank, world_size, worker_id, num_workers

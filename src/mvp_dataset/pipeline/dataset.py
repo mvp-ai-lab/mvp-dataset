@@ -5,14 +5,23 @@ from __future__ import annotations
 import importlib
 import os
 import random
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from types import ModuleType
 from typing import Literal, cast
 
-from ..core.types import RefFieldSpec, RuntimeContext, ShardInput, SidecarSpec, Stage
+from ..core.types import (
+    RefFieldSpec,
+    RuntimeContext,
+    ShardInput,
+    SidecarSpec,
+    Stage,
+    TarSelectPreprocessor,
+)
 from ..sources import iter_jsonls, iter_tars
 from ..sources.jsonl import materialize_jsonl_shards
+from ..sources.tar import cache_tar_path, normalize_select_output, sample_fields, write_select_cache
 from ..utils.sharding import iter_items
 from ..utils.url import normalize_paths
 from .ops import batch_samples, map_samples, shuffle_samples, unbatch_samples
@@ -22,6 +31,41 @@ SourceStore = list[str]
 SourceShape = Literal["tar_paths", "jsonl_paths"]
 
 
+def _normalize_selected_keys(keys: Sequence[str]) -> tuple[str, ...]:
+    """Validate and deduplicate selected tar field-group keys."""
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for key in keys:
+        if not isinstance(key, str):
+            msg = f"[InvalidSelectKey] expected str key, got={type(key).__name__}"
+            raise TypeError(msg)
+        candidate = key.strip()
+        if not candidate:
+            msg = "[InvalidSelectKey] select keys must be non-empty strings"
+            raise ValueError(msg)
+        if "/" in candidate or "\\" in candidate:
+            msg = f"[InvalidSelectKey] key={candidate!r} must not contain path separators"
+            raise ValueError(msg)
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        normalized.append(candidate)
+    if not normalized:
+        msg = "[InvalidSelectKey] select requires at least one key"
+        raise ValueError(msg)
+    return tuple(normalized)
+
+
+def _cache_sidecar_spec(key: str) -> SidecarSpec:
+    """Build the resolver used for cached select sidecars."""
+
+    def resolver(shard_path: str, *, selected_key: str = key) -> str:
+        return cache_tar_path(shard_path, selected_key)
+
+    return key, resolver
+
+
 def torch_iterabledataset_class(
     import_module: Callable[[str], ModuleType] = importlib.import_module,
 ) -> type:
@@ -29,7 +73,7 @@ def torch_iterabledataset_class(
 
     try:
         torch_utils_data = import_module("torch.utils.data")
-    except ModuleNotFoundError:
+    except Exception:  # noqa: BLE001
 
         class _IterableDatasetFallback:
             """Fallback IterableDataset shim when torch is unavailable."""
@@ -62,6 +106,7 @@ class Dataset(torch_iterabledataset_class()):
     _resample: bool
     _sidecar_specs: tuple[SidecarSpec, ...]
     _ref_fields: tuple[RefFieldSpec, ...]
+    _selected_keys: tuple[str, ...]
 
     @classmethod
     def from_tars(
@@ -279,6 +324,7 @@ class Dataset(torch_iterabledataset_class()):
             _resample=resample,
             _sidecar_specs=(),
             _ref_fields=(),
+            _selected_keys=(),
         )
 
     def join(self, sidecars: Sequence[SidecarSpec]) -> Dataset:
@@ -309,6 +355,7 @@ class Dataset(torch_iterabledataset_class()):
             _resample=self._resample,
             _sidecar_specs=self._sidecar_specs + tuple(sidecars),
             _ref_fields=self._ref_fields,
+            _selected_keys=self._selected_keys,
         )
 
     def resolve_refs(self, ref_fields: Sequence[RefFieldSpec]) -> Dataset:
@@ -338,6 +385,92 @@ class Dataset(torch_iterabledataset_class()):
             _resample=self._resample,
             _sidecar_specs=self._sidecar_specs,
             _ref_fields=self._ref_fields + tuple(ref_fields),
+            _selected_keys=self._selected_keys,
+        )
+
+    def select(
+        self,
+        keys: Sequence[str],
+        *,
+        preprocessors: Mapping[str, TarSelectPreprocessor] | None = None,
+    ) -> Dataset:
+        """Select tar field groups and materialize missing groups into cached tars.
+
+        Args:
+            keys: Field-group prefixes to load. A key matches a field when the
+                field name is exactly the key or starts with ``"{key}."``.
+            preprocessors: Optional mapping used to create missing field groups.
+                Each callable receives the merged sample produced by the current
+                tar source (including any existing joins) and returns either raw
+                bytes for ``key`` or a mapping like ``{"depth.png": payload}``.
+
+        Returns:
+            A new dataset that loads only the requested field groups, using
+            cache sidecars named ``<shard_stem>_<key>.tar`` for groups that were
+            materialized on demand.
+
+        Raises:
+            ValueError: If the dataset source is not tar-based, if requested key
+                availability is inconsistent across shards, or if a missing key
+                has no cache and no preprocessor.
+        """
+
+        if self.source_kind != "tars":
+            msg = "`select` currently supports only tar sources."
+            raise ValueError(msg)
+
+        selected_keys = _normalize_selected_keys(keys)
+        preprocessor_map = {} if preprocessors is None else dict(preprocessors)
+        key_dot_level = int(os.environ.get("LOADER_TAR_KEY_DOT_LEVEL", 1))
+        tar_paths = self._as_tar_source()
+        extra_sidecars: list[SidecarSpec] = []
+
+        for key in selected_keys:
+            availability = [
+                self._shard_has_selected_key(shard_path, key=key, key_dot_level=key_dot_level)
+                for shard_path in tar_paths
+            ]
+            if all(availability):
+                continue
+            if any(availability):
+                msg = (
+                    f"[InconsistentSelectKey] key={key!r} is present in only a subset of shards; "
+                    "materialize the dataset into consistent shards before using select"
+                )
+                raise ValueError(msg)
+
+            cached_ready = [self._cache_has_selected_key(shard_path, key=key, key_dot_level=key_dot_level) for shard_path in tar_paths]
+            if not all(cached_ready):
+                preprocessor = preprocessor_map.get(key)
+                if preprocessor is None:
+                    missing_shards = [str(Path(path).name) for path, ready in zip(tar_paths, cached_ready, strict=True) if not ready]
+                    msg = (
+                        f"[MissingSelectPreprocessor] key={key!r} is not present in the source shards and "
+                        f"cache shards are missing for {missing_shards!r}"
+                    )
+                    raise ValueError(msg)
+                for shard_path, ready in zip(tar_paths, cached_ready, strict=True):
+                    if ready:
+                        continue
+                    self._materialize_select_cache(
+                        shard_path,
+                        key=key,
+                        key_dot_level=key_dot_level,
+                        preprocessor=preprocessor,
+                    )
+
+            extra_sidecars.append(_cache_sidecar_spec(key))
+
+        return Dataset(
+            _source=self._source,
+            _source_shape=self._source_shape,
+            _stages=self._stages,
+            context=self.context,
+            source_kind=self.source_kind,
+            _resample=self._resample,
+            _sidecar_specs=self._sidecar_specs + tuple(extra_sidecars),
+            _ref_fields=self._ref_fields,
+            _selected_keys=selected_keys,
         )
 
     def _append_stage(self, stage: Stage) -> Dataset:
@@ -360,6 +493,7 @@ class Dataset(torch_iterabledataset_class()):
             _resample=self._resample,
             _sidecar_specs=self._sidecar_specs,
             _ref_fields=self._ref_fields,
+            _selected_keys=self._selected_keys,
         )
 
     def map(self, fn: Callable[[object], object]) -> Dataset:
@@ -461,6 +595,7 @@ class Dataset(torch_iterabledataset_class()):
                 shard_stream,
                 key_dot_level=tar_key_dot_level,
                 sidecars=self._sidecar_specs,
+                field_prefixes=self._selected_keys if self._selected_keys else None,
             )
         else:
             tar_cache_size = int(os.environ.get("LOADER_JSONL_TAR_CACHE_SIZE", 8))
@@ -510,3 +645,73 @@ class Dataset(torch_iterabledataset_class()):
             msg = "[InvalidSourceShape] expected jsonl_paths source shape"
             raise TypeError(msg)
         return cast(list[str], self._source)
+
+    def _shard_has_selected_key(
+        self,
+        shard_path: str,
+        *,
+        key: str,
+        key_dot_level: int,
+    ) -> bool:
+        """Return whether one shard already exposes the selected field group."""
+
+        for sample in iter_tars(
+            iter((shard_path,)),
+            key_dot_level=key_dot_level,
+            sidecars=self._sidecar_specs,
+            field_prefixes=(key,),
+        ):
+            if len(sample_fields(cast(dict[str, object], sample))) > 0:
+                return True
+        return False
+
+    def _cache_has_selected_key(
+        self,
+        shard_path: str,
+        *,
+        key: str,
+        key_dot_level: int,
+    ) -> bool:
+        """Return whether the cached sidecar exists and contains the selected key."""
+
+        cached_path = cache_tar_path(shard_path, key)
+        if not Path(cached_path).is_file():
+            return False
+        for sample in iter_tars(
+            iter((cached_path,)),
+            key_dot_level=key_dot_level,
+            field_prefixes=(key,),
+        ):
+            if len(sample_fields(cast(dict[str, object], sample))) > 0:
+                return True
+        return False
+
+    def _materialize_select_cache(
+        self,
+        shard_path: str,
+        *,
+        key: str,
+        key_dot_level: int,
+        preprocessor: TarSelectPreprocessor,
+    ) -> None:
+        """Create one cached select sidecar for a missing field group."""
+
+        source_samples = iter_tars(
+            iter((shard_path,)),
+            key_dot_level=key_dot_level,
+            sidecars=self._sidecar_specs,
+        )
+
+        def cached_samples() -> Iterator[dict[str, object]]:
+            produced_any = False
+            for sample in source_samples:
+                normalized_fields = normalize_select_output(key, preprocessor(cast(dict[str, object], sample)))
+                cached_sample: dict[str, object] = {"__key__": cast(dict[str, object], sample)["__key__"]}
+                cached_sample.update(normalized_fields)
+                produced_any = True
+                yield cached_sample
+            if not produced_any:
+                msg = f"[EmptySelectSource] key={key!r} shard={shard_path!r} contained no samples"
+                raise ValueError(msg)
+
+        write_select_cache(shard_path, key=key, samples=cached_samples())
