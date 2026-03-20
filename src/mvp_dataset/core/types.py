@@ -6,6 +6,7 @@ import importlib
 import os
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from typing import Protocol
 
 # ---------------------------------------------------------------------------
 # Shared aliases
@@ -34,6 +35,16 @@ RefFieldSpec = tuple[str, PathLikeStr]
 
 Stage = Callable[[Iterable[object]], Iterable[object]]
 """One lazy transformation stage in the iterator pipeline."""
+
+
+class Assembler[T, U](Protocol):
+    """Stateful stream assembler that may emit outputs after consuming inputs."""
+
+    def push(self, sample: T) -> Iterable[U]:
+        """Consume one upstream sample and yield any completed outputs."""
+
+    def finish(self, *, drop_last: bool = False) -> Iterable[U]:
+        """Flush remaining state at end of stream."""
 
 
 def _read_torch_runtime_values() -> tuple[int | None, int | None, int | None, int | None]:

@@ -10,12 +10,25 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Literal, cast
 
-from ..core.types import RefFieldSpec, RuntimeContext, ShardInput, SidecarSpec, Stage
+from ..core.types import (
+    Assembler,
+    RefFieldSpec,
+    RuntimeContext,
+    ShardInput,
+    SidecarSpec,
+    Stage,
+)
 from ..sources import iter_jsonls, iter_tars
 from ..sources.jsonl import materialize_jsonl_shards
 from ..utils.sharding import iter_items
 from ..utils.url import normalize_paths
-from .ops import batch_samples, map_samples, shuffle_samples, unbatch_samples
+from .ops import (
+    assemble_samples,
+    batch_samples,
+    map_samples,
+    shuffle_samples,
+    unbatch_samples,
+)
 
 SourceKind = Literal["jsonl", "tars"]
 SourceStore = list[str]
@@ -421,6 +434,34 @@ class Dataset(torch_iterabledataset_class()):
                 batch_size=batch_size,
                 drop_last=drop_last,
                 collate_fn=collate_fn,
+            )
+
+        return self._append_stage(stage)
+
+    def assemble(
+        self,
+        factory: Callable[[RuntimeContext], Assembler[object, object]],
+        *,
+        drop_last: bool = False,
+    ) -> Dataset:
+        """Append a stateful assembly stage.
+
+        Args:
+            factory: Callable that builds one fresh assembler for each iterator
+                execution. The assembler may consume multiple upstream samples
+                before yielding one or more downstream outputs.
+            drop_last: Whether to discard unfinished tail state instead of
+                delegating it to the assembler's final flush.
+
+        Returns:
+            A new dataset that assembles the upstream sample stream lazily.
+        """
+
+        def stage(data: Iterable[object]) -> Iterable[object]:
+            return assemble_samples(
+                data,
+                factory=lambda: factory(self.context),
+                drop_last=drop_last,
             )
 
         return self._append_stage(stage)

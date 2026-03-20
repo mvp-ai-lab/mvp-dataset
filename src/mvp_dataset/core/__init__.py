@@ -1,6 +1,7 @@
 """Core shared types and primitives."""
 
 from .types import (
+    Assembler,
     GroupedSample,
     PathLikeStr,
     RefFieldSpec,
@@ -11,6 +12,7 @@ from .types import (
 )
 
 __all__ = [
+    "Assembler",
     "GroupedSample",
     "PathLikeStr",
     "RefFieldSpec",
