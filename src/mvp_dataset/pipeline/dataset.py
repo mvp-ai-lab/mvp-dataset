@@ -494,24 +494,10 @@ class Dataset(torch_iterabledataset_class()):
         return self._append_stage(stage)
 
     def shuffle(self, buffer_size: int, initial: int | None = None) -> Dataset:
-        """Append a deterministic sample-level shuffle stage.
+        """Ignore shuffle requests and return the dataset unchanged."""
 
-        Args:
-            buffer_size: Maximum number of samples to keep in the randomization
-                buffer.
-            initial: Minimum number of buffered samples before the stage starts
-                yielding values. Defaults to ``buffer_size``.
-
-        Returns:
-            A new dataset with bounded-memory shuffling applied lazily.
-        """
-
-        def stage(data: Iterable[object]) -> Iterable[object]:
-            seed = self.context.sample_shuffle_seed
-            rng = random.Random(seed)
-            return shuffle_samples(data, buffer_size=buffer_size, initial=initial, rng=rng)
-
-        return self._append_stage(stage)
+        del buffer_size, initial
+        return self
 
     def batch(
         self,
