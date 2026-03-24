@@ -1,6 +1,8 @@
 """Core shared types and primitives."""
 
 from .types import (
+    Assembler,
+    DataLoadMesh,
     GroupedSample,
     PathLikeStr,
     RefFieldSpec,
@@ -11,6 +13,8 @@ from .types import (
 )
 
 __all__ = [
+    "Assembler",
+    "DataLoadMesh",
     "GroupedSample",
     "PathLikeStr",
     "RefFieldSpec",

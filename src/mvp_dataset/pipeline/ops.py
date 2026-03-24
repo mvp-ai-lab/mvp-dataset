@@ -5,6 +5,8 @@ from __future__ import annotations
 import random
 from collections.abc import Callable, Iterable, Iterator
 
+from ..core.types import Assembler
+
 
 def map_samples[T, U](data: Iterable[T], fn: Callable[[T], U]) -> Iterator[U]:
     """Lazily apply ``fn`` to each sample in ``data``."""
@@ -87,6 +89,20 @@ def batch_samples[T, U](
 
     if batch and not drop_last:
         yield collate_fn(batch) if collate_fn is not None else list(batch)
+
+
+def assemble_samples[T, U](
+    data: Iterable[T],
+    *,
+    factory: Callable[[], Assembler[T, U]],
+    drop_last: bool = False,
+) -> Iterator[U]:
+    """Assemble a stream with stateful many-to-one or many-to-many logic."""
+
+    assembler = factory()
+    for sample in data:
+        yield from assembler.push(sample)
+    yield from assembler.finish(drop_last=drop_last)
 
 
 def unbatch_samples(data: Iterable[object]) -> Iterator[object]:
