@@ -18,11 +18,29 @@ from ..core.types import (
     ShardInput,
     SidecarSpec,
     Stage,
+    TarMapCacheEntry,
+    TarMapCacheStage,
     TarSelectPreprocessor,
 )
 from ..sources import iter_jsonls, iter_tars
-from ..sources.jsonl import materialize_jsonl_shards
-from ..sources.tar import cache_tar_path, normalize_select_output, sample_fields, write_select_cache
+from ..sources.jsonl import (
+    count_jsonl_samples,
+    jsonl_cache_path,
+    jsonl_source_fingerprint,
+    materialize_jsonl_shards,
+    write_jsonl_cache,
+)
+from ..sources.tar import (
+    cache_field_name,
+    cache_tar_path,
+    count_tar_samples,
+    is_cache_field_name,
+    normalize_select_output,
+    sample_fields,
+    tar_map_output_fingerprint,
+    tar_source_fingerprint,
+    write_select_cache,
+)
 from ..utils.selection import normalize_selected_keys
 from ..utils.sharding import iter_items
 from ..utils.url import normalize_paths
@@ -39,13 +57,33 @@ SourceStore = list[str]
 SourceShape = Literal["tar_paths", "jsonl_paths"]
 
 
-def _cache_sidecar_spec(key: str) -> SidecarSpec:
+def _cache_sidecar_spec(key: str, fingerprint: str | None = None) -> SidecarSpec:
     """Build the resolver used for cached select sidecars."""
 
-    def resolver(shard_path: str, *, selected_key: str = key) -> str:
-        return cache_tar_path(shard_path, selected_key)
+    def resolver(
+        shard_path: str,
+        *,
+        selected_key: str = key,
+        selected_fingerprint: str | None = fingerprint,
+    ) -> str:
+        return cache_tar_path(shard_path, selected_key, selected_fingerprint)
 
-    return key, resolver
+    sidecar_name = key if fingerprint is None else f"{key}:{fingerprint}"
+    return sidecar_name, resolver
+
+
+def _jsonl_cache_sidecar_spec(key: str, fingerprint: str) -> SidecarSpec:
+    """Build the resolver used for cached JSONL keyed-map sidecars."""
+
+    def resolver(
+        shard_path: str,
+        *,
+        selected_key: str = key,
+        selected_fingerprint: str = fingerprint,
+    ) -> str:
+        return jsonl_cache_path(shard_path, selected_key, selected_fingerprint)
+
+    return f"{key}:{fingerprint}", resolver
 
 
 def torch_iterabledataset_class(
@@ -89,6 +127,7 @@ class Dataset(torch_iterabledataset_class()):
     _sidecar_specs: tuple[SidecarSpec, ...]
     _ref_fields: tuple[RefFieldSpec, ...]
     _selected_keys: tuple[str, ...]
+    _tar_map_stages: tuple[TarMapCacheStage, ...]
 
     @classmethod
     def from_tars(
@@ -307,6 +346,7 @@ class Dataset(torch_iterabledataset_class()):
             _sidecar_specs=(),
             _ref_fields=(),
             _selected_keys=(),
+            _tar_map_stages=(),
         )
 
     def join(self, sidecars: Sequence[SidecarSpec]) -> Dataset:
@@ -338,6 +378,7 @@ class Dataset(torch_iterabledataset_class()):
             _sidecar_specs=self._sidecar_specs + tuple(sidecars),
             _ref_fields=self._ref_fields,
             _selected_keys=self._selected_keys,
+            _tar_map_stages=self._tar_map_stages,
         )
 
     def resolve_refs(self, ref_fields: Sequence[RefFieldSpec]) -> Dataset:
@@ -368,6 +409,7 @@ class Dataset(torch_iterabledataset_class()):
             _sidecar_specs=self._sidecar_specs,
             _ref_fields=self._ref_fields + tuple(ref_fields),
             _selected_keys=self._selected_keys,
+            _tar_map_stages=self._tar_map_stages,
         )
 
     def select(
@@ -405,11 +447,17 @@ class Dataset(torch_iterabledataset_class()):
         preprocessor_map = {} if preprocessors is None else dict(preprocessors)
         key_dot_level = int(os.environ.get("LOADER_TAR_KEY_DOT_LEVEL", 1))
         tar_paths = self._as_tar_source()
+        upstream_sidecars = self._resolved_tar_sidecars(tar_paths, key_dot_level=key_dot_level)
         extra_sidecars: list[SidecarSpec] = []
 
         for key in selected_keys:
             availability = [
-                self._shard_has_selected_key(shard_path, key=key, key_dot_level=key_dot_level)
+                self._shard_has_selected_key(
+                    shard_path,
+                    key=key,
+                    key_dot_level=key_dot_level,
+                    sidecars=upstream_sidecars,
+                )
                 for shard_path in tar_paths
             ]
             if all(availability):
@@ -438,6 +486,7 @@ class Dataset(torch_iterabledataset_class()):
                         shard_path,
                         key=key,
                         key_dot_level=key_dot_level,
+                        sidecars=upstream_sidecars,
                         preprocessor=preprocessor,
                     )
 
@@ -453,6 +502,7 @@ class Dataset(torch_iterabledataset_class()):
             _sidecar_specs=self._sidecar_specs + tuple(extra_sidecars),
             _ref_fields=self._ref_fields,
             _selected_keys=selected_keys,
+            _tar_map_stages=self._tar_map_stages,
         )
 
     def _append_stage(self, stage: Stage) -> Dataset:
@@ -476,17 +526,63 @@ class Dataset(torch_iterabledataset_class()):
             _sidecar_specs=self._sidecar_specs,
             _ref_fields=self._ref_fields,
             _selected_keys=self._selected_keys,
+            _tar_map_stages=self._tar_map_stages,
         )
 
-    def map(self, fn: Callable[[object], object]) -> Dataset:
+    def map(
+        self,
+        fn: Callable[[object], object] | Mapping[str, TarSelectPreprocessor],
+    ) -> Dataset:
         """Append a lazy map stage.
 
         Args:
-            fn: Callable applied to each sample yielded by the upstream stage.
+            fn: Callable applied to each sample yielded by the upstream stage,
+                or a mapping of tar field-group keys to preprocessors for
+                staged tar cache materialization.
 
         Returns:
-            A new dataset that applies ``fn`` lazily during iteration.
+            A new dataset that applies ``fn`` lazily during iteration or stores
+            tar cache metadata for later materialization.
         """
+
+        if isinstance(fn, Mapping):
+            if self.source_kind not in ("tars", "jsonl"):
+                msg = "`map({key: fn})` currently supports only tar or jsonl sources."
+                raise ValueError(msg)
+            if self._stages:
+                msg = "`map({key: fn})` must be declared before non-source pipeline stages."
+                raise ValueError(msg)
+
+            normalized_keys = normalize_selected_keys(tuple(fn.keys()))
+            latest_fingerprints = self._latest_tar_map_fingerprints()
+            source_fingerprint = self._tar_source_fingerprint() if self.source_kind == "tars" else self._jsonl_source_fingerprint()
+            entries: list[TarMapCacheEntry] = []
+
+            for key in normalized_keys:
+                preprocessor = fn[key]
+                input_fingerprint = latest_fingerprints.get(key, source_fingerprint)
+                output_fingerprint = tar_map_output_fingerprint(input_fingerprint, preprocessor)
+                entries.append(
+                    TarMapCacheEntry(
+                        key=key,
+                        preprocessor=preprocessor,
+                        input_fingerprint=input_fingerprint,
+                        output_fingerprint=output_fingerprint,
+                    )
+                )
+
+            return Dataset(
+                _source=self._source,
+                _source_shape=self._source_shape,
+                _stages=self._stages,
+                context=self.context,
+                source_kind=self.source_kind,
+                _resample=self._resample,
+                _sidecar_specs=self._sidecar_specs,
+                _ref_fields=self._ref_fields,
+                _selected_keys=self._selected_keys,
+                _tar_map_stages=self._tar_map_stages + (TarMapCacheStage(entries=tuple(entries)),),
+            )
 
         def stage(data: Iterable[object]) -> Iterable[object]:
             return map_samples(data, fn)
@@ -590,13 +686,14 @@ class Dataset(torch_iterabledataset_class()):
             stream = iter_tars(
                 shard_stream,
                 key_dot_level=tar_key_dot_level,
-                sidecars=self._sidecar_specs,
+                sidecars=self._resolved_tar_sidecars(tar_paths, key_dot_level=tar_key_dot_level),
                 field_prefixes=self._selected_keys if self._selected_keys else None,
             )
         else:
             tar_cache_size = int(os.environ.get("LOADER_JSONL_TAR_CACHE_SIZE", 8))
+            jsonl_paths = self._as_jsonl_source()
             shard_stream = iter_items(
-                self._as_jsonl_source(),
+                jsonl_paths,
                 context=context,
                 resample=self._resample,
             )
@@ -605,6 +702,11 @@ class Dataset(torch_iterabledataset_class()):
                 ref_fields=self._ref_fields,
                 key_dot_level=tar_key_dot_level,
                 tar_cache_size=tar_cache_size,
+                cache_specs=self._resolved_jsonl_sidecars(
+                    jsonl_paths,
+                    key_dot_level=tar_key_dot_level,
+                    tar_cache_size=tar_cache_size,
+                ),
             )
 
         for stage in self._stages:
@@ -642,19 +744,25 @@ class Dataset(torch_iterabledataset_class()):
             raise TypeError(msg)
         return cast(list[str], self._source)
 
+    def _jsonl_source_fingerprint(self) -> str:
+        """Return the base fingerprint used by JSONL map cache stages."""
+
+        return jsonl_source_fingerprint(self._as_jsonl_source(), ref_fields=self._ref_fields)
+
     def _shard_has_selected_key(
         self,
         shard_path: str,
         *,
         key: str,
         key_dot_level: int,
+        sidecars: Sequence[SidecarSpec] | None = None,
     ) -> bool:
         """Return whether one shard already exposes the selected field group."""
 
         for sample in iter_tars(
             iter((shard_path,)),
             key_dot_level=key_dot_level,
-            sidecars=self._sidecar_specs,
+            sidecars=sidecars,
             field_prefixes=(key,),
         ):
             if len(sample_fields(cast(dict[str, object], sample))) > 0:
@@ -673,6 +781,8 @@ class Dataset(torch_iterabledataset_class()):
         cached_path = cache_tar_path(shard_path, key)
         if not Path(cached_path).is_file():
             return False
+        if count_tar_samples(cached_path, key_dot_level=key_dot_level) != count_tar_samples(shard_path, key_dot_level=key_dot_level):
+            return False
         for sample in iter_tars(
             iter((cached_path,)),
             key_dot_level=key_dot_level,
@@ -688,6 +798,7 @@ class Dataset(torch_iterabledataset_class()):
         *,
         key: str,
         key_dot_level: int,
+        sidecars: Sequence[SidecarSpec] | None = None,
         preprocessor: TarSelectPreprocessor,
     ) -> None:
         """Create one cached select sidecar for a missing field group."""
@@ -695,7 +806,7 @@ class Dataset(torch_iterabledataset_class()):
         source_samples = iter_tars(
             iter((shard_path,)),
             key_dot_level=key_dot_level,
-            sidecars=self._sidecar_specs,
+            sidecars=sidecars,
         )
 
         def cached_samples() -> Iterator[dict[str, object]]:
@@ -710,4 +821,210 @@ class Dataset(torch_iterabledataset_class()):
                 msg = f"[EmptySelectSource] key={key!r} shard={shard_path!r} contained no samples"
                 raise ValueError(msg)
 
-        write_select_cache(shard_path, key=key, samples=cached_samples())
+        write_select_cache(
+            shard_path,
+            key=key,
+            samples=cached_samples(),
+            expected_sample_count=count_tar_samples(shard_path, key_dot_level=key_dot_level),
+        )
+
+    def _tar_source_fingerprint(self) -> str:
+        """Return the base fingerprint used by tar map cache stages."""
+
+        return tar_source_fingerprint(self._as_tar_source())
+
+    def _latest_tar_map_fingerprints(self) -> dict[str, str]:
+        """Return the latest cache fingerprint for each tar map key."""
+
+        latest: dict[str, str] = {}
+        for stage in self._tar_map_stages:
+            for entry in stage.entries:
+                latest[entry.key] = entry.output_fingerprint
+        return latest
+
+    def _resolved_tar_sidecars(
+        self,
+        tar_paths: Sequence[str],
+        *,
+        key_dot_level: int,
+    ) -> tuple[SidecarSpec, ...]:
+        """Materialize missing tar map caches and return the full sidecar chain."""
+
+        resolved_sidecars: list[SidecarSpec] = list(self._sidecar_specs)
+        pending_entries: dict[str, list[TarMapCacheEntry]] = {}
+        latest_fingerprints = self._latest_tar_map_fingerprints()
+        for stage in self._tar_map_stages:
+            for entry in stage.entries:
+                pending_entries.setdefault(entry.key, []).append(entry)
+                if latest_fingerprints.get(entry.key) != entry.output_fingerprint:
+                    continue
+                for shard_path in tar_paths:
+                    cached_path = cache_tar_path(shard_path, entry.key, entry.output_fingerprint)
+                    expected_sample_count = count_tar_samples(shard_path, key_dot_level=key_dot_level)
+                    if (
+                        Path(cached_path).is_file()
+                        and count_tar_samples(cached_path, key_dot_level=key_dot_level) == expected_sample_count
+                    ):
+                        continue
+                    self._materialize_map_cache(
+                        shard_path,
+                        map_entries=tuple(pending_entries[entry.key]),
+                        key=entry.key,
+                        output_fingerprint=entry.output_fingerprint,
+                        key_dot_level=key_dot_level,
+                        sidecars=tuple(resolved_sidecars),
+                        expected_sample_count=expected_sample_count,
+                    )
+                resolved_sidecars = [
+                    sidecar for sidecar in resolved_sidecars if not sidecar[0].startswith(f"{entry.key}:")
+                ]
+                resolved_sidecars.append(_cache_sidecar_spec(entry.key, entry.output_fingerprint))
+                pending_entries.pop(entry.key, None)
+        return tuple(resolved_sidecars)
+
+    def _materialize_map_cache(
+        self,
+        shard_path: str,
+        *,
+        map_entries: Sequence[TarMapCacheEntry],
+        key: str,
+        output_fingerprint: str,
+        key_dot_level: int,
+        sidecars: Sequence[SidecarSpec],
+        expected_sample_count: int,
+    ) -> bool:
+        """Create one cached tar map sidecar for a shard and stage entry."""
+
+        source_samples = iter_tars(
+            iter((shard_path,)),
+            key_dot_level=key_dot_level,
+            sidecars=sidecars,
+        )
+
+        def cached_samples() -> Iterator[dict[str, object]]:
+            produced_any = False
+            for sample in source_samples:
+                cached_sample: dict[str, object] = {"__key__": cast(dict[str, object], sample)["__key__"]}
+                working_sample = dict(cast(dict[str, object], sample))
+                emitted_fields: dict[str, bytes] = {
+                    field_name: cast(bytes, payload)
+                    for field_name, payload in working_sample.items()
+                    if isinstance(payload, (bytes, bytearray)) and is_cache_field_name(field_name, key=key)
+                }
+                for entry in map_entries:
+                    normalized_fields = {
+                        cache_field_name(field_name, key=entry.key, fingerprint=entry.output_fingerprint): payload
+                        for field_name, payload in normalize_select_output(
+                            entry.key,
+                            entry.preprocessor(working_sample),
+                        ).items()
+                    }
+                    working_sample.update(normalized_fields)
+                    emitted_fields.update(normalized_fields)
+                cached_sample.update(emitted_fields)
+                produced_any = True
+                yield cached_sample
+            if not produced_any:
+                return
+        write_select_cache(
+            shard_path,
+            key=key,
+            samples=cached_samples(),
+            fingerprint=output_fingerprint,
+            expected_sample_count=expected_sample_count,
+        )
+        return True
+
+    def _resolved_jsonl_sidecars(
+        self,
+        shard_paths: Sequence[str],
+        *,
+        key_dot_level: int,
+        tar_cache_size: int,
+    ) -> tuple[SidecarSpec, ...]:
+        """Materialize missing JSONL keyed-map caches and return active sidecars."""
+
+        resolved_sidecars: list[SidecarSpec] = []
+        pending_entries: dict[str, list[TarMapCacheEntry]] = {}
+        latest_fingerprints = self._latest_tar_map_fingerprints()
+        for stage in self._tar_map_stages:
+            for entry in stage.entries:
+                pending_entries.setdefault(entry.key, []).append(entry)
+                if latest_fingerprints.get(entry.key) != entry.output_fingerprint:
+                    continue
+                for shard_path in shard_paths:
+                    cached_path = jsonl_cache_path(shard_path, entry.key, entry.output_fingerprint)
+                    expected_sample_count = count_jsonl_samples(shard_path)
+                    if Path(cached_path).is_file() and count_jsonl_samples(cached_path) == expected_sample_count:
+                        continue
+                    self._materialize_jsonl_map_cache(
+                        shard_path,
+                        map_entries=tuple(pending_entries[entry.key]),
+                        key=entry.key,
+                        output_fingerprint=entry.output_fingerprint,
+                        key_dot_level=key_dot_level,
+                        tar_cache_size=tar_cache_size,
+                        sidecars=tuple(resolved_sidecars),
+                        expected_sample_count=expected_sample_count,
+                    )
+                resolved_sidecars = [
+                    sidecar for sidecar in resolved_sidecars if not sidecar[0].startswith(f"{entry.key}:")
+                ]
+                resolved_sidecars.append(_jsonl_cache_sidecar_spec(entry.key, entry.output_fingerprint))
+                pending_entries.pop(entry.key, None)
+        return tuple(resolved_sidecars)
+
+    def _materialize_jsonl_map_cache(
+        self,
+        shard_path: str,
+        *,
+        map_entries: Sequence[TarMapCacheEntry],
+        key: str,
+        output_fingerprint: str,
+        key_dot_level: int,
+        tar_cache_size: int,
+        sidecars: Sequence[SidecarSpec],
+        expected_sample_count: int,
+    ) -> None:
+        """Create one cached JSONL keyed-map sidecar for a shard."""
+
+        source_samples = iter_jsonls(
+            iter((shard_path,)),
+            ref_fields=self._ref_fields,
+            key_dot_level=key_dot_level,
+            tar_cache_size=tar_cache_size,
+            cache_specs=tuple(sidecars),
+        )
+
+        def cached_samples() -> Iterator[dict[str, object]]:
+            for sample in source_samples:
+                working_sample = dict(cast(dict[str, object], sample))
+                emitted_fields: dict[str, bytes] = {
+                    field_name: cast(bytes, payload)
+                    for field_name, payload in working_sample.items()
+                    if isinstance(payload, (bytes, bytearray)) and is_cache_field_name(field_name, key=key)
+                }
+                for entry in map_entries:
+                    normalized_fields = {
+                        cache_field_name(field_name, key=entry.key, fingerprint=entry.output_fingerprint): payload
+                        for field_name, payload in normalize_select_output(
+                            entry.key,
+                            entry.preprocessor(working_sample),
+                        ).items()
+                    }
+                    working_sample.update(normalized_fields)
+                    emitted_fields.update(normalized_fields)
+                yield {
+                    "__key__": working_sample["__key__"],
+                    "__index_in_file__": working_sample["__index_in_file__"],
+                    "__file__": working_sample["__file__"],
+                    "__cache_fields__": emitted_fields,
+                }
+
+        write_jsonl_cache(
+            shard_path,
+            key=key,
+            samples=cached_samples(),
+            fingerprint=output_fingerprint,
+            expected_sample_count=expected_sample_count,
+        )

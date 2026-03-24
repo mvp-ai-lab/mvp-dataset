@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import itertools
+import os
 import tarfile
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from functools import partial
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path, PurePosixPath
+from string import hexdigits
 from typing import Final, cast
 
 from ..core.types import PathLikeStr, Sample, SidecarSpec, TarSelectValue
@@ -59,10 +63,108 @@ def field_matches(field: str, prefixes: Sequence[str]) -> bool:
     return False
 
 
-def cache_tar_path(shard_path: PathLikeStr, key: str) -> str:
+def fingerprint_parts(*parts: str) -> str:
+    """Return a short stable fingerprint for cache identity."""
+
+    digest = hashlib.sha256()
+    for part in parts:
+        digest.update(part.encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()[:16]
+
+
+def callable_fingerprint(fn: Callable[..., object]) -> str:
+    """Return a deterministic fingerprint for one callable."""
+
+    if isinstance(fn, partial):
+        keyword_items = () if fn.keywords is None else tuple(sorted(fn.keywords.items()))
+        return fingerprint_parts(
+            "partial",
+            callable_fingerprint(fn.func),
+            repr(fn.args),
+            repr(keyword_items),
+        )
+
+    code = getattr(fn, "__code__", None)
+    code_fingerprint = ""
+    if code is not None:
+        code_fingerprint = fingerprint_parts(
+            code.co_code.hex(),
+            repr(code.co_consts),
+            repr(code.co_names),
+        )
+    closure = getattr(fn, "__closure__", None)
+    closure_fingerprint = ""
+    if closure is not None:
+        closure_fingerprint = repr(tuple(cell.cell_contents for cell in closure))
+    return fingerprint_parts(
+        getattr(fn, "__module__", "<unknown>"),
+        getattr(fn, "__qualname__", getattr(fn, "__name__", repr(fn))),
+        code_fingerprint,
+        repr(getattr(fn, "__defaults__", None)),
+        repr(getattr(fn, "__kwdefaults__", None)),
+        closure_fingerprint,
+    )
+
+
+def cache_tar_dir(shard_path: PathLikeStr) -> Path:
+    """Return the cache directory used for fingerprinted shard sidecars."""
+
+    return Path(shard_path).parent / ".cache"
+
+
+def cache_tar_glob(shard_path: PathLikeStr, key: str) -> str:
+    """Return the glob pattern for all fingerprinted cache sidecars of one key."""
+
+    path = Path(shard_path)
+    return str(cache_tar_dir(path) / f"{path.stem}-{key}-*{path.suffix}")
+
+
+def tar_source_fingerprint(shard_paths: Sequence[PathLikeStr]) -> str:
+    """Return the base fingerprint used by tar map cache stages."""
+
+    return fingerprint_parts("tar-source", *(str(path) for path in shard_paths))
+
+
+def tar_map_output_fingerprint(input_fingerprint: str, fn: Callable[..., object]) -> str:
+    """Return the output fingerprint for one tar map stage."""
+
+    return fingerprint_parts("tar-map-v2", input_fingerprint, callable_fingerprint(fn))
+
+
+def cache_field_name(field_name: str, *, key: str, fingerprint: str) -> str:
+    """Return one field name rewritten to include the stage fingerprint."""
+
+    if field_name == key:
+        return f"{key}.{fingerprint}"
+    prefix = f"{key}."
+    if not field_name.startswith(prefix):
+        msg = f"[InvalidCacheFieldName] field={field_name!r} does not match key prefix {key!r}"
+        raise ValueError(msg)
+    return f"{key}.{fingerprint}.{field_name[len(prefix):]}"
+
+
+def is_cache_field_name(field_name: str, *, key: str) -> bool:
+    """Return whether one field name is a fingerprinted cached output for ``key``."""
+
+    prefix = f"{key}."
+    if not field_name.startswith(prefix):
+        return False
+    remainder = field_name[len(prefix):]
+    fingerprint = remainder.split(".", 1)[0]
+    return len(fingerprint) == 16 and all(char in hexdigits for char in fingerprint)
+
+
+def cache_tar_path(
+    shard_path: PathLikeStr,
+    key: str,
+    fingerprint: str | None = None,
+) -> str:
     """Return the cache tar path for one selected field group."""
 
     path = Path(shard_path)
+    if fingerprint is not None:
+        return str(cache_tar_dir(path) / f"{path.stem}-{key}-{fingerprint}{path.suffix}")
     return str(path.with_name(f"{path.stem}_{key}{path.suffix}"))
 
 
@@ -162,6 +264,12 @@ def iter_tar(
         yield current_sample
 
 
+def count_tar_samples(shard_path: PathLikeStr, *, key_dot_level: int = 1) -> int:
+    """Return the number of grouped samples in one tar shard."""
+
+    return sum(1 for _ in iter_tar(shard_path, key_dot_level=key_dot_level))
+
+
 def sample_fields(sample: Sample) -> tuple[str, ...]:
     """Return non-metadata field names from one sample."""
 
@@ -219,16 +327,23 @@ def iter_tars(
             field_prefixes=field_prefixes,
         )
         sidecar_iters: list[tuple[str, Iterator[Sample]]] = [
-            (
-                name,
-                iter_tar(
-                    fn(shard_path),
-                    key_dot_level=key_dot_level,
-                    field_prefixes=field_prefixes,
-                ),
-            )
-            for name, fn in sidecars
         ]
+        for name, fn in sidecars:
+            sidecar_path = Path(fn(shard_path))
+            # Fingerprinted map caches are optional per shard: shards without a
+            # matching key simply do not materialize that sidecar.
+            if ":" in name and not sidecar_path.is_file():
+                continue
+            sidecar_iters.append(
+                (
+                    name,
+                    iter_tar(
+                        sidecar_path,
+                        key_dot_level=key_dot_level,
+                        field_prefixes=field_prefixes,
+                    ),
+                )
+            )
         all_iters = [main_iter, *(it for _, it in sidecar_iters)]
 
         for group in itertools.zip_longest(*all_iters, fillvalue=_SENTINEL):
@@ -245,7 +360,7 @@ def iter_tars(
             main_key = _require_sample_key(main_sample, shard_path=shard_path, source_name="main")
             merged: Sample = dict(main_sample)
 
-            for i, (sidecar_name, _) in enumerate(sidecars):
+            for i, (sidecar_name, _) in enumerate(sidecar_iters):
                 sidecar_sample = cast(Sample, group[i + 1])
                 sidecar_key = _require_sample_key(
                     sidecar_sample,
@@ -283,16 +398,22 @@ def write_select_cache(
     *,
     key: str,
     samples: Iterable[Sample],
+    fingerprint: str | None = None,
+    expected_sample_count: int | None = None,
 ) -> str:
     """Write one cached select tar for the provided samples."""
 
-    output_path = cache_tar_path(shard_path, key)
-    with tarfile.open(output_path, mode="w") as archive:
+    output_path = cache_tar_path(shard_path, key, fingerprint)
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    temp_path = f"{output_path}.tmp"
+    written_samples = 0
+    with tarfile.open(temp_path, mode="w") as archive:
         for sample in samples:
             sample_key = sample.get("__key__")
             if not isinstance(sample_key, str):
                 msg = f"[InvalidSampleKey] key={key!r} shard={str(shard_path)!r} sample missing string '__key__'"
                 raise ValueError(msg)
+            written_samples += 1
             for field_name, payload in sample.items():
                 if field_name.startswith("__") and field_name.endswith("__"):
                     continue
@@ -307,4 +428,12 @@ def write_select_cache(
                 payload_bytes = bytes(payload)
                 info.size = len(payload_bytes)
                 archive.addfile(info, io.BytesIO(payload_bytes))
+    if expected_sample_count is not None and written_samples != expected_sample_count:
+        Path(temp_path).unlink(missing_ok=True)
+        msg = (
+            f"[CacheSampleCountMismatch] key={key!r} shard={str(shard_path)!r} "
+            f"expected={expected_sample_count} wrote={written_samples}"
+        )
+        raise ValueError(msg)
+    os.replace(temp_path, output_path)
     return output_path

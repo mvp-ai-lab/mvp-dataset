@@ -40,6 +40,24 @@ TarSelectValue = bytes | bytearray | Mapping[str, bytes | bytearray]
 TarSelectPreprocessor = Callable[[Sample], TarSelectValue]
 """Callable that materializes one requested tar field group for a sample."""
 
+
+@dataclass(frozen=True, slots=True)
+class TarMapCacheEntry:
+    """One cached tar map output keyed by field-group prefix."""
+
+    key: str
+    preprocessor: TarSelectPreprocessor
+    input_fingerprint: str
+    output_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class TarMapCacheStage:
+    """One tar map stage that may materialize multiple cached field groups."""
+
+    entries: tuple[TarMapCacheEntry, ...]
+
+
 Stage = Callable[[Iterable[object]], Iterable[object]]
 """One lazy transformation stage in the iterator pipeline."""
 

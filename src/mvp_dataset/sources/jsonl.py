@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
+import os
 import tarfile
 from collections import OrderedDict
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 
-from ..core.types import PathLikeStr, RefFieldSpec, Sample
+from ..core.types import PathLikeStr, RefFieldSpec, Sample, SidecarSpec
+from .tar import fingerprint_parts
 
 _TAR_URI_PREFIX = "tar://"
 
@@ -248,11 +251,57 @@ def materialize_jsonl_shards(
     return [str(path) for path in shard_paths]
 
 
+def jsonl_cache_dir(shard_path: PathLikeStr) -> Path:
+    """Return the cache directory used for fingerprinted JSONL sidecars."""
+
+    return Path(shard_path).parent / ".cache"
+
+
+def jsonl_cache_glob(shard_path: PathLikeStr, key: str) -> str:
+    """Return the glob pattern for all fingerprinted JSONL cache sidecars of one key."""
+
+    path = Path(shard_path)
+    return str(jsonl_cache_dir(path) / f"{path.stem}-{key}-*.jsonl")
+
+
+def jsonl_cache_path(
+    shard_path: PathLikeStr,
+    key: str,
+    fingerprint: str,
+) -> str:
+    """Return the JSONL cache path for one keyed map stage."""
+
+    path = Path(shard_path)
+    return str(jsonl_cache_dir(path) / f"{path.stem}-{key}-{fingerprint}.jsonl")
+
+
+def jsonl_source_fingerprint(
+    shard_paths: Sequence[PathLikeStr],
+    *,
+    ref_fields: Sequence[RefFieldSpec] = (),
+) -> str:
+    """Return the base fingerprint used by JSONL map cache stages."""
+
+    return fingerprint_parts(
+        "jsonl-source",
+        *(str(path) for path in shard_paths),
+        *(f"{field}:{base_dir}" for field, base_dir in ref_fields),
+    )
+
+
+def count_jsonl_samples(path: PathLikeStr) -> int:
+    """Return the number of rows in one JSONL shard or cache file."""
+
+    with open(path, encoding="utf-8") as handle:
+        return sum(1 for _ in handle)
+
+
 def iter_jsonls(
     shard_paths: Iterator[PathLikeStr],
     ref_fields: tuple[RefFieldSpec, ...],
     key_dot_level: int = 1,
     tar_cache_size: int = 8,
+    cache_specs: tuple[SidecarSpec, ...] = (),
 ) -> Iterator[Sample]:
     """Resolve tar data references while streaming JSONL shard files."""
 
@@ -275,10 +324,39 @@ def iter_jsonls(
 
     with TarManager(cache_size=tar_cache_size) as manager:
         for shard_path in shard_paths:
-            with open(shard_path, encoding="utf-8") as handle:
-                for line_index, line in enumerate(handle):
-                    sample = _parse_jsonl_line(str(shard_path), line_index, line, allow_preannotated=True)
-                    yield _resolve_one(sample, manager)
+            cache_handles = _open_jsonl_cache_handles(str(shard_path), cache_specs)
+            try:
+                with open(shard_path, encoding="utf-8") as handle:
+                    for line_index, line in enumerate(handle):
+                        sample = _parse_jsonl_line(str(shard_path), line_index, line, allow_preannotated=True)
+                        resolved = _resolve_one(sample, manager)
+                        for cache_handle in cache_handles:
+                            cache_line = cache_handle.readline()
+                            if cache_line == "":
+                                msg = (
+                                    f"[JsonlCacheCountMismatch] cache={cache_handle.name!r} "
+                                    f"ended before shard={str(shard_path)!r}"
+                                )
+                                raise ValueError(msg)
+                            resolved.update(
+                                _parse_jsonl_cache_line(
+                                    cache_handle.name,
+                                    line_index,
+                                    cache_line,
+                                    expected_key=str(resolved["__key__"]),
+                                )
+                            )
+                        yield resolved
+                for cache_handle in cache_handles:
+                    if cache_handle.readline() != "":
+                        msg = (
+                            f"[JsonlCacheCountMismatch] cache={cache_handle.name!r} "
+                            f"contains more rows than shard={str(shard_path)!r}"
+                        )
+                        raise ValueError(msg)
+            finally:
+                for cache_handle in cache_handles:
+                    cache_handle.close()
 
 
 def _bucket_id_for_sample(sample: Sample, *, group_key: str | None, spill_buckets: int) -> int:
@@ -372,3 +450,92 @@ def _balanced_shard_targets(*, total_rows: int, shard_count: int) -> list[int]:
     base = total_rows // shard_count
     remainder = total_rows % shard_count
     return [base + (1 if index < remainder else 0) for index in range(shard_count)]
+
+
+def write_jsonl_cache(
+    shard_path: PathLikeStr,
+    *,
+    key: str,
+    samples: Iterable[Sample],
+    fingerprint: str,
+    expected_sample_count: int,
+) -> None:
+    """Write one cached JSONL sidecar for the provided samples."""
+
+    output_path = Path(jsonl_cache_path(shard_path, key, fingerprint))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_suffix(f"{output_path.suffix}.tmp")
+    written_samples = 0
+    try:
+        with temp_path.open("w", encoding="utf-8") as handle:
+            for sample in samples:
+                cache_fields = sample.get("__cache_fields__")
+                if not isinstance(cache_fields, dict):
+                    msg = f"[InvalidJsonlCacheSample] key={key!r} missing __cache_fields__ mapping"
+                    raise ValueError(msg)
+                line = {
+                    "__key__": sample["__key__"],
+                    "__index_in_file__": sample["__index_in_file__"],
+                    "__file__": sample["__file__"],
+                    "__cache_fields__": {
+                        field_name: base64.b64encode(payload).decode("ascii")
+                        for field_name, payload in cache_fields.items()
+                    },
+                }
+                handle.write(json.dumps(line, sort_keys=True, ensure_ascii=True) + "\n")
+                written_samples += 1
+        if written_samples != expected_sample_count:
+            msg = (
+                f"[JsonlCacheSampleCountMismatch] key={key!r} shard={str(shard_path)!r} "
+                f"expected={expected_sample_count} wrote={written_samples}"
+            )
+            raise ValueError(msg)
+        os.replace(temp_path, output_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def _open_jsonl_cache_handles(
+    shard_path: str,
+    cache_specs: tuple[SidecarSpec, ...],
+) -> list[object]:
+    handles: list[object] = []
+    for _name, resolver in cache_specs:
+        cache_path = resolver(shard_path)
+        handles.append(open(cache_path, encoding="utf-8"))
+    return handles
+
+
+def _parse_jsonl_cache_line(
+    file: str,
+    index_in_file: int,
+    line: str,
+    *,
+    expected_key: str,
+) -> dict[str, bytes]:
+    sample = _parse_jsonl_line(file, index_in_file, line, allow_preannotated=True)
+    if sample["__key__"] != expected_key:
+        msg = (
+            f"[JsonlCacheKeyMismatch] cache={file!r} line={index_in_file + 1} "
+            f"expected_key={expected_key!r} got={sample['__key__']!r}"
+        )
+        raise ValueError(msg)
+    cache_fields = sample.get("__cache_fields__")
+    if not isinstance(cache_fields, dict):
+        msg = f"[InvalidJsonlCacheLine] file={file!r} line={index_in_file + 1} missing __cache_fields__"
+        raise ValueError(msg)
+    decoded: dict[str, bytes] = {}
+    for field_name, payload in cache_fields.items():
+        if not isinstance(field_name, str) or not isinstance(payload, str):
+            msg = f"[InvalidJsonlCacheLine] file={file!r} line={index_in_file + 1} invalid cache field payload"
+            raise ValueError(msg)
+        try:
+            decoded[field_name] = base64.b64decode(payload.encode("ascii"))
+        except Exception as exc:  # noqa: BLE001
+            msg = (
+                f"[InvalidJsonlCacheLine] file={file!r} line={index_in_file + 1} "
+                f"field={field_name!r} invalid base64 payload"
+            )
+            raise ValueError(msg) from exc
+    return decoded
