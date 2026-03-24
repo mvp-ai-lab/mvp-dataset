@@ -6,6 +6,7 @@ import importlib
 import os
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import Protocol
 from dataclasses import replace as dataclass_replace
 
 # ---------------------------------------------------------------------------
@@ -37,6 +38,14 @@ Stage = Callable[[Iterable[object]], Iterable[object]]
 """One lazy transformation stage in the iterator pipeline."""
 
 
+class Assembler[T, U](Protocol):
+    """Stateful stream assembler that may emit outputs after consuming inputs."""
+
+    def push(self, sample: T) -> Iterable[U]:
+        """Consume one upstream sample and yield any completed outputs."""
+
+    def finish(self, *, drop_last: bool = False) -> Iterable[U]:
+        """Flush remaining state at end of stream."""
 @dataclass(frozen=True, slots=True)
 class DataLoadMesh:
     """Data-parallel sub-mesh specification for shard assignment.
