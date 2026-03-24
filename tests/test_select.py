@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import shutil
+import sys
 import tarfile
+import tempfile
 from functools import partial
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
 from mvp_dataset import Dataset
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
 IMAGE_DIR = REPO_ROOT / "examples" / "demo_data" / "image"
 DEPTH_DIR = REPO_ROOT / "examples" / "demo_data" / "depth"
 
@@ -26,7 +32,7 @@ def load_depth_sample(sample: dict[str, object], *, depth_dir: Path) -> dict[str
     return {"depth.png": read_tar_member(depth_dir / shard_name, f"{sample_key}.depth.png")}
 
 
-def test_select_from_tars(tmp_path: Path) -> None:
+def run_select_smoke_check(tmp_path: Path) -> None:
     image_dir = tmp_path / "image"
     depth_dir = tmp_path / "depth"
     shutil.copytree(IMAGE_DIR, image_dir)
@@ -38,7 +44,7 @@ def test_select_from_tars(tmp_path: Path) -> None:
             resample=False,
         )
         .select(
-            ["image", "normal"],
+            ["image", "depth"],
             preprocessors={"depth": partial(load_depth_sample, depth_dir=depth_dir)},
         )
         .shuffle(buffer_size=8)
@@ -47,3 +53,17 @@ def test_select_from_tars(tmp_path: Path) -> None:
     sample = next(iter(dataset))
     assert sample["image.png"]
     assert sample["depth.png"]
+
+
+def test_select_from_tars(tmp_path: Path) -> None:
+    run_select_smoke_check(tmp_path)
+
+
+def main() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        run_select_smoke_check(Path(temp_dir))
+    print("test_select smoke check passed")
+
+
+if __name__ == "__main__":
+    main()
