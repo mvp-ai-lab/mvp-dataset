@@ -22,6 +22,7 @@ from ..core.types import (
 from ..sources import iter_jsonls, iter_tars
 from ..sources.jsonl import materialize_jsonl_shards
 from ..sources.tar import cache_tar_path, normalize_select_output, sample_fields, write_select_cache
+from ..utils.selection import normalize_selected_keys
 from ..utils.sharding import iter_items
 from ..utils.url import normalize_paths
 from .ops import batch_samples, map_samples, shuffle_samples, unbatch_samples
@@ -29,32 +30,6 @@ from .ops import batch_samples, map_samples, shuffle_samples, unbatch_samples
 SourceKind = Literal["jsonl", "tars"]
 SourceStore = list[str]
 SourceShape = Literal["tar_paths", "jsonl_paths"]
-
-
-def _normalize_selected_keys(keys: Sequence[str]) -> tuple[str, ...]:
-    """Validate and deduplicate selected tar field-group keys."""
-
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for key in keys:
-        if not isinstance(key, str):
-            msg = f"[InvalidSelectKey] expected str key, got={type(key).__name__}"
-            raise TypeError(msg)
-        candidate = key.strip()
-        if not candidate:
-            msg = "[InvalidSelectKey] select keys must be non-empty strings"
-            raise ValueError(msg)
-        if "/" in candidate or "\\" in candidate:
-            msg = f"[InvalidSelectKey] key={candidate!r} must not contain path separators"
-            raise ValueError(msg)
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        normalized.append(candidate)
-    if not normalized:
-        msg = "[InvalidSelectKey] select requires at least one key"
-        raise ValueError(msg)
-    return tuple(normalized)
 
 
 def _cache_sidecar_spec(key: str) -> SidecarSpec:
@@ -419,7 +394,7 @@ class Dataset(torch_iterabledataset_class()):
             msg = "`select` currently supports only tar sources."
             raise ValueError(msg)
 
-        selected_keys = _normalize_selected_keys(keys)
+        selected_keys = normalize_selected_keys(keys)
         preprocessor_map = {} if preprocessors is None else dict(preprocessors)
         key_dot_level = int(os.environ.get("LOADER_TAR_KEY_DOT_LEVEL", 1))
         tar_paths = self._as_tar_source()
