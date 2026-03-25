@@ -7,16 +7,18 @@ import os
 import random
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 from types import ModuleType
 from typing import Literal, cast
 
 from ..core.types import (
     Assembler,
+    CacheSpec,
     RefFieldSpec,
     RuntimeContext,
     ShardInput,
     SidecarSpec,
-    Stage,
+    StageSpec,
 )
 from ..sources import iter_jsonls, iter_tars
 from ..sources.jsonl import materialize_jsonl_shards
@@ -33,6 +35,8 @@ from .ops import (
 SourceKind = Literal["jsonl", "tars"]
 SourceStore = list[str]
 SourceShape = Literal["tar_paths", "jsonl_paths"]
+
+_UNSUPPORTED_CACHE_KINDS = frozenset({"shuffle", "batch", "unbatch"})
 
 
 def torch_iterabledataset_class(
@@ -71,10 +75,11 @@ class Dataset(torch_iterabledataset_class()):
 
     _source: SourceStore
     _source_shape: SourceShape
-    _stages: tuple[Stage, ...]
+    _stages: tuple[StageSpec, ...]
     _resample: bool
     _sidecar_specs: tuple[SidecarSpec, ...]
     _ref_fields: tuple[RefFieldSpec, ...]
+    _cache_spec: CacheSpec | None
 
     @classmethod
     def from_tars(
@@ -292,6 +297,7 @@ class Dataset(torch_iterabledataset_class()):
             _resample=resample,
             _sidecar_specs=(),
             _ref_fields=(),
+            _cache_spec=None,
         )
 
     def join(self, sidecars: Sequence[SidecarSpec]) -> Dataset:
@@ -313,16 +319,7 @@ class Dataset(torch_iterabledataset_class()):
         if self.source_kind != "tars":
             msg = "`join` currently supports only tar sources."
             raise ValueError(msg)
-        return Dataset(
-            _source=self._source,
-            _source_shape=self._source_shape,
-            _stages=self._stages,
-            context=self.context,
-            source_kind=self.source_kind,
-            _resample=self._resample,
-            _sidecar_specs=self._sidecar_specs + tuple(sidecars),
-            _ref_fields=self._ref_fields,
-        )
+        return dataclass_replace(self, _sidecar_specs=self._sidecar_specs + tuple(sidecars))
 
     def resolve_refs(self, ref_fields: Sequence[RefFieldSpec]) -> Dataset:
         """Resolve ``tar://`` URIs in selected JSONL fields during iteration.
@@ -342,38 +339,19 @@ class Dataset(torch_iterabledataset_class()):
         if self.source_kind != "jsonl":
             msg = "`resolve_refs` currently supports only jsonl sources."
             raise ValueError(msg)
-        return Dataset(
-            _source=self._source,
-            _source_shape=self._source_shape,
-            _stages=self._stages,
-            context=self.context,
-            source_kind=self.source_kind,
-            _resample=self._resample,
-            _sidecar_specs=self._sidecar_specs,
-            _ref_fields=self._ref_fields + tuple(ref_fields),
-        )
+        return dataclass_replace(self, _ref_fields=self._ref_fields + tuple(ref_fields))
 
-    def _append_stage(self, stage: Stage) -> Dataset:
+    def _append_stage(self, spec: StageSpec) -> Dataset:
         """Return a new dataset with one extra lazy stage.
 
         Args:
-            stage: Iterator transformation applied after source loading.
+            spec: Stage spec to append to the pipeline.
 
         Returns:
-            A dataset that shares the same source and context but appends
-            ``stage`` to the pipeline.
+            A new :class:`Dataset` sharing the same source and context.
         """
 
-        return Dataset(
-            _source=self._source,
-            _source_shape=self._source_shape,
-            _stages=self._stages + (stage,),
-            context=self.context,
-            source_kind=self.source_kind,
-            _resample=self._resample,
-            _sidecar_specs=self._sidecar_specs,
-            _ref_fields=self._ref_fields,
-        )
+        return dataclass_replace(self, _stages=self._stages + (spec,))
 
     def map(self, fn: Callable[[object], object]) -> Dataset:
         """Append a lazy map stage.
@@ -384,11 +362,22 @@ class Dataset(torch_iterabledataset_class()):
         Returns:
             A new dataset that applies ``fn`` lazily during iteration.
         """
+        from ..cache.fingerprint import callable_fingerprint
+        from ..cache.materialize import make_cache_aware_map
 
-        def stage(data: Iterable[object]) -> Iterable[object]:
+        fn_fp = callable_fingerprint(fn)
+
+        def _apply(data: Iterable[object]) -> Iterable[object]:
             return map_samples(data, fn)
 
-        return self._append_stage(stage)
+        spec = StageSpec(
+            kind="map",
+            apply=_apply,
+            fn_fingerprint=fn_fp,
+            cache_trace_policy="traceable",
+            cache_stage=make_cache_aware_map(fn, fn_fp),
+        )
+        return self._append_stage(spec)
 
     def shuffle(self, buffer_size: int, initial: int | None = None) -> Dataset:
         """Append a deterministic sample-level shuffle stage.
@@ -403,12 +392,19 @@ class Dataset(torch_iterabledataset_class()):
             A new dataset with bounded-memory shuffling applied lazily.
         """
 
-        def stage(data: Iterable[object]) -> Iterable[object]:
+        def _apply(data: Iterable[object]) -> Iterable[object]:
             seed = self.context.sample_shuffle_seed
             rng = random.Random(seed)
             return shuffle_samples(data, buffer_size=buffer_size, initial=initial, rng=rng)
 
-        return self._append_stage(stage)
+        spec = StageSpec(
+            kind="shuffle",
+            apply=_apply,
+            fn_fingerprint="",
+            cache_trace_policy="unsupported",
+            cache_stage=None,
+        )
+        return self._append_stage(spec)
 
     def batch(
         self,
@@ -428,7 +424,7 @@ class Dataset(torch_iterabledataset_class()):
             A new dataset that yields batches instead of individual samples.
         """
 
-        def stage(data: Iterable[object]) -> Iterable[object]:
+        def _apply(data: Iterable[object]) -> Iterable[object]:
             return batch_samples(
                 data,
                 batch_size=batch_size,
@@ -436,7 +432,14 @@ class Dataset(torch_iterabledataset_class()):
                 collate_fn=collate_fn,
             )
 
-        return self._append_stage(stage)
+        spec = StageSpec(
+            kind="batch",
+            apply=_apply,
+            fn_fingerprint="",
+            cache_trace_policy="unsupported",
+            cache_stage=None,
+        )
+        return self._append_stage(spec)
 
     def assemble(
         self,
@@ -456,15 +459,31 @@ class Dataset(torch_iterabledataset_class()):
         Returns:
             A new dataset that assembles the upstream sample stream lazily.
         """
+        from ..cache.fingerprint import callable_fingerprint
+        from ..cache.materialize import make_cache_aware_assemble
 
-        def stage(data: Iterable[object]) -> Iterable[object]:
+        fn_fp = callable_fingerprint(factory)
+        ctx = self.context
+
+        def _apply(data: Iterable[object]) -> Iterable[object]:
             return assemble_samples(
                 data,
-                factory=lambda: factory(self.context),
+                factory=lambda: factory(ctx),
                 drop_last=drop_last,
             )
 
-        return self._append_stage(stage)
+        spec = StageSpec(
+            kind="assemble",
+            apply=_apply,
+            fn_fingerprint=fn_fp,
+            cache_trace_policy="traceable",
+            cache_stage=make_cache_aware_assemble(
+                lambda: factory(ctx),
+                fn_fp,
+                drop_last,
+            ),
+        )
+        return self._append_stage(spec)
 
     def unbatch(self) -> Dataset:
         """Append an unbatching stage.
@@ -474,10 +493,70 @@ class Dataset(torch_iterabledataset_class()):
             into individual samples during iteration.
         """
 
-        def stage(data: Iterable[object]) -> Iterable[object]:
+        def _apply(data: Iterable[object]) -> Iterable[object]:
             return unbatch_samples(data)
 
-        return self._append_stage(stage)
+        spec = StageSpec(
+            kind="unbatch",
+            apply=_apply,
+            fn_fingerprint="",
+            cache_trace_policy="unsupported",
+            cache_stage=None,
+        )
+        return self._append_stage(spec)
+
+    def cache(
+        self,
+        groups: Sequence[Sequence[str]] | None = None,
+        *,
+        show_progress: bool = True,
+    ) -> Dataset:
+        """Insert a cache boundary after the current pipeline stages.
+
+        On the first :meth:`__iter__` call the pipeline up to this boundary is
+        materialized into tar files on disk.  Subsequent iterations read from
+        those cached tars, skipping all upstream computation.
+
+        Args:
+            groups: Optional field grouping.  Each inner sequence specifies a
+                set of fields that should be stored together in one tar.
+                ``None`` (default) places all non-metadata fields in a single
+                tar.  Fields not covered by any explicit group are stored as
+                singleton groups.
+            show_progress: Whether to print warm-up progress to ``stderr``.
+
+        Returns:
+            A new dataset with the cache boundary registered.
+
+        Raises:
+            ValueError: If a cache boundary has already been registered on this
+                dataset.
+        """
+        if self._cache_spec is not None:
+            msg = "[CacheError] only one .cache() boundary is allowed per dataset"
+            raise ValueError(msg)
+
+        from ..cache.fingerprint import hash_bytes
+
+        normalized_groups: tuple[tuple[str, ...], ...] | None
+        if groups is None:
+            normalized_groups = None
+        else:
+            normalized_groups = tuple(tuple(g) for g in groups)
+
+        # Build plan fingerprint from all traceable pre-cache stage fingerprints.
+        pre_stage_fps = [spec.fn_fingerprint for spec in self._stages if spec.cache_trace_policy == "traceable"]
+        groups_repr = repr(normalized_groups)
+        plan_fp = hash_bytes(*pre_stage_fps, groups_repr)
+
+        cache_spec = CacheSpec(
+            boundary_index=len(self._stages),
+            groups=normalized_groups,
+            show_progress=show_progress,
+            plan_fingerprint=plan_fp,
+        )
+
+        return dataclass_replace(self, _cache_spec=cache_spec)
 
     def __iter__(self) -> Iterator[object]:
         """Materialize and run the full lazy pipeline.
@@ -486,6 +565,10 @@ class Dataset(torch_iterabledataset_class()):
             An iterator over samples or batch objects produced by the dataset's
             source backend followed by all appended pipeline stages.
         """
+
+        if self._cache_spec is not None:
+            yield from self._iter_with_cache()
+            return
 
         context = self.context.resolve_current_process()
         stream: Iterable[object]
@@ -517,8 +600,99 @@ class Dataset(torch_iterabledataset_class()):
                 tar_cache_size=tar_cache_size,
             )
 
-        for stage in self._stages:
-            stream = stage(stream)
+        for spec in self._stages:
+            stream = spec.apply(stream)
+
+        yield from stream
+
+    def _iter_with_cache(self) -> Iterator[object]:
+        """Run the pipeline using the cache layer.
+
+        On cache miss, builds a signature-annotated source stream, runs
+        pre-cache stages through their cache-aware variants, and
+        materializes the results into per-shard group tars.  On cache hit,
+        reads directly from the cached tars.  In both cases, post-cache
+        stages are applied on the output before yielding.
+
+        Yields:
+            Samples or batch objects produced by reading cached tars
+            followed by all post-cache pipeline stages.
+        """
+        from ..cache.materialize import (
+            iter_cache_shard,
+            iter_jsonls_with_sigs,
+            iter_tars_with_sigs,
+            read_manifest,
+            warmup_cache,
+        )
+
+        cache_spec = self._cache_spec
+        assert cache_spec is not None
+
+        context = self.context.resolve_current_process()
+        tar_key_dot_level = int(os.environ.get("LOADER_TAR_KEY_DOT_LEVEL", 1))
+        tar_cache_size = int(os.environ.get("LOADER_JSONL_TAR_CACHE_SIZE", 8))
+
+        if self.source_kind == "tars":
+            all_shards = self._as_tar_source()
+        else:
+            all_shards = self._as_jsonl_source()
+
+        assigned_shards = list(iter_items(all_shards, context=context, resample=False))
+
+        pre_specs = self._stages[: cache_spec.boundary_index]
+        post_specs = self._stages[cache_spec.boundary_index :]
+
+        # Check whether all assigned shards already have valid caches.
+        all_cached = all(read_manifest(shard, cache_spec.plan_fingerprint) is not None for shard in assigned_shards)
+
+        if not all_cached:
+            # --- Warm-up: build the cache. ---
+            # Build source stream with signature annotation.
+            if self.source_kind == "tars":
+                shard_stream: Iterator[str] = iter(assigned_shards)
+                source_stream = iter_tars_with_sigs(
+                    shard_stream,
+                    key_dot_level=tar_key_dot_level,
+                    sidecars=self._sidecar_specs,
+                )
+            else:
+                shard_stream = iter(assigned_shards)
+                source_stream = iter_jsonls_with_sigs(
+                    shard_stream,
+                    ref_fields=self._ref_fields,
+                    key_dot_level=tar_key_dot_level,
+                    tar_cache_size=tar_cache_size,
+                )
+
+            # Apply pre-cache stages with cache-aware versions where available.
+            pre_stream: Iterable[object] = source_stream
+            unsupported_kinds: list[str] = []
+            for spec in pre_specs:
+                if spec.cache_stage is not None:
+                    pre_stream = spec.cache_stage(pre_stream)
+                else:
+                    if spec.kind in _UNSUPPORTED_CACHE_KINDS:
+                        unsupported_kinds.append(spec.kind)
+                    pre_stream = spec.apply(pre_stream)
+
+            warmup_cache(
+                assigned_shards=assigned_shards,
+                pre_cache_stream=iter(pre_stream),
+                groups_spec=cache_spec.groups,
+                plan_fingerprint=cache_spec.plan_fingerprint,
+                show_progress=cache_spec.show_progress,
+                unsupported_stage_kinds=unsupported_kinds,
+            )
+
+        # --- Serve path: read from cache tars. ---
+        def _cache_source() -> Iterator[object]:
+            for shard in assigned_shards:
+                yield from iter_cache_shard(shard, cache_spec.plan_fingerprint)
+
+        stream: Iterable[object] = _cache_source()
+        for spec in post_specs:
+            stream = spec.apply(stream)
 
         yield from stream
 
