@@ -6,8 +6,8 @@ import importlib
 import os
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Protocol
 from dataclasses import replace as dataclass_replace
+from typing import Literal, Protocol
 
 # ---------------------------------------------------------------------------
 # Shared aliases
@@ -37,6 +37,58 @@ RefFieldSpec = tuple[str, PathLikeStr]
 Stage = Callable[[Iterable[object]], Iterable[object]]
 """One lazy transformation stage in the iterator pipeline."""
 
+CacheTracePolicy = Literal["traceable", "unsupported"]
+"""Whether a stage participates in cache invalidation."""
+
+StageKind = Literal["map", "shuffle", "batch", "assemble", "unbatch"]
+"""Recognized pipeline stage kinds."""
+
+
+@dataclass(frozen=True, slots=True)
+class StageSpec:
+    """Metadata wrapper around one pipeline stage.
+
+    Attributes:
+        kind: Symbolic stage name (``"map"``, ``"shuffle"``, ``"batch"``, etc.).
+        apply: Standard stage callable used during normal (non-cache) iteration.
+        fn_fingerprint: Stable hash of the user-provided callable, used to
+            detect when a stage's logic changes and the cache must be rebuilt.
+            Empty string for unsupported stages.
+        cache_trace_policy: Whether the stage participates in per-field
+            signature tracking and cache invalidation.
+        cache_stage: Optional cache-aware version of the stage that propagates
+            ``__cache_meta__`` through the sample stream.  ``None`` for
+            unsupported stages that use the regular ``apply`` callable during
+            warm-up.
+    """
+
+    kind: StageKind
+    apply: Stage
+    fn_fingerprint: str
+    cache_trace_policy: CacheTracePolicy
+    cache_stage: Stage | None
+
+
+@dataclass(frozen=True, slots=True)
+class CacheSpec:
+    """Cache boundary descriptor attached to a :class:`~mvp_dataset.Dataset`.
+
+    Attributes:
+        boundary_index: Number of pre-cache :class:`StageSpec` entries.
+        groups: Field grouping for cache tars.  ``None`` means all non-meta
+            fields go into a single tar.  Each inner tuple is one group; keys
+            not covered by any group are stored as singleton groups.
+        show_progress: Whether to print progress to stderr during warm-up.
+        plan_fingerprint: Stable hash of all traceable pre-cache stage
+            fingerprints combined with the groups spec.  Changes when any
+            traceable stage changes.
+    """
+
+    boundary_index: int
+    groups: tuple[tuple[str, ...], ...] | None
+    show_progress: bool
+    plan_fingerprint: str
+
 
 class Assembler[T, U](Protocol):
     """Stateful stream assembler that may emit outputs after consuming inputs."""
@@ -46,6 +98,8 @@ class Assembler[T, U](Protocol):
 
     def finish(self, *, drop_last: bool = False) -> Iterable[U]:
         """Flush remaining state at end of stream."""
+
+
 @dataclass(frozen=True, slots=True)
 class DataLoadMesh:
     """Data-parallel sub-mesh specification for shard assignment.
@@ -100,6 +154,26 @@ class DataLoadMesh:
         for dim in self.dp_dims:
             size *= self.device_mesh.size(dim)
         return size
+
+    @property
+    def is_cache_leader(self) -> bool:
+        """Whether this rank should lead cache warm-up for its model-parallel group.
+
+        In a mesh with both data-parallel and model-parallel (e.g. TP)
+        dimensions, all ranks sharing the same ``dp_rank`` receive the same
+        shards.  Only one of them — the one whose local rank on every
+        non-DP dimension is 0 — should build the cache.  The others wait
+        and reuse the result.
+
+        Returns:
+            ``True`` if this rank is the designated cache builder for its
+            model-parallel co-members, ``False`` otherwise.
+        """
+        all_dims: tuple[str, ...] = getattr(self.device_mesh, "mesh_dim_names", ())
+        non_dp_dims = [d for d in all_dims if d not in self.dp_dims]
+        if not non_dp_dims:
+            return True
+        return all(self.device_mesh.get_local_rank(d) == 0 for d in non_dp_dims)
 
 
 def _normalize_dp_dims(dp_dims: str | Sequence[str]) -> tuple[str, ...]:
@@ -225,6 +299,21 @@ class RuntimeContext:
 
         dp_size = self.mesh.dp_size if self.mesh is not None else self.world_size
         return dp_size * self.num_workers
+
+    @property
+    def is_cache_leader(self) -> bool:
+        """Whether this rank should lead cache warm-up for its model-parallel group.
+
+        When no mesh is set every rank is its own leader.  With a mesh,
+        delegates to :attr:`DataLoadMesh.is_cache_leader`.
+
+        Returns:
+            ``True`` if this rank should build the cache, ``False`` if it
+            should wait for a co-member to do so.
+        """
+        if self.mesh is None:
+            return True
+        return self.mesh.is_cache_leader
 
     @property
     def sample_shuffle_seed(self) -> int:
