@@ -155,6 +155,26 @@ class DataLoadMesh:
             size *= self.device_mesh.size(dim)
         return size
 
+    @property
+    def is_cache_leader(self) -> bool:
+        """Whether this rank should lead cache warm-up for its model-parallel group.
+
+        In a mesh with both data-parallel and model-parallel (e.g. TP)
+        dimensions, all ranks sharing the same ``dp_rank`` receive the same
+        shards.  Only one of them — the one whose local rank on every
+        non-DP dimension is 0 — should build the cache.  The others wait
+        and reuse the result.
+
+        Returns:
+            ``True`` if this rank is the designated cache builder for its
+            model-parallel co-members, ``False`` otherwise.
+        """
+        all_dims: tuple[str, ...] = getattr(self.device_mesh, "mesh_dim_names", ())
+        non_dp_dims = [d for d in all_dims if d not in self.dp_dims]
+        if not non_dp_dims:
+            return True
+        return all(self.device_mesh.get_local_rank(d) == 0 for d in non_dp_dims)
+
 
 def _normalize_dp_dims(dp_dims: str | Sequence[str]) -> tuple[str, ...]:
     """Normalize one-or-many DP mesh dimension names into a tuple."""
@@ -279,6 +299,21 @@ class RuntimeContext:
 
         dp_size = self.mesh.dp_size if self.mesh is not None else self.world_size
         return dp_size * self.num_workers
+
+    @property
+    def is_cache_leader(self) -> bool:
+        """Whether this rank should lead cache warm-up for its model-parallel group.
+
+        When no mesh is set every rank is its own leader.  With a mesh,
+        delegates to :attr:`DataLoadMesh.is_cache_leader`.
+
+        Returns:
+            ``True`` if this rank should build the cache, ``False`` if it
+            should wait for a co-member to do so.
+        """
+        if self.mesh is None:
+            return True
+        return self.mesh.is_cache_leader
 
     @property
     def sample_shuffle_seed(self) -> int:

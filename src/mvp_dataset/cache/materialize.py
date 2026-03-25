@@ -841,3 +841,52 @@ def warmup_cache(
         if show_progress:
             print(f"[cache] building shard {i}/{n_shards}: {Path(shard).name}", file=sys.stderr)
         build_shard_cache(shard, samples, groups_spec, plan_fingerprint, show_progress)
+
+
+def wait_for_cache(
+    assigned_shards: list[str],
+    plan_fingerprint: str,
+    *,
+    show_progress: bool = False,
+    poll_interval: float = 0.5,
+    timeout: float = 3600.0,
+) -> None:
+    """Block until valid cache manifests exist for all *assigned_shards*.
+
+    Used by non-leader model-parallel ranks (e.g. TP co-members) that skip
+    the warm-up phase and wait for the leader to finish building the cache.
+
+    Args:
+        assigned_shards: Shard paths whose caches must be ready.
+        plan_fingerprint: Expected plan fingerprint to validate manifests.
+        show_progress: Whether to print waiting status to ``stderr``.
+        poll_interval: Seconds between manifest existence checks.
+        timeout: Maximum seconds to wait before raising ``TimeoutError``.
+
+    Raises:
+        TimeoutError: If the cache is not ready within *timeout* seconds.
+    """
+    import time
+
+    pending = set(assigned_shards)
+    if show_progress and pending:
+        print(f"[cache] waiting for leader to build {len(pending)} shard(s)…", file=sys.stderr)
+
+    deadline = time.monotonic() + timeout
+    while pending:
+        if time.monotonic() > deadline:
+            msg = (
+                f"[CacheWaitTimeout] timed out after {timeout}s waiting for "
+                f"cache leader to build {len(pending)} shard(s): "
+                f"{[Path(s).name for s in sorted(pending)]}"
+            )
+            raise TimeoutError(msg)
+        time.sleep(poll_interval)
+        still_pending = set()
+        for shard in pending:
+            if read_manifest(shard, plan_fingerprint) is None:
+                still_pending.add(shard)
+        pending = still_pending
+
+    if show_progress:
+        print("[cache] leader finished, proceeding with cached data", file=sys.stderr)

@@ -623,6 +623,7 @@ class Dataset(torch_iterabledataset_class()):
             iter_jsonls_with_sigs,
             iter_tars_with_sigs,
             read_manifest,
+            wait_for_cache,
             warmup_cache,
         )
 
@@ -647,43 +648,52 @@ class Dataset(torch_iterabledataset_class()):
         all_cached = all(read_manifest(shard, cache_spec.plan_fingerprint) is not None for shard in assigned_shards)
 
         if not all_cached:
-            # --- Warm-up: build the cache. ---
-            # Build source stream with signature annotation.
-            if self.source_kind == "tars":
-                shard_stream: Iterator[str] = iter(assigned_shards)
-                source_stream = iter_tars_with_sigs(
-                    shard_stream,
-                    key_dot_level=tar_key_dot_level,
-                    sidecars=self._sidecar_specs,
+            if not context.is_cache_leader:
+                # Non-leader TP co-member: skip warm-up, wait for the leader
+                # to finish building the cache for our shared shards.
+                wait_for_cache(
+                    assigned_shards,
+                    cache_spec.plan_fingerprint,
+                    show_progress=cache_spec.show_progress,
                 )
             else:
-                shard_stream = iter(assigned_shards)
-                source_stream = iter_jsonls_with_sigs(
-                    shard_stream,
-                    ref_fields=self._ref_fields,
-                    key_dot_level=tar_key_dot_level,
-                    tar_cache_size=tar_cache_size,
-                )
-
-            # Apply pre-cache stages with cache-aware versions where available.
-            pre_stream: Iterable[object] = source_stream
-            unsupported_kinds: list[str] = []
-            for spec in pre_specs:
-                if spec.cache_stage is not None:
-                    pre_stream = spec.cache_stage(pre_stream)
+                # --- Warm-up: build the cache. ---
+                # Build source stream with signature annotation.
+                if self.source_kind == "tars":
+                    shard_stream: Iterator[str] = iter(assigned_shards)
+                    source_stream = iter_tars_with_sigs(
+                        shard_stream,
+                        key_dot_level=tar_key_dot_level,
+                        sidecars=self._sidecar_specs,
+                    )
                 else:
-                    if spec.kind in _UNSUPPORTED_CACHE_KINDS:
-                        unsupported_kinds.append(spec.kind)
-                    pre_stream = spec.apply(pre_stream)
+                    shard_stream = iter(assigned_shards)
+                    source_stream = iter_jsonls_with_sigs(
+                        shard_stream,
+                        ref_fields=self._ref_fields,
+                        key_dot_level=tar_key_dot_level,
+                        tar_cache_size=tar_cache_size,
+                    )
 
-            warmup_cache(
-                assigned_shards=assigned_shards,
-                pre_cache_stream=iter(pre_stream),
-                groups_spec=cache_spec.groups,
-                plan_fingerprint=cache_spec.plan_fingerprint,
-                show_progress=cache_spec.show_progress,
-                unsupported_stage_kinds=unsupported_kinds,
-            )
+                # Apply pre-cache stages with cache-aware versions where available.
+                pre_stream: Iterable[object] = source_stream
+                unsupported_kinds: list[str] = []
+                for spec in pre_specs:
+                    if spec.cache_stage is not None:
+                        pre_stream = spec.cache_stage(pre_stream)
+                    else:
+                        if spec.kind in _UNSUPPORTED_CACHE_KINDS:
+                            unsupported_kinds.append(spec.kind)
+                        pre_stream = spec.apply(pre_stream)
+
+                warmup_cache(
+                    assigned_shards=assigned_shards,
+                    pre_cache_stream=iter(pre_stream),
+                    groups_spec=cache_spec.groups,
+                    plan_fingerprint=cache_spec.plan_fingerprint,
+                    show_progress=cache_spec.show_progress,
+                    unsupported_stage_kinds=unsupported_kinds,
+                )
 
         # --- Serve path: read from cache tars. ---
         def _cache_source() -> Iterator[object]:

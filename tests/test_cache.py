@@ -525,3 +525,210 @@ def test_callable_fingerprint_unsupported_closure():
 
     with pytest.raises(ValueError, match="CacheFingerprintError"):
         callable_fingerprint(fn)
+
+
+# ---------------------------------------------------------------------------
+# DataLoadMesh / RuntimeContext – is_cache_leader
+# ---------------------------------------------------------------------------
+
+
+class _FakeMesh:
+    """Minimal stand-in for ``torch.distributed.DeviceMesh``."""
+
+    def __init__(self, dim_names: tuple[str, ...], local_ranks: dict[str, int], sizes: dict[str, int]):
+        self.mesh_dim_names = dim_names
+        self._local_ranks = local_ranks
+        self._sizes = sizes
+
+    def get_local_rank(self, dim: str) -> int:
+        return self._local_ranks[dim]
+
+    def size(self, dim: str) -> int:
+        return self._sizes[dim]
+
+
+def test_is_cache_leader_no_mesh():
+    """Without a mesh every rank is its own leader."""
+    from mvp_dataset.core.types import RuntimeContext
+
+    ctx = RuntimeContext(rank=3, world_size=4)
+    assert ctx.is_cache_leader is True
+
+
+def test_is_cache_leader_pure_dp():
+    """When all mesh dims are DP, every rank is a leader (no TP dims)."""
+    from mvp_dataset.core.types import DataLoadMesh
+
+    mesh = _FakeMesh(
+        dim_names=("replicate", "shard"),
+        local_ranks={"replicate": 1, "shard": 0},
+        sizes={"replicate": 2, "shard": 4},
+    )
+    dlm = DataLoadMesh(device_mesh=mesh, dp_dims=("replicate", "shard"))
+    assert dlm.is_cache_leader is True
+
+
+def test_is_cache_leader_tp_leader():
+    """TP local-rank 0 is the leader."""
+    from mvp_dataset.core.types import DataLoadMesh, RuntimeContext
+
+    mesh = _FakeMesh(
+        dim_names=("dp", "tp"),
+        local_ranks={"dp": 1, "tp": 0},
+        sizes={"dp": 4, "tp": 2},
+    )
+    dlm = DataLoadMesh(device_mesh=mesh, dp_dims=("dp",))
+    assert dlm.is_cache_leader is True
+
+    ctx = RuntimeContext(rank=2, world_size=8, mesh=dlm)
+    assert ctx.is_cache_leader is True
+
+
+def test_is_cache_leader_tp_follower():
+    """TP local-rank != 0 is a follower and must NOT build cache."""
+    from mvp_dataset.core.types import DataLoadMesh, RuntimeContext
+
+    mesh = _FakeMesh(
+        dim_names=("dp", "tp"),
+        local_ranks={"dp": 1, "tp": 1},
+        sizes={"dp": 4, "tp": 2},
+    )
+    dlm = DataLoadMesh(device_mesh=mesh, dp_dims=("dp",))
+    assert dlm.is_cache_leader is False
+
+    ctx = RuntimeContext(rank=3, world_size=8, mesh=dlm)
+    assert ctx.is_cache_leader is False
+
+
+def test_is_cache_leader_3d_mesh():
+    """3-D mesh (replicate, shard, tensor): leader only when tensor local-rank == 0."""
+    from mvp_dataset.core.types import DataLoadMesh
+
+    # Leader: tensor=0
+    mesh_leader = _FakeMesh(
+        dim_names=("replicate", "shard", "tensor"),
+        local_ranks={"replicate": 0, "shard": 1, "tensor": 0},
+        sizes={"replicate": 2, "shard": 4, "tensor": 8},
+    )
+    assert DataLoadMesh(device_mesh=mesh_leader, dp_dims=("replicate", "shard")).is_cache_leader is True
+
+    # Follower: tensor=3
+    mesh_follower = _FakeMesh(
+        dim_names=("replicate", "shard", "tensor"),
+        local_ranks={"replicate": 0, "shard": 1, "tensor": 3},
+        sizes={"replicate": 2, "shard": 4, "tensor": 8},
+    )
+    assert DataLoadMesh(device_mesh=mesh_follower, dp_dims=("replicate", "shard")).is_cache_leader is False
+
+
+# ---------------------------------------------------------------------------
+# wait_for_cache
+# ---------------------------------------------------------------------------
+
+
+def test_wait_for_cache_immediate(tmp_path):
+    """wait_for_cache returns immediately when manifests already exist."""
+    from mvp_dataset.cache.materialize import _write_manifest, wait_for_cache
+
+    shard = str(tmp_path / "shard-00000.tar")
+    Path(shard).touch()
+    _write_manifest(shard, "fp123", {"g": str(tmp_path / "g.tar")})
+    Path(tmp_path / "g.tar").touch()
+
+    # Should return instantly without timeout.
+    wait_for_cache([shard], "fp123", poll_interval=0.01, timeout=1.0)
+
+
+def test_wait_for_cache_timeout(tmp_path):
+    """wait_for_cache raises TimeoutError when manifest never appears."""
+    from mvp_dataset.cache.materialize import wait_for_cache
+
+    shard = str(tmp_path / "shard-00000.tar")
+    Path(shard).touch()
+
+    with pytest.raises(TimeoutError, match="CacheWaitTimeout"):
+        wait_for_cache([shard], "fp_missing", poll_interval=0.01, timeout=0.05)
+
+
+def test_wait_for_cache_delayed(tmp_path):
+    """wait_for_cache succeeds when manifest appears after a short delay."""
+    import threading
+
+    from mvp_dataset.cache.materialize import _write_manifest, wait_for_cache
+
+    shard = str(tmp_path / "shard-00000.tar")
+    Path(shard).touch()
+    group_tar = tmp_path / "g.tar"
+    group_tar.touch()
+
+    def _build_later():
+        import time
+
+        time.sleep(0.1)
+        _write_manifest(shard, "fp_delayed", {"g": str(group_tar)})
+
+    t = threading.Thread(target=_build_later)
+    t.start()
+    wait_for_cache([shard], "fp_delayed", poll_interval=0.02, timeout=5.0)
+    t.join()
+
+
+# ---------------------------------------------------------------------------
+# Non-leader TP rank skips warm-up (end-to-end)
+# ---------------------------------------------------------------------------
+
+
+def test_non_leader_skips_warmup(tmp_path):
+    """A non-leader TP rank should read from cache built by the leader, not re-run the pipeline."""
+    from mvp_dataset.core.types import DataLoadMesh, RuntimeContext
+
+    # Create a shard.
+    shard = tmp_path / "shard-00000.tar"
+    _make_tar(
+        shard,
+        [
+            {"__key__": "a", "x": b"hello"},
+            {"__key__": "b", "x": b"world"},
+        ],
+    )
+
+    call_count = [0]
+
+    def counting_map(sample):
+        call_count[0] += 1
+        return {**sample, "y": b"mapped"}
+
+    # --- Leader (tp=0) builds the cache ---
+    leader_mesh = _FakeMesh(
+        dim_names=("dp", "tp"),
+        local_ranks={"dp": 0, "tp": 0},
+        sizes={"dp": 1, "tp": 2},
+    )
+    leader_ctx = RuntimeContext(
+        rank=0,
+        world_size=2,
+        mesh=DataLoadMesh(device_mesh=leader_mesh, dp_dims=("dp",)),
+    )
+    ds_leader = Dataset.from_tars([str(shard)], context=leader_ctx).map(counting_map).cache(show_progress=False)
+    leader_result = list(ds_leader)
+    assert call_count[0] == 2  # map ran for both samples
+    assert len(leader_result) == 2
+
+    # --- Follower (tp=1) should NOT run the map ---
+    call_count[0] = 0
+    follower_mesh = _FakeMesh(
+        dim_names=("dp", "tp"),
+        local_ranks={"dp": 0, "tp": 1},
+        sizes={"dp": 1, "tp": 2},
+    )
+    follower_ctx = RuntimeContext(
+        rank=1,
+        world_size=2,
+        mesh=DataLoadMesh(device_mesh=follower_mesh, dp_dims=("dp",)),
+    )
+    ds_follower = Dataset.from_tars([str(shard)], context=follower_ctx).map(counting_map).cache(show_progress=False)
+    follower_result = list(ds_follower)
+    assert call_count[0] == 0, "non-leader should NOT have run the map function"
+    assert len(follower_result) == 2
+    for s in follower_result:
+        assert s["y"] == b"mapped"
