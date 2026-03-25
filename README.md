@@ -21,6 +21,7 @@ A minimal, high-performance data loading library for multimodal training pipelin
   - `.shuffle(buffer_size, initial=...)`
   - `.batch(batch_size, drop_last=..., collate_fn=...)`
   - `.unbatch()`
+  - `.cache(groups=...)` — materialize expensive preprocessing to disk with automatic invalidation
 - Tar workflows:
   - sample parsing from shard members
   - optional sidecar merge via `.join([...])`. In this way, you can store different modalities in separate tars and join them on the fly via member naming conventions.
@@ -125,6 +126,83 @@ Read JSONL with `tar://` references:
 
 ```bash
 python3 examples/jsonl.py examples/demo_data/samples.jsonl --max-batches 2
+```
+
+## Caching
+
+`.cache()` materializes all upstream stages into tar files on disk so that expensive preprocessing (decoding, tokenization, augmentation, etc.) runs once and is reused on every subsequent iteration.
+
+### Basic usage
+
+```python
+ds = (
+    Dataset.from_tars("shards/shard_{000000..000099}.tar")
+    .map(expensive_preprocess)   # runs only on first iteration
+    .cache()                     # <-- cache boundary
+    .shuffle(buffer_size=4096)   # runs every iteration
+)
+
+for sample in ds:  # 1st iter: builds cache
+    train_step(sample)
+
+for sample in ds:  # 2nd iter: reads from cache, skips expensive_preprocess
+    train_step(sample)
+```
+
+Cache tars are written to a `.cache/` directory next to the source shards.
+
+### How invalidation works
+
+Each `.map()` / `.assemble()` stage is fingerprinted from its bytecode, defaults, and closure state. A **plan fingerprint** (SHA-256 of all pre-cache stage fingerprints + the groups spec) is stored in the manifest. When any pre-cache stage changes, the fingerprint changes and the cache is rebuilt automatically.
+
+### Field grouping
+
+By default all fields go into one tar per shard. Pass `groups` to split fields into separate tars — useful when only a subset of fields change between experiments:
+
+```python
+ds = (
+    Dataset.from_tars(shards)
+    .map(preprocess)
+    .cache(groups=[["image"], ["label"]])
+    # "image", "label" each get their own tar; any remaining fields
+    # (e.g. "tag") become singleton groups automatically.
+)
+```
+
+Only the group tars whose content signatures changed are rewritten.
+
+### Post-cache stages
+
+Stages appended **after** `.cache()` run on every iteration, reading from the cached tars:
+
+```python
+ds = (
+    Dataset.from_tars(shards)
+    .map(tokenize)       # cached
+    .cache()
+    .map(random_augment) # NOT cached — runs every time
+    .shuffle(buffer_size=2048)
+)
+```
+
+### Distributed / tensor-parallel awareness
+
+When using a `DataLoadMesh` with model-parallel dimensions (e.g. tensor parallelism), multiple ranks receive the same shards. The cache layer automatically elects one **cache leader** per model-parallel group (the rank whose non-DP local ranks are all 0) to build the cache. All other co-members wait for the leader to finish and then read directly from the cached tars, avoiding redundant computation.
+
+```python
+from mvp_dataset import Dataset
+from mvp_dataset.core.types import RuntimeContext
+
+ctx = RuntimeContext.from_runtime(
+    device_mesh=mesh,
+    dp_dims=("replicate", "shard"),  # TP dim excluded → co-members share shards
+)
+
+ds = (
+    Dataset.from_tars(shards, context=ctx)
+    .map(expensive_fn)
+    .cache()
+)
 ```
 
 ## Data conventions
