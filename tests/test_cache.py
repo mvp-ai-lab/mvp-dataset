@@ -673,6 +673,53 @@ def test_wait_for_cache_delayed(tmp_path):
     t.join()
 
 
+def test_cache_progress_uses_shard_counter(tmp_path, capsys):
+    """cache(show_progress=True) reports progress as shard counters."""
+    shard_a = tmp_path / "shard-00000.tar"
+    shard_b = tmp_path / "shard-00001.tar"
+    _make_tar(shard_a, [{"__key__": "0001", "x": b"a"}])
+    _make_tar(shard_b, [{"__key__": "0002", "x": b"b"}])
+
+    ds = Dataset.from_tars([str(shard_a), str(shard_b)]).cache(show_progress=True)
+    list(ds)
+
+    stderr = capsys.readouterr().err
+    assert "Caching 1/2 shards..." in stderr
+    assert "Caching 2/2 shards..." in stderr
+
+
+def test_cache_progress_uses_injected_logger(tmp_path):
+    """cache progress should use the globally injected logger when present."""
+    from mvp_dataset import reset_logger, set_logger
+
+    class _FakeLogger:
+        def __init__(self) -> None:
+            self.infos: list[str] = []
+            self.errors: list[str] = []
+
+        def info(self, msg, *args, **kwargs):
+            self.infos.append(str(msg))
+
+        def error(self, msg, *args, **kwargs):
+            self.errors.append(str(msg))
+
+    shard_a = tmp_path / "shard-00000.tar"
+    shard_b = tmp_path / "shard-00001.tar"
+    _make_tar(shard_a, [{"__key__": "0001", "x": b"a"}])
+    _make_tar(shard_b, [{"__key__": "0002", "x": b"b"}])
+
+    logger = _FakeLogger()
+    set_logger(logger)
+    try:
+        ds = Dataset.from_tars([str(shard_a), str(shard_b)]).cache(show_progress=True)
+        list(ds)
+    finally:
+        reset_logger()
+
+    assert "Caching 1/2 shards..." in logger.infos
+    assert "Caching 2/2 shards..." in logger.infos
+
+
 # ---------------------------------------------------------------------------
 # Non-leader TP rank skips warm-up (end-to-end)
 # ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@
 
 from .core import DataLoadMesh, RuntimeContext
 from .loader import TorchLoader
+from .log import get_logger, reset_logger, set_logger
 from .pipeline import Dataset
 
 __all__ = [
@@ -9,4 +10,7 @@ __all__ = [
     "Dataset",
     "RuntimeContext",
     "TorchLoader",
+    "get_logger",
+    "reset_logger",
+    "set_logger",
 ]

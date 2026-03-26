@@ -7,7 +7,6 @@ import io
 import itertools
 import json
 import os
-import sys
 import tarfile
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -16,6 +15,7 @@ from pathlib import Path
 from typing import Any, Final
 
 from ..core.types import RefFieldSpec, Sample, SidecarSpec
+from ..log import get_logger
 from ..sources.jsonl import TarManager, _parse_jsonl_line, parse_tar_uri
 from ..sources.tar import iter_tar
 from .codecs import decode_value, encode_value
@@ -25,6 +25,11 @@ from .fingerprint import hash_bytes
 _CACHE_META_SUFFIX: Final[str] = ".__cache_meta__"
 # Key used inside sample dicts to carry per-sample cache metadata through pipeline
 _CACHE_META_KEY: Final[str] = "__cache_meta__"
+
+
+def _log_info(message: str) -> None:
+    """Emit an info-level cache log via the package logger."""
+    get_logger().info(message)
 
 
 def _is_meta_field(name: str) -> bool:
@@ -549,7 +554,6 @@ def build_shard_cache(
     samples: list[tuple[Sample, CacheMeta]],
     groups_spec: tuple[tuple[str, ...], ...] | None,
     plan_fingerprint: str,
-    show_progress: bool,
 ) -> dict[str, str]:
     """Write group tar files for *shard_path* and return ``{label: tar_path}``.
 
@@ -561,8 +565,6 @@ def build_shard_cache(
         samples: Pre-cache output samples with their cache metadata.
         groups_spec: Field grouping forwarded to :func:`normalize_groups`.
         plan_fingerprint: Plan fingerprint written into the manifest.
-        show_progress: Whether to print progress to ``stderr``.
-
     Returns:
         A ``{group_label: tar_path}`` mapping for the written group tars.
     """
@@ -570,12 +572,7 @@ def build_shard_cache(
         # Re-check under lock: another process may have built it while we waited.
         existing = read_manifest(shard_path, plan_fingerprint)
         if existing is not None:
-            if show_progress:
-                print(f"[cache] reusing {Path(shard_path).name}", file=sys.stderr)
             return existing
-
-        if show_progress:
-            print(f"[cache] building {Path(shard_path).name}", file=sys.stderr)
 
         cache_dir = _cache_dir(shard_path)
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -610,12 +607,6 @@ def build_shard_cache(
             group_tars[label] = str(final_path)
 
         _write_manifest(shard_path, plan_fingerprint, group_tars)
-
-        if show_progress:
-            print(
-                f"[cache] done {Path(shard_path).name} ({len(group_tars)} group(s), {len(samples)} sample(s))",
-                file=sys.stderr,
-            )
 
         return group_tars
 
@@ -810,11 +801,6 @@ def warmup_cache(
     # Collect all pre-cache outputs grouped by route_shard.
     shard_samples: dict[str, list[tuple[Sample, CacheMeta]]] = {s: [] for s in assigned_shards}
 
-    n_shards = len(assigned_shards)
-    for i, shard in enumerate(assigned_shards, 1):
-        if show_progress:
-            print(f"[cache] waiting shard {i}/{n_shards}: {Path(shard).name}", file=sys.stderr)
-
     for item in pre_cache_stream:
         if not isinstance(item, dict):
             msg = (
@@ -836,11 +822,12 @@ def warmup_cache(
         shard_samples[route_shard].append((item, meta))
 
     # Build cache per shard (locked).
+    n_shards = len(assigned_shards)
     for i, shard in enumerate(assigned_shards, 1):
         samples = shard_samples.get(shard, [])
         if show_progress:
-            print(f"[cache] building shard {i}/{n_shards}: {Path(shard).name}", file=sys.stderr)
-        build_shard_cache(shard, samples, groups_spec, plan_fingerprint, show_progress)
+            _log_info(f"Caching {i}/{n_shards} shards...")
+        build_shard_cache(shard, samples, groups_spec, plan_fingerprint)
 
 
 def wait_for_cache(
@@ -870,7 +857,7 @@ def wait_for_cache(
 
     pending = set(assigned_shards)
     if show_progress and pending:
-        print(f"[cache] waiting for leader to build {len(pending)} shard(s)…", file=sys.stderr)
+        _log_info(f"[cache] waiting for leader to build {len(pending)} shard(s)...")
 
     deadline = time.monotonic() + timeout
     while pending:
@@ -889,4 +876,4 @@ def wait_for_cache(
         pending = still_pending
 
     if show_progress:
-        print("[cache] leader finished, proceeding with cached data", file=sys.stderr)
+        _log_info("[cache] leader finished, proceeding with cached data")
