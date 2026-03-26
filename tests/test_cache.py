@@ -674,7 +674,7 @@ def test_wait_for_cache_delayed(tmp_path):
 
 
 def test_cache_progress_uses_shard_counter(tmp_path, capsys):
-    """cache(show_progress=True) reports progress as shard counters."""
+    """cache(show_progress=True) reports shard counters and ETA."""
     shard_a = tmp_path / "shard-00000.tar"
     shard_b = tmp_path / "shard-00001.tar"
     _make_tar(shard_a, [{"__key__": "0001", "x": b"a"}])
@@ -684,8 +684,8 @@ def test_cache_progress_uses_shard_counter(tmp_path, capsys):
     list(ds)
 
     stderr = capsys.readouterr().err
-    assert "Caching 1/2 shards..." in stderr
-    assert "Caching 2/2 shards..." in stderr
+    assert "Caching 1/2 shards... ETA " in stderr
+    assert "Caching 2/2 shards... ETA " in stderr
 
 
 def test_cache_progress_uses_injected_logger(tmp_path):
@@ -716,8 +716,8 @@ def test_cache_progress_uses_injected_logger(tmp_path):
     finally:
         reset_logger()
 
-    assert "Caching 1/2 shards..." in logger.infos
-    assert "Caching 2/2 shards..." in logger.infos
+    assert any(msg.startswith("Caching 1/2 shards... ETA ") for msg in logger.infos)
+    assert any(msg.startswith("Caching 2/2 shards... ETA ") for msg in logger.infos)
 
 
 # ---------------------------------------------------------------------------

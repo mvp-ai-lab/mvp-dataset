@@ -8,6 +8,7 @@ import itertools
 import json
 import os
 import tarfile
+import time
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
@@ -30,6 +31,18 @@ _CACHE_META_KEY: Final[str] = "__cache_meta__"
 def _log_info(message: str) -> None:
     """Emit an info-level cache log via the package logger."""
     get_logger().info(message)
+
+
+def _format_eta(seconds: float) -> str:
+    """Format an ETA duration into a compact human-readable string."""
+    total_seconds = max(0, int(round(seconds)))
+    minutes, secs = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
 
 
 def _is_meta_field(name: str) -> bool:
@@ -823,11 +836,15 @@ def warmup_cache(
 
     # Build cache per shard (locked).
     n_shards = len(assigned_shards)
+    started_at = time.monotonic()
     for i, shard in enumerate(assigned_shards, 1):
         samples = shard_samples.get(shard, [])
-        if show_progress:
-            _log_info(f"Caching {i}/{n_shards} shards...")
         build_shard_cache(shard, samples, groups_spec, plan_fingerprint)
+        if show_progress:
+            elapsed = time.monotonic() - started_at
+            avg_per_shard = elapsed / i if i else 0.0
+            eta = avg_per_shard * (n_shards - i)
+            _log_info(f"Caching {i}/{n_shards} shards... ETA {_format_eta(eta)}")
 
 
 def wait_for_cache(
@@ -853,8 +870,6 @@ def wait_for_cache(
     Raises:
         TimeoutError: If the cache is not ready within *timeout* seconds.
     """
-    import time
-
     pending = set(assigned_shards)
     if show_progress and pending:
         _log_info(f"[cache] waiting for leader to build {len(pending)} shard(s)...")
