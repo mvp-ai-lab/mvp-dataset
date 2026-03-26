@@ -156,10 +156,15 @@ def _collect_value(val: Any, parts: list[Any]) -> None:
         parts.append(f"<module:{val.__name__}>")
     elif callable(val):
         _collect_callable(val, parts, seen=set())
+    elif hasattr(val, "__fingerprint__"):
+        fp = val.__fingerprint__()
+        if not isinstance(fp, str):
+            raise TypeError(f"__fingerprint__ must return str, got {type(fp).__name__!r}")
+        parts.append(f"<fingerprint:{fp}>")
     else:
         msg = (
             f"[CacheFingerprintError] cannot stably encode closure value of type "
             f"{type(val).__name__!r}; supported: None, bool, int, float, str, bytes, "
-            f"list, tuple, dict, module, or callable"
+            f"list, tuple, dict, module, callable, or objects with __fingerprint__()"
         )
         raise ValueError(msg)
