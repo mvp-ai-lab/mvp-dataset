@@ -32,13 +32,9 @@ def parse_tar_uri(
     base_dir: PathLikeStr,
     key_dot_level: int = 1,
 ) -> TarRef:
-    """Parse URI with grammar ``tar://<shard>#<key>.<field>``."""
+    """Parse URI with grammar ``tar://<shard>#<key>.<field>`` or ``<shard>#<key>.<field>``."""
 
-    if not uri.startswith(_TAR_URI_PREFIX):
-        msg = f"[InvalidTarUri] uri={uri!r} expected_prefix={_TAR_URI_PREFIX!r}"
-        raise ValueError(msg)
-
-    body = uri[len(_TAR_URI_PREFIX) :]
+    body = uri[len(_TAR_URI_PREFIX) :] if uri.startswith(_TAR_URI_PREFIX) else uri
     if "#" not in body:
         msg = f"[InvalidTarUri] uri={uri!r} missing '#'"
         raise ValueError(msg)
@@ -74,6 +70,56 @@ def parse_tar_uri(
         field=field,
         raw_uri=uri,
     )
+
+
+def iter_ref_field_uris(value: object, *, field: str) -> Iterator[str]:
+    """Yield one-or-many tar reference URIs from a JSONL field value."""
+
+    if isinstance(value, str):
+        yield value
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            if not isinstance(item, str):
+                msg = (
+                    f"[InvalidRefField] expected string URI in field={field!r} list item "
+                    f"{index}, got={type(item).__name__}"
+                )
+                raise ValueError(msg)
+            yield item
+        return
+    msg = f"[InvalidRefField] expected string URI or list of string URIs in field={field!r} got={type(value).__name__}"
+    raise ValueError(msg)
+
+
+def resolve_ref_field_value(
+    value: object,
+    *,
+    field: str,
+    base_dir: PathLikeStr,
+    key_dot_level: int,
+    manager: TarManager,
+) -> object:
+    """Resolve one JSONL reference field to bytes or a list of bytes."""
+
+    if isinstance(value, str):
+        try:
+            tar_ref = parse_tar_uri(value, base_dir=base_dir, key_dot_level=key_dot_level)
+        except ValueError as exc:
+            msg = f"[InvalidRefField] failed to parse tar URI in field={field!r} value={value!r} reason={exc}"
+            raise ValueError(msg) from exc
+        return manager.read(tar_ref)
+
+    uris = list(iter_ref_field_uris(value, field=field))
+    resolved: list[bytes] = []
+    for uri in uris:
+        try:
+            tar_ref = parse_tar_uri(uri, base_dir=base_dir, key_dot_level=key_dot_level)
+        except ValueError as exc:
+            msg = f"[InvalidRefField] failed to parse tar URI in field={field!r} value={uri!r} reason={exc}"
+            raise ValueError(msg) from exc
+        resolved.append(manager.read(tar_ref))
+    return resolved
 
 
 class TarManager:
@@ -261,16 +307,13 @@ def iter_jsonls(
         for field, base_dir in ref_fields:
             if field not in sample:
                 continue
-            value = sample[field]
-            if not isinstance(value, str):
-                msg = f"[InvalidRefField] expected string URI in field={field!r} got={type(value).__name__}"
-                raise ValueError(msg)
-            try:
-                tar_ref = parse_tar_uri(value, base_dir=base_dir, key_dot_level=key_dot_level)
-            except ValueError as exc:
-                msg = f"[InvalidRefField] failed to parse tar URI in field={field!r} value={value!r} reason={exc}"
-                raise ValueError(msg) from exc
-            resolved[field] = manager.read(tar_ref)
+            resolved[field] = resolve_ref_field_value(
+                sample[field],
+                field=field,
+                base_dir=base_dir,
+                key_dot_level=key_dot_level,
+                manager=manager,
+            )
         return resolved
 
     with TarManager(cache_size=tar_cache_size) as manager:
@@ -286,10 +329,19 @@ def _bucket_id_for_sample(sample: Sample, *, group_key: str | None, spill_bucket
         key = str(sample["__key__"])
     else:
         value = sample.get(group_key)
-        if not isinstance(value, str):
+        if isinstance(value, str):
+            key = value.split("#", 1)[0]
+        elif isinstance(value, list):
+            if not value:
+                key = str(sample["__key__"])
+            elif all(isinstance(item, str) for item in value):
+                key = value[0].split("#", 1)[0]
+            else:
+                msg = f"[InvalidGroupKey] sample missing string refs for group_key={group_key!r}"
+                raise ValueError(msg)
+        else:
             msg = f"[InvalidGroupKey] sample missing string key for group_key={group_key!r}"
             raise ValueError(msg)
-        key = value.split("#", 1)[0]
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
     return int(digest[:16], 16) % spill_buckets
 

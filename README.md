@@ -26,7 +26,7 @@ A minimal, high-performance data loading library for multimodal training pipelin
   - sample parsing from shard members
   - optional sidecar merge via `.join([...])`. In this way, you can store different modalities in separate tars and join them on the fly via member naming conventions.
 - JSONL workflows:
-  - optional `tar://` reference resolution via `.resolve_refs([...])`. In this way, you can use JSONL to store data like conversations and reference external image data in tar shards.
+  - optional linked-tar reference resolution via `.resolve_refs([...])`. In this way, you can use JSONL to store data like conversations and reference external image data in tar shards.
   - optional spill sharding via `from_jsonl(..., group_key=..., num_shards=...)` for bounded-memory preprocessing and better tar locality.
 - `TorchLoader` for PyTorch `DataLoader` integration with post-merge stages
 
@@ -221,12 +221,19 @@ Supported URI grammar:
 
 ```text
 tar://<shard_path>#<key>.<field>
+<shard_path>#<key>.<field>
 ```
 
 Example:
 
 ```text
 tar://examples/data/tars/shard_000000.tar#image_001.jpg
+```
+
+Reference fields can be either a single string URI or a list of string URIs. For example:
+
+```json
+{"images": ["images/train-00000.tar#image_00.jpg", "images/train-00000.tar#image_01.jpg"]}
 ```
 
 ## Runtime and environment variables

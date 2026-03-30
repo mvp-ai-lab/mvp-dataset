@@ -139,8 +139,10 @@ class Dataset(torch_iterabledataset_class()):
             context: Optional execution context. If omitted, inferred from runtime.
             resample: Whether to loop JSONL shard inputs indefinitely across rounds.
             group_key: Optional string field used to improve locality while
-                spilling rows into temporary buckets. For ``tar://...#...``
+                spilling rows into temporary buckets. For linked-tar
                 references, the portion before ``#`` is used for grouping.
+                If the field is a list of references, the first reference is
+                used.
             num_shards: Optional exact number of final local JSONL shards to
                 materialize before iteration.
             target_samples_per_shard: Optional target shard size used to derive
@@ -322,11 +324,13 @@ class Dataset(torch_iterabledataset_class()):
         return dataclass_replace(self, _sidecar_specs=self._sidecar_specs + tuple(sidecars))
 
     def resolve_refs(self, ref_fields: Sequence[RefFieldSpec]) -> Dataset:
-        """Resolve ``tar://`` URIs in selected JSONL fields during iteration.
+        """Resolve linked tar URIs in selected JSONL fields during iteration.
 
         Args:
             ref_fields: Sequence of ``(field_name, base_dir)`` pairs that
-                identify JSONL fields containing ``tar://`` references.
+                identify JSONL fields containing ``tar://...#...`` or
+                ``...tar#...`` references. Field values may be a single string
+                URI or a list of string URIs.
 
         Returns:
             A new dataset that replaces selected URI fields with raw bytes read

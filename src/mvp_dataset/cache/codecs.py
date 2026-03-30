@@ -5,12 +5,14 @@ Codec tags
 ``raw``        bytes / bytearray  — stored as-is
 ``utf8``       str                — UTF-8 encoded
 ``json``       JSON-compatible scalars and containers
+``structured`` nested containers that include raw bytes
 ``npy``        numpy.ndarray      — stored via numpy.save
 ``npy_tensor`` torch.Tensor       — converted to CPU, stored via numpy.save
 """
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 from typing import Any
@@ -18,8 +20,13 @@ from typing import Any
 CODEC_RAW = "raw"
 CODEC_UTF8 = "utf8"
 CODEC_JSON = "json"
+CODEC_STRUCTURED = "structured"
 CODEC_NPY = "npy"
 CODEC_NPY_TENSOR = "npy_tensor"
+
+_STRUCTURED_BYTES_MARKER_KEY = "__mvp_dataset_codec__"
+_STRUCTURED_BYTES_MARKER_VALUE = "bytes"
+_STRUCTURED_BYTES_DATA_KEY = "base64"
 
 
 def encode_value(value: Any) -> tuple[bytes, str]:
@@ -48,6 +55,12 @@ def encode_value(value: Any) -> tuple[bytes, str]:
             CODEC_JSON,
         )
 
+    if _is_structured_compatible(value):
+        return (
+            json.dumps(_encode_structured(value), ensure_ascii=True, separators=(",", ":")).encode("utf-8"),
+            CODEC_STRUCTURED,
+        )
+
     try:
         import numpy as np
 
@@ -73,6 +86,7 @@ def encode_value(value: Any) -> tuple[bytes, str]:
     msg = (
         f"[CacheCodecError] unsupported value type {type(value).__name__!r}; "
         f"supported: bytes, str, JSON-compatible scalars/containers, "
+        f"nested containers containing bytes, "
         f"numpy.ndarray, torch.Tensor"
     )
     raise TypeError(msg)
@@ -102,6 +116,9 @@ def decode_value(data: bytes, codec_tag: str) -> Any:
     if codec_tag == CODEC_JSON:
         return json.loads(data.decode("utf-8"))
 
+    if codec_tag == CODEC_STRUCTURED:
+        return _decode_structured(json.loads(data.decode("utf-8")))
+
     if codec_tag == CODEC_NPY:
         import numpy as np
 
@@ -126,3 +143,42 @@ def _is_json_compatible(value: Any) -> bool:
     if isinstance(value, dict):
         return all(isinstance(k, str) and _is_json_compatible(v) for k, v in value.items())
     return False
+
+
+def _is_structured_compatible(value: Any) -> bool:
+    if value is None or isinstance(value, (bool, int, float, str, bytes, bytearray)):
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(_is_structured_compatible(v) for v in value)
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and _is_structured_compatible(v) for k, v in value.items())
+    return False
+
+
+def _encode_structured(value: Any) -> Any:
+    if isinstance(value, (bytes, bytearray)):
+        return {
+            _STRUCTURED_BYTES_MARKER_KEY: _STRUCTURED_BYTES_MARKER_VALUE,
+            _STRUCTURED_BYTES_DATA_KEY: base64.b64encode(bytes(value)).decode("ascii"),
+        }
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_encode_structured(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _encode_structured(v) for k, v in value.items()}
+    msg = f"[CacheCodecError] unsupported structured value type {type(value).__name__!r}"
+    raise TypeError(msg)
+
+
+def _decode_structured(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_decode_structured(v) for v in value]
+    if isinstance(value, dict):
+        if value.get(_STRUCTURED_BYTES_MARKER_KEY) == _STRUCTURED_BYTES_MARKER_VALUE and set(value) == {
+            _STRUCTURED_BYTES_MARKER_KEY,
+            _STRUCTURED_BYTES_DATA_KEY,
+        }:
+            return base64.b64decode(value[_STRUCTURED_BYTES_DATA_KEY].encode("ascii"))
+        return {k: _decode_structured(v) for k, v in value.items()}
+    return value

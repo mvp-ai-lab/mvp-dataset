@@ -17,7 +17,13 @@ from typing import Any, Final
 
 from ..core.types import RefFieldSpec, Sample, SidecarSpec
 from ..log import get_logger
-from ..sources.jsonl import TarManager, _parse_jsonl_line, parse_tar_uri
+from ..sources.jsonl import (
+    TarManager,
+    _parse_jsonl_line,
+    iter_ref_field_uris,
+    parse_tar_uri,
+    resolve_ref_field_value,
+)
 from ..sources.tar import iter_tar
 from .codecs import decode_value, encode_value
 from .fingerprint import hash_bytes
@@ -364,22 +370,44 @@ def iter_jsonls_with_sigs(
                     for field, value in sample.items():
                         if _is_meta_field(field):
                             continue
-                        if field in ref_field_map and isinstance(value, str):
-                            # Tar-referenced field: sig from referenced tar member.
+                        if field in ref_field_map:
+                            # Tar-referenced field: sig from referenced tar member(s).
                             try:
-                                tar_ref = parse_tar_uri(
-                                    value,
-                                    base_dir=ref_field_map[field],
-                                    key_dot_level=key_dot_level,
-                                )
-                                ref_stat = os.stat(tar_ref.shard_path)
-                                member = f"{tar_ref.key}.{tar_ref.field}"
-                                field_sigs[field] = hash_bytes(
-                                    tar_ref.shard_path,
-                                    ref_stat.st_mtime_ns,
-                                    ref_stat.st_size,
-                                    member,
-                                )
+                                uris = list(iter_ref_field_uris(value, field=field))
+                                if len(uris) == 1:
+                                    tar_ref = parse_tar_uri(
+                                        uris[0],
+                                        base_dir=ref_field_map[field],
+                                        key_dot_level=key_dot_level,
+                                    )
+                                    ref_stat = os.stat(tar_ref.shard_path)
+                                    member = f"{tar_ref.key}.{tar_ref.field}"
+                                    field_sigs[field] = hash_bytes(
+                                        tar_ref.shard_path,
+                                        ref_stat.st_mtime_ns,
+                                        ref_stat.st_size,
+                                        member,
+                                    )
+                                else:
+                                    sig_parts: list[object] = []
+                                    for item_index, uri in enumerate(uris):
+                                        tar_ref = parse_tar_uri(
+                                            uri,
+                                            base_dir=ref_field_map[field],
+                                            key_dot_level=key_dot_level,
+                                        )
+                                        ref_stat = os.stat(tar_ref.shard_path)
+                                        member = f"{tar_ref.key}.{tar_ref.field}"
+                                        sig_parts.extend(
+                                            [
+                                                item_index,
+                                                tar_ref.shard_path,
+                                                ref_stat.st_mtime_ns,
+                                                ref_stat.st_size,
+                                                member,
+                                            ]
+                                        )
+                                    field_sigs[field] = hash_bytes(*sig_parts)
                             except (ValueError, OSError):
                                 # Fallback to JSON-field sig on parse/stat failure.
                                 canonical = json.dumps(value, ensure_ascii=True, sort_keys=True)
@@ -407,15 +435,13 @@ def iter_jsonls_with_sigs(
                     for field, base_dir in ref_fields:
                         if field not in sample:
                             continue
-                        uri = sample[field]
-                        if not isinstance(uri, str):
-                            continue
-                        try:
-                            tar_ref = parse_tar_uri(uri, base_dir=base_dir, key_dot_level=key_dot_level)
-                        except ValueError as exc:
-                            msg = f"[InvalidRefField] field={field!r} value={uri!r} reason={exc}"
-                            raise ValueError(msg) from exc
-                        resolved[field] = manager.read(tar_ref)
+                        resolved[field] = resolve_ref_field_value(
+                            sample[field],
+                            field=field,
+                            base_dir=base_dir,
+                            key_dot_level=key_dot_level,
+                            manager=manager,
+                        )
 
                     resolved[_CACHE_META_KEY] = CacheMeta(
                         route_shard=shard_str,

@@ -381,6 +381,95 @@ def test_cache_jsonl_source(tmp_path):
     assert {s["upper"] for s in result} == {"HELLO", "WORLD"}
 
 
+def test_jsonl_resolve_list_refs_with_bare_tar_uri(tmp_path):
+    """JSONL ref resolution supports list-valued fields and bare ``.tar#...`` URIs."""
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    image_shard = image_dir / "train-00000.tar"
+    _make_tar(
+        image_shard,
+        [
+            {"__key__": "image_00", "jpg": b"img0"},
+            {"__key__": "image_01", "jpg": b"img1"},
+        ],
+    )
+
+    shard = tmp_path / "samples.jsonl"
+    _make_jsonl(
+        shard,
+        [
+            {
+                "images": [
+                    "images/train-00000.tar#image_00.jpg",
+                    "images/train-00000.tar#image_01.jpg",
+                ]
+            }
+        ],
+    )
+
+    ds = Dataset.from_jsonl(
+        [str(shard)],
+        group_key="images",
+        num_shards=1,
+        output_dir=tmp_path / "materialized",
+    ).resolve_refs([("images", str(tmp_path))])
+
+    samples = list(ds)
+    assert len(samples) == 1
+    assert samples[0]["images"] == [b"img0", b"img1"]
+
+
+def test_cache_jsonl_list_refs_roundtrip(tmp_path):
+    """Resolved ``list[bytes]`` JSONL fields survive a cache round-trip."""
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    image_shard = image_dir / "train-00000.tar"
+    _make_tar(
+        image_shard,
+        [
+            {"__key__": "image_00", "jpg": b"img0"},
+            {"__key__": "image_01", "jpg": b"img1"},
+        ],
+    )
+
+    shard = tmp_path / "samples.jsonl"
+    _make_jsonl(
+        shard,
+        [
+            {
+                "images": [
+                    "images/train-00000.tar#image_00.jpg",
+                    "tar://images/train-00000.tar#image_01.jpg",
+                ]
+            }
+        ],
+    )
+
+    call_count = [0]
+
+    def annotate(sample):
+        call_count[0] += 1
+        return {**sample, "num_images": len(sample["images"])}
+
+    ds = (
+        Dataset.from_jsonl([str(shard)])
+        .resolve_refs([("images", str(tmp_path))])
+        .map(annotate)
+        .cache(show_progress=False)
+    )
+
+    first = list(ds)
+    assert call_count[0] == 1
+    assert first[0]["images"] == [b"img0", b"img1"]
+    assert first[0]["num_images"] == 2
+
+    call_count[0] = 0
+    second = list(ds)
+    assert call_count[0] == 0
+    assert second[0]["images"] == [b"img0", b"img1"]
+    assert second[0]["num_images"] == 2
+
+
 # ---------------------------------------------------------------------------
 # Assemble round-trip
 # ---------------------------------------------------------------------------
