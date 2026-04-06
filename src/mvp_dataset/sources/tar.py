@@ -96,7 +96,6 @@ def iter_tar(shard_path: PathLikeStr, key_dot_level: int = 1) -> Iterator[Sample
                     "__index_in_shard__": index_in_shard,
                 }
 
-            assert current_sample is not None
             if field in current_sample:
                 msg = f"duplicate field {field!r} for key {key!r} in shard {shard!r}"
                 raise ValueError(msg)
@@ -174,7 +173,6 @@ def iter_tars(
                     source_name=sidecar_name,
                 )
 
-                # Key consistency check.
                 if sidecar_key != main_key:
                     msg = (
                         f"[SidecarKeyMismatch] main key {main_key!r} does not match "
@@ -186,7 +184,7 @@ def iter_tars(
                 # Merge non-metadata fields from the sidecar into the sample.
                 for field, value in sidecar_sample.items():
                     if field.startswith("__") and field.endswith("__"):
-                        continue  # Drop sidecar metadata fields.
+                        continue
                     if field in merged:
                         msg = (
                             f"[SidecarFieldConflict] field {field!r} from sidecar "

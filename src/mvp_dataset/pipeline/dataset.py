@@ -28,6 +28,7 @@ from ..sources import (
     list_parquet_fragments,
 )
 from ..sources.jsonl import materialize_jsonl_shards
+from ..sources.parquet import _DEFAULT_BATCH_SIZE
 from ..utils.sharding import iter_items
 from ..utils.url import normalize_paths
 from .ops import (
@@ -288,7 +289,7 @@ class Dataset(torch_iterabledataset_class()):
         normalized_shards = normalize_paths(shards)
 
         if all(path.endswith(".jsonl") for path in normalized_shards):
-            if columns is not None or batch_size != 65536 or not use_threads:
+            if columns is not None or batch_size != _DEFAULT_BATCH_SIZE or not use_threads:
                 msg = "Parquet arguments are not supported for jsonl sources"
                 raise ValueError(msg)
             return cls.from_jsonl(
@@ -309,7 +310,7 @@ class Dataset(torch_iterabledataset_class()):
                 or spill_buckets != 128
                 or output_dir is not None
                 or columns is not None
-                or batch_size != 65536
+                or batch_size != _DEFAULT_BATCH_SIZE
                 or not use_threads
             ):
                 msg = "JSONL/parquet arguments are not supported for tar sources"
@@ -365,16 +366,6 @@ class Dataset(torch_iterabledataset_class()):
         Raises:
             ValueError: If ``source_shape`` and ``source_kind`` do not match.
         """
-
-        if source_shape == "tar_paths" and source_kind != "tars":
-            msg = f"[InvalidSourceShape] tar_paths requires source_kind='tars', got={source_kind!r}"
-            raise ValueError(msg)
-        if source_shape == "jsonl_paths" and source_kind != "jsonl":
-            msg = f"[InvalidSourceShape] jsonl_paths requires source_kind='jsonl', got={source_kind!r}"
-            raise ValueError(msg)
-        if source_shape == "parquet_fragments" and source_kind != "parquet":
-            msg = f"[InvalidSourceShape] parquet_fragments requires source_kind='parquet', got={source_kind!r}"
-            raise ValueError(msg)
 
         return cls(
             _source=source,
@@ -781,26 +772,17 @@ class Dataset(torch_iterabledataset_class()):
                     else {}
                 )
 
-                # Factory that builds an independent pre-cache stream for a shard subset.
-                # Each call produces a fresh iterator; safe to call from multiple threads.
-                source_kind = self.source_kind
-                sidecar_specs = self._sidecar_specs
-                ref_fields = self._ref_fields
-                parquet_columns = self._parquet_columns
-                parquet_batch_size = self._parquet_batch_size
-                parquet_use_threads = self._parquet_use_threads
-
                 def _make_pre_cache_stream(shards: list[str]) -> Iterator[object]:
-                    if source_kind == "tars":
+                    if self.source_kind == "tars":
                         src: Iterable[object] = iter_tars_with_sigs(
                             iter(shards),
                             key_dot_level=tar_key_dot_level,
-                            sidecars=sidecar_specs,
+                            sidecars=self._sidecar_specs,
                         )
-                    elif source_kind == "jsonl":
+                    elif self.source_kind == "jsonl":
                         src = iter_jsonls_with_sigs(
                             iter(shards),
-                            ref_fields=ref_fields,
+                            ref_fields=self._ref_fields,
                             key_dot_level=tar_key_dot_level,
                             tar_cache_size=tar_cache_size,
                         )
@@ -808,9 +790,9 @@ class Dataset(torch_iterabledataset_class()):
                         frags = [fragment_by_key[s] for s in shards if s in fragment_by_key]
                         src = iter_parquets_with_sigs(
                             iter(frags),
-                            columns=parquet_columns,
-                            batch_size=parquet_batch_size,
-                            use_threads=parquet_use_threads,
+                            columns=self._parquet_columns,
+                            batch_size=self._parquet_batch_size,
+                            use_threads=self._parquet_use_threads,
                         )
                     stream: Iterable[object] = src
                     for spec in pre_specs:
@@ -820,7 +802,7 @@ class Dataset(torch_iterabledataset_class()):
                             stream = spec.apply(stream)
                     return iter(stream)
 
-                num_cache_workers = int(os.environ.get("LOADER_CACHE_NUM_WORKERS", "1"))
+                num_cache_workers = int(os.environ.get("LOADER_CACHE_NUM_WORKERS", "8"))
                 warmup_cache(
                     assigned_shards=assigned_shards,
                     pre_cache_stream=None,

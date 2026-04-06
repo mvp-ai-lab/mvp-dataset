@@ -42,12 +42,10 @@ _TAR_ERRORS: Final[str] = "surrogateescape"
 
 
 def _log_info(message: str) -> None:
-    """Emit an info-level cache log via the package logger."""
     get_logger().info(message)
 
 
 def _format_eta(seconds: float) -> str:
-    """Format an ETA duration into a compact human-readable string."""
     total_seconds = max(0, int(round(seconds)))
     minutes, secs = divmod(total_seconds, 60)
     hours, minutes = divmod(minutes, 60)
@@ -59,7 +57,6 @@ def _format_eta(seconds: float) -> str:
 
 
 def _is_meta_field(name: str) -> bool:
-    """Return True for dunder metadata fields (e.g. ``__key__``)."""
     return name.startswith("__") and name.endswith("__")
 
 
@@ -172,17 +169,14 @@ def _group_label(field_names: tuple[str, ...]) -> str:
 
 
 def _cache_dir(shard_path: str) -> Path:
-    """Return the ``.cache/`` directory co-located with *shard_path*."""
     return Path(shard_path).parent / ".cache"
 
 
 def _manifest_path(shard_path: str) -> Path:
-    """Return the manifest JSON path for *shard_path*."""
     return _cache_dir(shard_path) / f"{Path(shard_path).name}.manifest.json"
 
 
 def _lock_path(shard_path: str) -> Path:
-    """Return the lock file path for *shard_path*."""
     return _cache_dir(shard_path) / f"{Path(shard_path).name}.lock"
 
 
@@ -667,8 +661,6 @@ def make_cache_aware_assemble(
 
 
 def _add_tar_member(file_obj: io.BufferedWriter, member_name: str, data: bytes) -> None:
-    """Write one regular file member into an open GNU tar stream."""
-
     ti = tarfile.TarInfo(name=member_name)
     ti.size = len(data)
     file_obj.write(ti.tobuf(format=_TAR_FORMAT, encoding=tarfile.ENCODING, errors=_TAR_ERRORS))
@@ -683,8 +675,6 @@ def _group_meta_payload(
     codec_map: dict[str, str],
     field_sigs: dict[str, str],
 ) -> bytes:
-    """Encode per-sample codec/signature metadata for one cache group."""
-
     payload: dict[str, dict[str, str]] = {}
     for field in group_fields:
         if field not in codec_map:

@@ -268,7 +268,7 @@ def materialize_jsonl_shards(
     try:
         current_shard = 0
         rows_in_current_shard = 0
-        for bucket_id in sorted(_non_empty_bucket_ids(bucket_counts)):
+        for bucket_id in sorted(i for i, c in enumerate(bucket_counts) if c > 0):
             bucket_path = bucket_dir / f"bucket_{bucket_id:05d}.jsonl"
             with bucket_path.open(encoding="utf-8") as handle:
                 for line in handle:
@@ -355,7 +355,7 @@ def _jsonl_shard_plan_fingerprint(
     spill_buckets: int,
 ) -> str:
     payload = {
-        "files": [(file, Path(file).stat().st_mtime_ns, Path(file).stat().st_size) for file in files],
+        "files": [(file, s.st_mtime_ns, s.st_size) for file in files for s in (Path(file).stat(),)],
         "group_key": group_key,
         "num_shards": num_shards,
         "target_samples_per_shard": target_samples_per_shard,
@@ -363,12 +363,6 @@ def _jsonl_shard_plan_fingerprint(
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
-
-
-def _non_empty_bucket_ids(bucket_counts: Sequence[int]) -> Iterator[int]:
-    for bucket_id, count in enumerate(bucket_counts):
-        if count > 0:
-            yield bucket_id
 
 
 def _parse_jsonl_line(
