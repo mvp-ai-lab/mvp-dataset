@@ -20,7 +20,13 @@ from ..core.types import (
     SidecarSpec,
     StageSpec,
 )
-from ..sources import iter_jsonls, iter_tars
+from ..sources import (
+    ParquetFragment,
+    iter_jsonls,
+    iter_parquets,
+    iter_tars,
+    list_parquet_fragments,
+)
 from ..sources.jsonl import materialize_jsonl_shards
 from ..utils.sharding import iter_items
 from ..utils.url import normalize_paths
@@ -32,9 +38,9 @@ from .ops import (
     unbatch_samples,
 )
 
-SourceKind = Literal["jsonl", "tars"]
-SourceStore = list[str]
-SourceShape = Literal["tar_paths", "jsonl_paths"]
+SourceKind = Literal["jsonl", "tars", "parquet"]
+SourceStore = list[str] | list[ParquetFragment]
+SourceShape = Literal["tar_paths", "jsonl_paths", "parquet_fragments"]
 
 _UNSUPPORTED_CACHE_KINDS = frozenset({"shuffle", "batch", "unbatch"})
 
@@ -65,9 +71,10 @@ class Dataset(torch_iterabledataset_class()):
     lazily during iteration, then passed through the appended iterator stages in
     declaration order.
 
-    The dataset stores one of two source backends:
+    The dataset stores one of three source backends:
     - ``"tars"``: a list of tar shard paths
     - ``"jsonl"``: a list of JSONL shard paths
+    - ``"parquet"``: a list of parquet shard paths
     """
 
     context: RuntimeContext
@@ -80,6 +87,9 @@ class Dataset(torch_iterabledataset_class()):
     _sidecar_specs: tuple[SidecarSpec, ...]
     _ref_fields: tuple[RefFieldSpec, ...]
     _cache_spec: CacheSpec | None
+    _parquet_columns: tuple[str, ...] | None
+    _parquet_batch_size: int
+    _parquet_use_threads: bool
 
     @classmethod
     def from_tars(
@@ -188,6 +198,42 @@ class Dataset(torch_iterabledataset_class()):
         )
 
     @classmethod
+    def from_parquet(
+        cls,
+        files: ShardInput | Sequence[ShardInput],
+        context: RuntimeContext | None = None,
+        resample: bool = False,
+        *,
+        columns: Sequence[str] | None = None,
+        batch_size: int = 65536,
+        use_threads: bool = True,
+    ) -> Dataset:
+        """Build a dataset from local parquet files."""
+
+        runtime_context = RuntimeContext.from_runtime() if context is None else context
+        normalized_files = normalize_paths(files)
+        if not all(path.endswith(".parquet") for path in normalized_files):
+            msg = f"[InvalidSourceType] expected .parquet inputs, got={normalized_files!r}"
+            raise ValueError(msg)
+        if batch_size <= 0:
+            msg = f"[InvalidParquetBatchSize] batch_size must be > 0, got={batch_size}"
+            raise ValueError(msg)
+        fragments = list_parquet_fragments(normalized_files)
+        if not fragments:
+            msg = f"[EmptyParquetSource] no row groups found in input files {normalized_files!r}"
+            raise ValueError(msg)
+        return cls._build_dataset(
+            source=fragments,
+            source_shape="parquet_fragments",
+            context=runtime_context,
+            source_kind="parquet",
+            resample=resample,
+            parquet_columns=None if columns is None else tuple(columns),
+            parquet_batch_size=batch_size,
+            parquet_use_threads=use_threads,
+        )
+
+    @classmethod
     def from_source(
         cls,
         shards: ShardInput | Sequence[ShardInput],
@@ -199,15 +245,19 @@ class Dataset(torch_iterabledataset_class()):
         target_samples_per_shard: int | None = None,
         spill_buckets: int = 128,
         output_dir: str | os.PathLike[str] | None = None,
+        columns: Sequence[str] | None = None,
+        batch_size: int = 65536,
+        use_threads: bool = True,
     ) -> Dataset:
-        """Build a dataset from local tar or JSONL inputs.
+        """Build a dataset from local tar, JSONL, or parquet inputs.
 
         This compatibility constructor dispatches to :meth:`from_tars` when all
-        inputs end with ``.tar`` and to :meth:`from_jsonl` when all inputs end
-        with ``.jsonl``.
+        inputs end with ``.tar``, to :meth:`from_jsonl` when all inputs end
+        with ``.jsonl``, and to :meth:`from_parquet` when all inputs end with
+        ``.parquet``.
 
         Args:
-            shards: One or more tar or JSONL paths, globs, or brace-expansion specs.
+            shards: One or more tar, JSONL, or parquet paths, globs, or brace-expansion specs.
             context: Optional execution context. If omitted, inferred from runtime.
             resample: Whether to loop the selected source shards indefinitely.
             group_key: JSONL-only spill sharding key forwarded to
@@ -219,19 +269,28 @@ class Dataset(torch_iterabledataset_class()):
             spill_buckets: JSONL-only temporary spill bucket count forwarded to
                 :meth:`from_jsonl`.
             output_dir: JSONL-only output directory for materialized shard files.
+            columns: Parquet-only column selection forwarded to
+                :meth:`from_parquet`.
+            batch_size: Parquet-only record batch size forwarded to
+                :meth:`from_parquet`.
+            use_threads: Parquet-only threaded decode flag forwarded to
+                :meth:`from_parquet`.
 
         Returns:
-            A dataset backed by tar shard paths or JSONL shard paths.
+            A dataset backed by tar shard paths, JSONL shard paths, or parquet shard paths.
 
         Raises:
             ValueError: If inputs mix extensions, use an unsupported extension,
-                or pass JSONL-only sharding arguments for tar sources.
+                or pass JSONL-only sharding arguments for tar or parquet sources.
         """
 
         runtime_context = RuntimeContext.from_runtime() if context is None else context
         normalized_shards = normalize_paths(shards)
 
         if all(path.endswith(".jsonl") for path in normalized_shards):
+            if columns is not None or batch_size != 65536 or not use_threads:
+                msg = "Parquet arguments are not supported for jsonl sources"
+                raise ValueError(msg)
             return cls.from_jsonl(
                 normalized_shards,
                 context=runtime_context,
@@ -249,12 +308,33 @@ class Dataset(torch_iterabledataset_class()):
                 or target_samples_per_shard is not None
                 or spill_buckets != 128
                 or output_dir is not None
+                or columns is not None
+                or batch_size != 65536
+                or not use_threads
             ):
-                msg = "JSONL sharding arguments are not supported for tar sources"
+                msg = "JSONL/parquet arguments are not supported for tar sources"
                 raise ValueError(msg)
             return cls.from_tars(normalized_shards, context=runtime_context, resample=resample)
+        if all(path.endswith(".parquet") for path in normalized_shards):
+            if (
+                group_key is not None
+                or num_shards is not None
+                or target_samples_per_shard is not None
+                or spill_buckets != 128
+                or output_dir is not None
+            ):
+                msg = "JSONL sharding arguments are not supported for parquet sources"
+                raise ValueError(msg)
+            return cls.from_parquet(
+                normalized_shards,
+                context=runtime_context,
+                resample=resample,
+                columns=columns,
+                batch_size=batch_size,
+                use_threads=use_threads,
+            )
 
-        msg = f"[InvalidSourceType] all inputs must be .jsonl or all must be .tar, got={normalized_shards!r}"
+        msg = f"[InvalidSourceType] all inputs must be .jsonl, all .parquet, or all .tar, got={normalized_shards!r}"
         raise ValueError(msg)
 
     @classmethod
@@ -266,6 +346,9 @@ class Dataset(torch_iterabledataset_class()):
         context: RuntimeContext,
         source_kind: SourceKind,
         resample: bool,
+        parquet_columns: tuple[str, ...] | None = None,
+        parquet_batch_size: int = 65536,
+        parquet_use_threads: bool = True,
     ) -> Dataset:
         """Build one dataset instance from normalized source metadata.
 
@@ -289,6 +372,9 @@ class Dataset(torch_iterabledataset_class()):
         if source_shape == "jsonl_paths" and source_kind != "jsonl":
             msg = f"[InvalidSourceShape] jsonl_paths requires source_kind='jsonl', got={source_kind!r}"
             raise ValueError(msg)
+        if source_shape == "parquet_fragments" and source_kind != "parquet":
+            msg = f"[InvalidSourceShape] parquet_fragments requires source_kind='parquet', got={source_kind!r}"
+            raise ValueError(msg)
 
         return cls(
             _source=source,
@@ -300,6 +386,9 @@ class Dataset(torch_iterabledataset_class()):
             _sidecar_specs=(),
             _ref_fields=(),
             _cache_spec=None,
+            _parquet_columns=parquet_columns,
+            _parquet_batch_size=parquet_batch_size,
+            _parquet_use_threads=parquet_use_threads,
         )
 
     def join(self, sidecars: Sequence[SidecarSpec]) -> Dataset:
@@ -590,7 +679,7 @@ class Dataset(torch_iterabledataset_class()):
                 key_dot_level=tar_key_dot_level,
                 sidecars=self._sidecar_specs,
             )
-        else:
+        elif self.source_kind == "jsonl":
             tar_cache_size = int(os.environ.get("LOADER_JSONL_TAR_CACHE_SIZE", 8))
             shard_stream = iter_items(
                 self._as_jsonl_source(),
@@ -602,6 +691,18 @@ class Dataset(torch_iterabledataset_class()):
                 ref_fields=self._ref_fields,
                 key_dot_level=tar_key_dot_level,
                 tar_cache_size=tar_cache_size,
+            )
+        else:
+            shard_stream = iter_items(
+                self._as_parquet_source(),
+                context=context,
+                resample=self._resample,
+            )
+            stream = iter_parquets(
+                shard_stream,
+                columns=self._parquet_columns,
+                batch_size=self._parquet_batch_size,
+                use_threads=self._parquet_use_threads,
             )
 
         for spec in self._stages:
@@ -625,6 +726,7 @@ class Dataset(torch_iterabledataset_class()):
         from ..cache.materialize import (
             iter_cache_shard,
             iter_jsonls_with_sigs,
+            iter_parquets_with_sigs,
             iter_tars_with_sigs,
             read_manifest,
             wait_for_cache,
@@ -638,12 +740,16 @@ class Dataset(torch_iterabledataset_class()):
         tar_key_dot_level = int(os.environ.get("LOADER_TAR_KEY_DOT_LEVEL", 1))
         tar_cache_size = int(os.environ.get("LOADER_JSONL_TAR_CACHE_SIZE", 8))
 
+        assigned_parquet_fragments: list[ParquetFragment] | None = None
         if self.source_kind == "tars":
             all_shards = self._as_tar_source()
-        else:
+            assigned_shards = list(iter_items(all_shards, context=context, resample=False))
+        elif self.source_kind == "jsonl":
             all_shards = self._as_jsonl_source()
-
-        assigned_shards = list(iter_items(all_shards, context=context, resample=False))
+            assigned_shards = list(iter_items(all_shards, context=context, resample=False))
+        else:
+            assigned_parquet_fragments = list(iter_items(self._as_parquet_source(), context=context, resample=False))
+            assigned_shards = [fragment.cache_key for fragment in assigned_parquet_fragments]
 
         pre_specs = self._stages[: cache_spec.boundary_index]
         post_specs = self._stages[cache_spec.boundary_index :]
@@ -670,13 +776,21 @@ class Dataset(torch_iterabledataset_class()):
                         key_dot_level=tar_key_dot_level,
                         sidecars=self._sidecar_specs,
                     )
-                else:
+                elif self.source_kind == "jsonl":
                     shard_stream = iter(assigned_shards)
                     source_stream = iter_jsonls_with_sigs(
                         shard_stream,
                         ref_fields=self._ref_fields,
                         key_dot_level=tar_key_dot_level,
                         tar_cache_size=tar_cache_size,
+                    )
+                else:
+                    assert assigned_parquet_fragments is not None
+                    source_stream = iter_parquets_with_sigs(
+                        iter(assigned_parquet_fragments),
+                        columns=self._parquet_columns,
+                        batch_size=self._parquet_batch_size,
+                        use_threads=self._parquet_use_threads,
                     )
 
                 # Apply pre-cache stages with cache-aware versions where available.
@@ -739,3 +853,11 @@ class Dataset(torch_iterabledataset_class()):
             msg = "[InvalidSourceShape] expected jsonl_paths source shape"
             raise TypeError(msg)
         return cast(list[str], self._source)
+
+    def _as_parquet_source(self) -> list[ParquetFragment]:
+        """Return parquet row-group fragments with O(1) source-shape validation."""
+
+        if self._source_shape != "parquet_fragments":
+            msg = "[InvalidSourceShape] expected parquet_fragments source shape"
+            raise TypeError(msg)
+        return cast(list[ParquetFragment], self._source)

@@ -9,12 +9,13 @@ A minimal, high-performance data loading library for multimodal training pipelin
 - Minimal: only a few core abstractions (`Dataset`, `TorchLoader`, `RuntimeContext`)
 - Fast: lazy iterator stages, bounded-memory shuffle, tar sidecar join, and loader-side pipeline composition
 - Deterministic: seed-aware sharding and shuffle behavior across distributed + worker processes
-- Extensible: source-level operations for TAR and JSONL-with-TAR-reference workflows
+- Extensible: source-level operations for TAR, JSONL-with-TAR-reference, and parquet workflows
 
 ## Features
 
 - `Dataset.from_tars(...)` for local `.tar` shard inputs
 - `Dataset.from_jsonl(...)` for local `.jsonl` inputs
+- `Dataset.from_parquet(...)` for local `.parquet` inputs
 - `Dataset.from_source(...)` as a compatibility dispatcher for mixed call sites
 - Chainable pipeline ops:
   - `.map(...)`
@@ -28,6 +29,10 @@ A minimal, high-performance data loading library for multimodal training pipelin
 - JSONL workflows:
   - optional linked-tar reference resolution via `.resolve_refs([...])`. In this way, you can use JSONL to store data like conversations and reference external image data in tar shards.
   - optional spill sharding via `from_jsonl(..., group_key=..., num_shards=...)` for bounded-memory preprocessing and better tar locality.
+- Parquet workflows:
+  - row-group-parallel sample iteration from local `.parquet` shards
+  - optional column projection via `from_parquet(..., columns=[...])`
+  - each row is exposed as one `dict[str, object]` sample with `__file__`, `__index_in_file__`, and `__key__`
 - `TorchLoader` for PyTorch `DataLoader` integration with post-merge stages
 
 ## Installation
@@ -112,6 +117,25 @@ for sample in dataset:
     consume(sample)
 ```
 
+### Parquet pipeline
+
+```python
+from mvp_dataset import Dataset
+
+dataset = (
+    Dataset.from_parquet(
+        "/data/meta/train_{000000..000003}.parquet",
+        columns=["text", "label"],
+        batch_size=8192,
+    )
+    .map(lambda s: {**s, "length": len(s["text"])})
+    .cache()
+)
+
+for sample in dataset:
+    consume(sample)
+```
+
 ### Demo
 
 Generate demo shards and metadata:
@@ -126,6 +150,12 @@ Read JSONL with `tar://` references:
 
 ```bash
 python3 examples/jsonl.py examples/demo_data/samples.jsonl --max-batches 2
+```
+
+Read parquet shards:
+
+```bash
+python3 examples/parquet.py "examples/demo_data/*.parquet" --max-batches 2
 ```
 
 ## Caching
@@ -149,7 +179,7 @@ for sample in ds:  # 2nd iter: reads from cache, skips expensive_preprocess
     train_step(sample)
 ```
 
-Cache tars are written to a `.cache/` directory next to the source shards.
+Cache tars are written to a `.cache/` directory next to the source shards, including parquet-backed datasets.
 
 ### How invalidation works
 
@@ -236,6 +266,22 @@ Reference fields can be either a single string URI or a list of string URIs. For
 {"images": ["images/train-00000.tar#image_00.jpg", "images/train-00000.tar#image_01.jpg"]}
 ```
 
+### Parquet row samples
+
+Parquet rows are yielded as ordinary sample dicts. Each sample includes:
+
+- `__file__`: parquet file path
+- `__index_in_file__`: zero-based row index
+- `__key__`: synthesized as `<file>:<row_index>`
+
+Specialized source helpers remain unchanged:
+
+- `.join(...)` is tar-only
+- `.resolve_refs(...)` is jsonl-only
+
+Parquet scheduling uses row groups as the unit of work, so different slots can
+read different row groups from the same parquet file.
+
 ## Runtime and environment variables
 
 - Distributed/runtime context:
@@ -255,6 +301,7 @@ Reference fields can be either a single string URI or a list of string URIs. For
 - Shuffle uses bounded buffer memory (`buffer_size`, optional `initial`).
 - JSONL reference resolution uses LRU tar-handle caching.
 - `from_jsonl(...)` can pre-materialize balanced local JSONL shards so workers shard by file instead of holding the full JSONL in memory.
+- parquet row groups are scheduled as shards and streamed row-by-row via `pyarrow`.
 - Recommended high-throughput pattern with PyTorch:
   1. worker micro-batch (`batch_size` on `TorchLoader` + identity collate)
   2. `.unbatch()`

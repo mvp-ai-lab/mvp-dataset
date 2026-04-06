@@ -24,6 +24,7 @@ from ..sources.jsonl import (
     parse_tar_uri,
     resolve_ref_field_value,
 )
+from ..sources.parquet import ParquetFragment, iter_parquet
 from ..sources.tar import iter_tar
 from .codecs import decode_value, encode_value
 from .fingerprint import hash_bytes
@@ -54,6 +55,36 @@ def _format_eta(seconds: float) -> str:
 def _is_meta_field(name: str) -> bool:
     """Return True for dunder metadata fields (e.g. ``__key__``)."""
     return name.startswith("__") and name.endswith("__")
+
+
+def _stable_value_for_sig(value: Any) -> Any:
+    """Convert a Python value into a JSON-serializable structure for signatures."""
+
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        return {
+            "__mvp_dataset_sig__": "bytes",
+            "hex": bytes(value).hex(),
+        }
+    if isinstance(value, (list, tuple)):
+        return [_stable_value_for_sig(item) for item in value]
+    if isinstance(value, dict):
+        if all(isinstance(key, str) for key in value):
+            return {key: _stable_value_for_sig(item) for key, item in value.items()}
+        return repr(value)
+    return repr(value)
+
+
+def _canonical_field_value(value: Any) -> str:
+    """Return a stable string representation used in source field signatures."""
+
+    return json.dumps(
+        _stable_value_for_sig(value),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +441,7 @@ def iter_jsonls_with_sigs(
                                     field_sigs[field] = hash_bytes(*sig_parts)
                             except (ValueError, OSError):
                                 # Fallback to JSON-field sig on parse/stat failure.
-                                canonical = json.dumps(value, ensure_ascii=True, sort_keys=True)
+                                canonical = _canonical_field_value(value)
                                 field_sigs[field] = hash_bytes(
                                     shard_str,
                                     shard_stat.st_mtime_ns,
@@ -420,7 +451,7 @@ def iter_jsonls_with_sigs(
                                     canonical,
                                 )
                         else:
-                            canonical = json.dumps(value, ensure_ascii=True, sort_keys=True)
+                            canonical = _canonical_field_value(value)
                             field_sigs[field] = hash_bytes(
                                 shard_str,
                                 shard_stat.st_mtime_ns,
@@ -448,6 +479,47 @@ def iter_jsonls_with_sigs(
                         field_sigs=field_sigs,
                     )
                     yield resolved
+
+
+def iter_parquets_with_sigs(
+    fragments: Iterator[ParquetFragment],
+    *,
+    columns: Sequence[str] | None,
+    batch_size: int,
+    use_threads: bool,
+) -> Iterator[Sample]:
+    """Iterate parquet shards and annotate each row sample with cache signatures."""
+
+    for fragment in fragments:
+        shard_str = fragment.path
+        shard_stat = os.stat(shard_str)
+        for sample in iter_parquet(
+            fragment,
+            columns=columns,
+            batch_size=batch_size,
+            use_threads=use_threads,
+        ):
+            index_in_file = sample.get("__index_in_file__")
+            if not isinstance(index_in_file, int):
+                msg = f"[InvalidParquetSample] shard={shard_str!r} sample missing int '__index_in_file__'"
+                raise ValueError(msg)
+
+            field_sigs: dict[str, str] = {}
+            for field, value in sample.items():
+                if _is_meta_field(field):
+                    continue
+                canonical = _canonical_field_value(value)
+                field_sigs[field] = hash_bytes(
+                    shard_str,
+                    shard_stat.st_mtime_ns,
+                    shard_stat.st_size,
+                    index_in_file,
+                    field,
+                    canonical,
+                )
+
+            sample[_CACHE_META_KEY] = CacheMeta(route_shard=fragment.cache_key, field_sigs=field_sigs)
+            yield sample
 
 
 # ---------------------------------------------------------------------------

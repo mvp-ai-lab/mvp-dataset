@@ -12,7 +12,9 @@ authors = [
   { name = "MVP AI Lab" }
 ]
 license = { file = "LICENSE" }
-dependencies = []
+dependencies = [
+  "pyarrow>=18.0.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/mvp-ai-lab/mvp-dataset"

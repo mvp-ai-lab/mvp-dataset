@@ -43,6 +43,14 @@ def _make_jsonl(path: Path, rows: list[dict]) -> None:
             fh.write(json.dumps(row) + "\n")
 
 
+def _make_parquet(path: Path, rows: list[dict], *, row_group_size: int | None = None) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+
+    table = pa.Table.from_pylist(rows)
+    pq.write_table(table, path, row_group_size=row_group_size)
+
+
 # ---------------------------------------------------------------------------
 # Basic cache build / reuse
 # ---------------------------------------------------------------------------
@@ -468,6 +476,204 @@ def test_cache_jsonl_list_refs_roundtrip(tmp_path):
     assert call_count[0] == 0
     assert second[0]["images"] == [b"img0", b"img1"]
     assert second[0]["num_images"] == 2
+
+
+def test_from_parquet_iterates_rows(tmp_path):
+    """from_parquet() yields one dict sample per parquet row."""
+    shard = tmp_path / "shard-00000.parquet"
+    _make_parquet(
+        shard,
+        [
+            {"text": "hello", "count": 1},
+            {"text": "world", "count": 2},
+        ],
+    )
+
+    samples = list(Dataset.from_parquet([str(shard)]))
+    assert len(samples) == 2
+    assert samples[0]["text"] == "hello"
+    assert samples[1]["count"] == 2
+    assert samples[0]["__file__"] == str(shard)
+    assert samples[0]["__index_in_file__"] == 0
+    assert samples[0]["__key__"] == f"{shard}:0"
+
+
+def test_from_source_dispatches_parquet(tmp_path):
+    """from_source() recognizes parquet shards."""
+    shard = tmp_path / "shard-00000.parquet"
+    _make_parquet(shard, [{"value": "x"}])
+
+    ds = Dataset.from_source([str(shard)])
+    samples = list(ds)
+    assert len(samples) == 1
+    assert samples[0]["value"] == "x"
+
+
+def test_from_parquet_columns_pushdown(tmp_path):
+    """from_parquet() can project a subset of columns."""
+    shard = tmp_path / "shard-00000.parquet"
+    _make_parquet(
+        shard,
+        [
+            {"value": "x", "unused": "drop-me"},
+        ],
+    )
+
+    samples = list(Dataset.from_parquet([str(shard)], columns=["value"]))
+    assert len(samples) == 1
+    assert samples[0]["value"] == "x"
+    assert "unused" not in samples[0]
+
+
+def test_from_source_mixed_extensions_with_parquet_raises(tmp_path):
+    """from_source() rejects mixed source extensions including parquet."""
+    parquet_shard = tmp_path / "shard-00000.parquet"
+    jsonl_shard = tmp_path / "shard-00000.jsonl"
+    _make_parquet(parquet_shard, [{"value": "x"}])
+    _make_jsonl(jsonl_shard, [{"value": "y"}])
+
+    with pytest.raises(ValueError, match="InvalidSourceType"):
+        Dataset.from_source([str(parquet_shard), str(jsonl_shard)])
+
+
+def test_parquet_row_groups_split_across_slots(tmp_path, monkeypatch):
+    """Different slots can read different row groups from the same parquet file."""
+    shard = tmp_path / "shard-00000.parquet"
+    _make_parquet(
+        shard,
+        [
+            {"id": 0},
+            {"id": 1},
+            {"id": 2},
+            {"id": 3},
+        ],
+        row_group_size=2,
+    )
+
+    ds0 = Dataset.from_parquet([str(shard)])
+    ds1 = Dataset.from_parquet([str(shard)])
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "0")
+    ids0 = {sample["id"] for sample in ds0}
+
+    monkeypatch.setenv("RANK", "1")
+    ids1 = {sample["id"] for sample in ds1}
+
+    assert ids0
+    assert ids1
+    assert ids0.isdisjoint(ids1)
+    assert ids0 | ids1 == {0, 1, 2, 3}
+
+
+def test_parquet_pipeline_ops(tmp_path):
+    """Parquet sources run through map, shuffle, and batch stages."""
+    shard = tmp_path / "shard-00000.parquet"
+    _make_parquet(
+        shard,
+        [
+            {"value": 1},
+            {"value": 2},
+            {"value": 3},
+        ],
+    )
+
+    ds = (
+        Dataset.from_parquet([str(shard)])
+        .map(lambda sample: {**sample, "double": sample["value"] * 2})
+        .shuffle(buffer_size=2, initial=1)
+        .batch(batch_size=2, drop_last=False)
+    )
+
+    batches = list(ds)
+    assert len(batches) == 2
+    doubles = sorted(sample["double"] for batch in batches for sample in batch)
+    assert doubles == [2, 4, 6]
+
+
+def test_cache_parquet_source(tmp_path):
+    """cache() works with parquet sources."""
+    shard = tmp_path / "shard-00000.parquet"
+    _make_parquet(
+        shard,
+        [
+            {"text": "hello"},
+            {"text": "world"},
+        ],
+    )
+
+    call_count = [0]
+
+    def fn(sample):
+        call_count[0] += 1
+        return {**sample, "upper": sample["text"].upper()}
+
+    ds = Dataset.from_parquet([str(shard)]).map(fn).cache(show_progress=False)
+
+    list(ds)
+    assert call_count[0] == 2
+
+    call_count[0] = 0
+    result = list(ds)
+    assert call_count[0] == 0
+    assert {sample["upper"] for sample in result} == {"HELLO", "WORLD"}
+
+
+def test_cache_parquet_invalidation_on_fn_change(tmp_path):
+    """Parquet cache invalidates when a pre-cache map changes."""
+    shard = tmp_path / "shard-00000.parquet"
+    _make_parquet(shard, [{"value": 1}])
+
+    def fn_v1(sample):
+        return {**sample, "tag": "v1"}
+
+    def fn_v2(sample):
+        return {**sample, "tag": "v2"}
+
+    ds1 = Dataset.from_parquet([str(shard)]).map(fn_v1).cache(show_progress=False)
+    ds2 = Dataset.from_parquet([str(shard)]).map(fn_v2).cache(show_progress=False)
+
+    assert list(ds1)[0]["tag"] == "v1"
+    assert list(ds2)[0]["tag"] == "v2"
+    assert len(list((tmp_path / ".cache").glob("*.tar"))) == 2
+
+
+def test_parquet_nested_and_bytes_roundtrip(tmp_path):
+    """Parquet rows preserve bytes, lists, and nested dicts through cache."""
+    shard = tmp_path / "shard-00000.parquet"
+    _make_parquet(
+        shard,
+        [
+            {
+                "payload": b"abc",
+                "items": [1, 2, 3],
+                "meta": {"source": "demo", "ok": True},
+            }
+        ],
+    )
+
+    ds = Dataset.from_parquet([str(shard)]).cache(show_progress=False)
+    first = list(ds)
+    second = list(ds)
+
+    assert first[0]["payload"] == b"abc"
+    assert first[0]["items"] == [1, 2, 3]
+    assert first[0]["meta"] == {"source": "demo", "ok": True}
+    assert second[0]["payload"] == b"abc"
+    assert second[0]["items"] == [1, 2, 3]
+    assert second[0]["meta"] == {"source": "demo", "ok": True}
+
+
+def test_parquet_join_and_resolve_refs_restrictions(tmp_path):
+    """Parquet remains a general source without tar/jsonl-specific APIs."""
+    shard = tmp_path / "shard-00000.parquet"
+    _make_parquet(shard, [{"value": 1}])
+
+    ds = Dataset.from_parquet([str(shard)])
+    with pytest.raises(ValueError, match="join"):
+        ds.join([("sidecar", lambda path: path)])
+    with pytest.raises(ValueError, match="resolve_refs"):
+        ds.resolve_refs([("image", str(tmp_path))])
 
 
 # ---------------------------------------------------------------------------
