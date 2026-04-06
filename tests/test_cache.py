@@ -11,6 +11,14 @@ from pathlib import Path
 import pytest
 
 from mvp_dataset import Dataset
+from mvp_dataset.cache.fingerprint import hash_bytes
+from mvp_dataset.cache.materialize import (
+    CacheMeta,
+    build_shard_cache,
+    iter_cache_shard,
+    read_manifest,
+    warmup_cache,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -129,6 +137,207 @@ def test_cache_directory_layout(tmp_path):
     assert (cache_dir / "shard-00000.tar.manifest.json").is_file()
     group_tars = list(cache_dir.glob("shard-00000-*.tar"))
     assert len(group_tars) == 1
+
+
+def test_warmup_cache_streams_interleaved_route_shards(tmp_path):
+    """Streaming warm-up writes interleaved routed samples into separate shard caches."""
+    shard_a = tmp_path / "shard-a.tar"
+    shard_b = tmp_path / "shard-b.tar"
+    plan_fingerprint = "plan-stream-interleaved"
+
+    pre_cache_stream = iter(
+        [
+            {
+                "__key__": "a1",
+                "x": b"A1",
+                "__cache_meta__": CacheMeta(route_shard=str(shard_a), field_sigs={"x": "sig-a1"}),
+            },
+            {
+                "__key__": "b1",
+                "x": b"B1",
+                "__cache_meta__": CacheMeta(route_shard=str(shard_b), field_sigs={"x": "sig-b1"}),
+            },
+            {
+                "__key__": "a2",
+                "x": b"A2",
+                "__cache_meta__": CacheMeta(route_shard=str(shard_a), field_sigs={"x": "sig-a2"}),
+            },
+            {
+                "__key__": "b2",
+                "x": b"B2",
+                "__cache_meta__": CacheMeta(route_shard=str(shard_b), field_sigs={"x": "sig-b2"}),
+            },
+        ]
+    )
+
+    warmup_cache(
+        assigned_shards=[str(shard_a), str(shard_b)],
+        pre_cache_stream=pre_cache_stream,
+        groups_spec=None,
+        plan_fingerprint=plan_fingerprint,
+        show_progress=False,
+        unsupported_stage_kinds=[],
+    )
+
+    assert [sample["x"] for sample in iter_cache_shard(str(shard_a), plan_fingerprint)] == [b"A1", b"A2"]
+    assert [sample["x"] for sample in iter_cache_shard(str(shard_b), plan_fingerprint)] == [b"B1", b"B2"]
+
+
+def test_streaming_cache_filename_matches_group_sig_formula(tmp_path):
+    """Streaming cache publishing preserves the historical group signature filename formula."""
+    shard = tmp_path / "shard-00000.tar"
+    plan_fingerprint = "plan-stream-name"
+    samples = [
+        (
+            {"__key__": "0001", "a": b"A1", "b": b"B1"},
+            CacheMeta(route_shard=str(shard), field_sigs={"a": "sig-a1", "b": "sig-b1"}),
+        ),
+        (
+            {"__key__": "0002", "a": b"A2", "b": b"B2"},
+            CacheMeta(route_shard=str(shard), field_sigs={"a": "sig-a2", "b": "sig-b2"}),
+        ),
+    ]
+
+    manifest = build_shard_cache(
+        str(shard),
+        samples,
+        groups_spec=(("a", "b"),),
+        plan_fingerprint=plan_fingerprint,
+    )
+
+    expected_sig = hash_bytes(
+        "0001:a:sig-a1",
+        "0001:b:sig-b1",
+        "0002:a:sig-a2",
+        "0002:b:sig-b2",
+    )[:16]
+    expected_path = tmp_path / ".cache" / f"shard-00000-a+b-{expected_sig}.tar"
+
+    assert manifest == {"a+b": str(expected_path)}
+    assert expected_path.is_file()
+
+
+def test_warmup_cache_empty_assigned_shard_writes_empty_manifest(tmp_path):
+    """Assigned shards with no routed samples still publish an empty manifest."""
+    shard_a = tmp_path / "shard-a.tar"
+    shard_b = tmp_path / "shard-b.tar"
+    plan_fingerprint = "plan-stream-empty"
+
+    pre_cache_stream = iter(
+        [
+            {
+                "__key__": "a1",
+                "x": b"A1",
+                "__cache_meta__": CacheMeta(route_shard=str(shard_a), field_sigs={"x": "sig-a1"}),
+            }
+        ]
+    )
+
+    warmup_cache(
+        assigned_shards=[str(shard_a), str(shard_b)],
+        pre_cache_stream=pre_cache_stream,
+        groups_spec=None,
+        plan_fingerprint=plan_fingerprint,
+        show_progress=False,
+        unsupported_stage_kinds=[],
+    )
+
+    assert read_manifest(str(shard_a), plan_fingerprint) is not None
+    assert read_manifest(str(shard_b), plan_fingerprint) == {}
+    assert list((tmp_path / ".cache").glob("shard-b-*.tar")) == []
+
+
+def test_warmup_cache_reuses_existing_manifest_on_finalize(tmp_path):
+    """Finalize reuses a concurrently available manifest instead of publishing temp tars."""
+    shard_a = tmp_path / "shard-a.tar"
+    shard_b = tmp_path / "shard-b.tar"
+    plan_fingerprint = "plan-stream-reuse"
+
+    existing_manifest = build_shard_cache(
+        str(shard_a),
+        [
+            (
+                {"__key__": "old", "x": b"old"},
+                CacheMeta(route_shard=str(shard_a), field_sigs={"x": "sig-old"}),
+            )
+        ],
+        groups_spec=None,
+        plan_fingerprint=plan_fingerprint,
+    )
+
+    pre_cache_stream = iter(
+        [
+            {
+                "__key__": "new-a",
+                "x": b"new-a",
+                "__cache_meta__": CacheMeta(route_shard=str(shard_a), field_sigs={"x": "sig-new-a"}),
+            },
+            {
+                "__key__": "new-b",
+                "x": b"new-b",
+                "__cache_meta__": CacheMeta(route_shard=str(shard_b), field_sigs={"x": "sig-new-b"}),
+            },
+        ]
+    )
+
+    warmup_cache(
+        assigned_shards=[str(shard_a), str(shard_b)],
+        pre_cache_stream=pre_cache_stream,
+        groups_spec=None,
+        plan_fingerprint=plan_fingerprint,
+        show_progress=False,
+        unsupported_stage_kinds=[],
+    )
+
+    assert read_manifest(str(shard_a), plan_fingerprint) == existing_manifest
+    assert [sample["x"] for sample in iter_cache_shard(str(shard_a), plan_fingerprint)] == [b"old"]
+    assert [sample["x"] for sample in iter_cache_shard(str(shard_b), plan_fingerprint)] == [b"new-b"]
+
+
+def test_warmup_cache_parallel_stream_factory(tmp_path):
+    """stream_factory + num_workers > 1 produces correct per-shard caches in parallel."""
+    shard_a = tmp_path / "shard-a.tar"
+    shard_b = tmp_path / "shard-b.tar"
+    plan_fingerprint = "plan-parallel"
+
+    samples_by_shard = {
+        str(shard_a): [
+            {
+                "__key__": "a1",
+                "x": b"A1",
+                "__cache_meta__": CacheMeta(route_shard=str(shard_a), field_sigs={"x": "sa1"}),
+            },
+            {
+                "__key__": "a2",
+                "x": b"A2",
+                "__cache_meta__": CacheMeta(route_shard=str(shard_a), field_sigs={"x": "sa2"}),
+            },
+        ],
+        str(shard_b): [
+            {
+                "__key__": "b1",
+                "x": b"B1",
+                "__cache_meta__": CacheMeta(route_shard=str(shard_b), field_sigs={"x": "sb1"}),
+            },
+        ],
+    }
+
+    def _factory(shards: list[str]):
+        return iter(s for shard in shards for s in samples_by_shard.get(shard, []))
+
+    warmup_cache(
+        assigned_shards=[str(shard_a), str(shard_b)],
+        pre_cache_stream=None,
+        groups_spec=None,
+        plan_fingerprint=plan_fingerprint,
+        show_progress=False,
+        unsupported_stage_kinds=[],
+        stream_factory=_factory,
+        num_workers=2,
+    )
+
+    assert [s["x"] for s in iter_cache_shard(str(shard_a), plan_fingerprint)] == [b"A1", b"A2"]
+    assert [s["x"] for s in iter_cache_shard(str(shard_b), plan_fingerprint)] == [b"B1"]
 
 
 # ---------------------------------------------------------------------------

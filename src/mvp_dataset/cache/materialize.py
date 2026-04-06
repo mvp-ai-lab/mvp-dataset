@@ -8,9 +8,11 @@ import itertools
 import json
 import os
 import tarfile
+import threading
 import time
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
@@ -27,12 +29,16 @@ from ..sources.jsonl import (
 from ..sources.parquet import ParquetFragment, iter_parquet
 from ..sources.tar import iter_tar
 from .codecs import decode_value, encode_value
-from .fingerprint import hash_bytes
+from .fingerprint import _HashAccumulator, hash_bytes
 
 # Reserved meta member suffix inside cache tars (e.g. "0001.__cache_meta__")
 _CACHE_META_SUFFIX: Final[str] = ".__cache_meta__"
 # Key used inside sample dicts to carry per-sample cache metadata through pipeline
 _CACHE_META_KEY: Final[str] = "__cache_meta__"
+_TAR_BLOCK_SIZE: Final[int] = tarfile.BLOCKSIZE
+_TAR_EOF: Final[bytes] = tarfile.NUL * _TAR_BLOCK_SIZE * 2
+_TAR_FORMAT: Final[int] = tarfile.GNU_FORMAT
+_TAR_ERRORS: Final[str] = "surrogateescape"
 
 
 def _log_info(message: str) -> None:
@@ -660,6 +666,203 @@ def make_cache_aware_assemble(
 # ---------------------------------------------------------------------------
 
 
+def _add_tar_member(file_obj: io.BufferedWriter, member_name: str, data: bytes) -> None:
+    """Write one regular file member into an open GNU tar stream."""
+
+    ti = tarfile.TarInfo(name=member_name)
+    ti.size = len(data)
+    file_obj.write(ti.tobuf(format=_TAR_FORMAT, encoding=tarfile.ENCODING, errors=_TAR_ERRORS))
+    file_obj.write(data)
+    remainder = len(data) % _TAR_BLOCK_SIZE
+    if remainder:
+        file_obj.write(tarfile.NUL * (_TAR_BLOCK_SIZE - remainder))
+
+
+def _group_meta_payload(
+    group_fields: tuple[str, ...],
+    codec_map: dict[str, str],
+    field_sigs: dict[str, str],
+) -> bytes:
+    """Encode per-sample codec/signature metadata for one cache group."""
+
+    payload: dict[str, dict[str, str]] = {}
+    for field in group_fields:
+        if field not in codec_map:
+            continue
+        payload[field] = {
+            "codec": codec_map[field],
+            "sig": field_sigs.get(field, ""),
+        }
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+@dataclass
+class _GroupTarWriter:
+    """Streaming writer for one cache group tar."""
+
+    shard_stem: str
+    cache_dir: Path
+    label: str
+    group_fields: tuple[str, ...]
+    tmp_path: Path
+    file_obj: io.BufferedWriter
+    sig_accumulator: _HashAccumulator
+    _closed: bool = False
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        shard_stem: str,
+        cache_dir: Path,
+        label: str,
+        group_fields: tuple[str, ...],
+    ) -> _GroupTarWriter:
+        token = hash_bytes(shard_stem, label, os.getpid(), time.time_ns())[:16]
+        tmp_path = cache_dir / f"{shard_stem}-{label}-{token}.tmp.tar"
+        return cls(
+            shard_stem=shard_stem,
+            cache_dir=cache_dir,
+            label=label,
+            group_fields=group_fields,
+            tmp_path=tmp_path,
+            file_obj=tmp_path.open("wb"),
+            sig_accumulator=_HashAccumulator(),
+        )
+
+    def append(self, sample: Sample, meta: CacheMeta) -> None:
+        """Append one sample to the open temp tar and update its group signature."""
+
+        key = str(sample.get("__key__", ""))
+        codec_map: dict[str, str] = {}
+
+        for field in self.group_fields:
+            self.sig_accumulator.update(f"{key}:{field}:{meta.field_sigs.get(field, '')}")
+            if field not in sample:
+                continue
+            data, codec_tag = encode_value(sample[field])
+            codec_map[field] = codec_tag
+            _add_tar_member(self.file_obj, f"{key}.{field}", data)
+
+        meta_bytes = _group_meta_payload(self.group_fields, codec_map, meta.field_sigs)
+        _add_tar_member(self.file_obj, f"{key}{_CACHE_META_SUFFIX}", meta_bytes)
+
+    def close(self) -> None:
+        """Close the underlying temp tar if it is still open."""
+
+        if not self._closed:
+            self.file_obj.write(_TAR_EOF)
+            self.file_obj.close()
+            self._closed = True
+
+    def discard(self) -> None:
+        """Close and remove the temp tar if it still exists."""
+
+        self.close()
+        try:
+            self.tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    @property
+    def final_path(self) -> Path:
+        """Return the published tar path derived from the accumulated signature."""
+
+        group_sig = self.sig_accumulator.hexdigest()[:16]
+        return self.cache_dir / f"{self.shard_stem}-{self.label}-{group_sig}.tar"
+
+
+@dataclass
+class _ShardCacheWriter:
+    """Streaming cache writer for one source shard."""
+
+    shard_path: str
+    groups_spec: tuple[tuple[str, ...], ...] | None
+    plan_fingerprint: str
+    _initialized: bool = False
+    _group_writers: list[_GroupTarWriter] | None = None
+    _existing_manifest: dict[str, str] | None = None
+
+    def _ensure_initialized(self, sample_keys: Iterable[str]) -> None:
+        if self._initialized:
+            return
+        self._initialized = True
+
+        existing = read_manifest(self.shard_path, self.plan_fingerprint)
+        if existing is not None:
+            self._existing_manifest = existing
+            self._group_writers = []
+            return
+
+        cache_dir = _cache_dir(self.shard_path)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        shard_stem = Path(self.shard_path).stem
+        self._group_writers = []
+        for group_fields in normalize_groups(self.groups_spec, sample_keys):
+            self._group_writers.append(
+                _GroupTarWriter.create(
+                    shard_stem=shard_stem,
+                    cache_dir=cache_dir,
+                    label=_group_label(group_fields),
+                    group_fields=group_fields,
+                )
+            )
+
+    def append(self, sample: Sample, meta: CacheMeta) -> None:
+        """Append one routed sample to this shard's cache temp files."""
+
+        self._ensure_initialized(sample.keys())
+        if self._existing_manifest is not None:
+            return
+        assert self._group_writers is not None
+        for writer in self._group_writers:
+            writer.append(sample, meta)
+
+    def finalize(self) -> dict[str, str]:
+        """Publish temp tars and manifest, or reuse an existing manifest."""
+
+        if self._existing_manifest is not None:
+            return self._existing_manifest
+
+        group_writers = self._group_writers or []
+        for writer in group_writers:
+            writer.close()
+
+        with _ShardLock(self.shard_path):
+            existing = read_manifest(self.shard_path, self.plan_fingerprint)
+            if existing is not None:
+                self._existing_manifest = existing
+                for writer in group_writers:
+                    writer.discard()
+                return existing
+
+            if not self._initialized or not group_writers:
+                _write_manifest(self.shard_path, self.plan_fingerprint, {})
+                self._existing_manifest = {}
+                return {}
+
+            group_tars: dict[str, str] = {}
+            for writer in group_writers:
+                final_path = writer.final_path
+                if not final_path.is_file():
+                    writer.tmp_path.rename(final_path)
+                else:
+                    writer.discard()
+                group_tars[writer.label] = str(final_path)
+
+            _write_manifest(self.shard_path, self.plan_fingerprint, group_tars)
+            self._existing_manifest = group_tars
+            return group_tars
+
+    def discard(self) -> None:
+        """Best-effort cleanup for any un-published temp files."""
+
+        if self._group_writers is None:
+            return
+        for writer in self._group_writers:
+            writer.discard()
+
+
 def build_shard_cache(
     shard_path: str,
     samples: list[tuple[Sample, CacheMeta]],
@@ -668,8 +871,8 @@ def build_shard_cache(
 ) -> dict[str, str]:
     """Write group tar files for *shard_path* and return ``{label: tar_path}``.
 
-    Uses an atomic temp→rename pattern so partial writes are never seen.
-    A per-shard exclusive lock prevents concurrent builds.
+    Uses the streaming shard writer so naming, manifest publishing, and
+    locking stay aligned with the warm-up path.
 
     Args:
         shard_path: Path to the original source shard.
@@ -679,102 +882,17 @@ def build_shard_cache(
     Returns:
         A ``{group_label: tar_path}`` mapping for the written group tars.
     """
-    with _ShardLock(shard_path):
-        # Re-check under lock: another process may have built it while we waited.
-        existing = read_manifest(shard_path, plan_fingerprint)
-        if existing is not None:
-            return existing
-
-        cache_dir = _cache_dir(shard_path)
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        shard_stem = Path(shard_path).stem
-
-        if not samples:
-            _write_manifest(shard_path, plan_fingerprint, {})
-            return {}
-
-        first_sample = samples[0][0]
-        groups = normalize_groups(groups_spec, first_sample.keys())
-
-        group_tars: dict[str, str] = {}
-
-        for group_fields in groups:
-            label = _group_label(group_fields)
-
-            # Compute group signature from per-field content signatures.
-            sig_parts: list[str] = []
-            for s_dict, s_meta in samples:
-                key = str(s_dict.get("__key__", ""))
-                for field in group_fields:
-                    sig_parts.append(f"{key}:{field}:{s_meta.field_sigs.get(field, '')}")
-            group_sig = hash_bytes(*sig_parts)[:16]
-
-            final_name = f"{shard_stem}-{label}-{group_sig}.tar"
-            final_path = cache_dir / final_name
-
-            if not final_path.is_file():
-                _write_group_tar(final_path, samples, group_fields)
-
-            group_tars[label] = str(final_path)
-
-        _write_manifest(shard_path, plan_fingerprint, group_tars)
-
-        return group_tars
-
-
-def _write_group_tar(
-    final_path: Path,
-    samples: list[tuple[Sample, CacheMeta]],
-    group_fields: tuple[str, ...],
-) -> None:
-    """Write one group tar to a temp file, then atomically rename it.
-
-    Args:
-        final_path: Destination path for the group tar.
-        samples: Sample/meta pairs to write.
-        group_fields: Field names belonging to this group.
-    """
-    tmp_path = final_path.with_suffix(".tmp.tar")
+    writer = _ShardCacheWriter(
+        shard_path=shard_path,
+        groups_spec=groups_spec,
+        plan_fingerprint=plan_fingerprint,
+    )
     try:
-        with tarfile.open(str(tmp_path), "w") as tf:
-            for s_dict, s_meta in samples:
-                key = str(s_dict.get("__key__", ""))
-
-                # Per-field codec map stored in the sample's meta member.
-                codec_map: dict[str, str] = {}
-
-                for field in group_fields:
-                    if field not in s_dict:
-                        continue
-                    data, codec_tag = encode_value(s_dict[field])
-                    codec_map[field] = codec_tag
-                    member_name = f"{key}.{field}"
-                    ti = tarfile.TarInfo(name=member_name)
-                    ti.size = len(data)
-                    tf.addfile(ti, io.BytesIO(data))
-
-                # Write per-sample meta member with codec + signature info.
-                meta_payload: dict[str, Any] = {
-                    field: {
-                        "codec": codec_map[field],
-                        "sig": s_meta.field_sigs.get(field, ""),
-                    }
-                    for field in group_fields
-                    if field in codec_map
-                }
-                meta_bytes = json.dumps(meta_payload, separators=(",", ":")).encode("utf-8")
-                meta_name = f"{key}{_CACHE_META_SUFFIX}"
-                mti = tarfile.TarInfo(name=meta_name)
-                mti.size = len(meta_bytes)
-                tf.addfile(mti, io.BytesIO(meta_bytes))
-
-        tmp_path.rename(final_path)
-    except Exception:
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+        for sample, meta in samples:
+            writer.append(sample, meta)
+        return writer.finalize()
+    finally:
+        writer.discard()
 
 
 # ---------------------------------------------------------------------------
@@ -873,32 +991,126 @@ def iter_cache_shard(shard_path: str, plan_fingerprint: str) -> Iterator[Sample]
 # ---------------------------------------------------------------------------
 
 
+def _warmup_shards(
+    worker_shards: list[str],
+    stream: Iterator[object],
+    groups_spec: tuple[tuple[str, ...], ...] | None,
+    plan_fingerprint: str,
+    *,
+    show_progress: bool = False,
+    progress_lock: threading.Lock | None = None,
+    progress_counter: list[int] | None = None,
+    total_shards: int = 0,
+    started_at: float = 0.0,
+) -> None:
+    """Process one chunk of shards from *stream* and materialise their caches.
+
+    This is the inner worker used by both the serial and parallel paths of
+    :func:`warmup_cache`.  Each invocation owns an exclusive set of shards
+    and writes independently to their cache directories.
+
+    Args:
+        worker_shards: Shards this worker is responsible for.
+        stream: Pre-built sample stream for exactly *worker_shards*.
+        groups_spec: Forwarded to :class:`_ShardCacheWriter`.
+        plan_fingerprint: Forwarded to :class:`_ShardCacheWriter`.
+        show_progress: Whether to emit per-shard log messages.
+        progress_lock: Shared lock for multi-worker progress reporting.
+        progress_counter: Shared ``[started_count]`` list for multi-worker ETA.
+        total_shards: Total shards across all workers (for ETA denominator).
+        started_at: ``time.monotonic()`` value from the warmup start.
+    """
+    shard_writers = {
+        shard: _ShardCacheWriter(
+            shard_path=shard,
+            groups_spec=groups_spec,
+            plan_fingerprint=plan_fingerprint,
+        )
+        for shard in worker_shards
+    }
+
+    local_started: set[str] = set()
+
+    try:
+        for item in stream:
+            if not isinstance(item, dict):
+                msg = (
+                    f"[CacheBoundaryError] cache() boundary requires dict samples; "
+                    f"got {type(item).__name__!r}. "
+                    f"Stages like batch() must not appear before cache()."
+                )
+                raise TypeError(msg)
+            meta: CacheMeta | None = item.pop(_CACHE_META_KEY, None)
+            if meta is None:
+                route = worker_shards[0] if worker_shards else ""
+                meta = CacheMeta(route_shard=route, field_sigs={})
+            route_shard = meta.route_shard
+            if route_shard not in shard_writers:
+                continue
+            if show_progress and route_shard not in local_started:
+                local_started.add(route_shard)
+                if progress_lock is not None and progress_counter is not None:
+                    with progress_lock:
+                        progress_counter[0] += 1
+                        started = progress_counter[0]
+                    elapsed = time.monotonic() - started_at
+                    avg = elapsed / started if started else 0.0
+                    eta = avg * (total_shards - started)
+                    _log_info(f"Caching {started}/{total_shards} shards... ETA {_format_eta(eta)}")
+                else:
+                    elapsed = time.monotonic() - started_at
+                    avg = elapsed / len(local_started) if local_started else 0.0
+                    eta = avg * (len(worker_shards) - len(local_started))
+                    _log_info(f"Caching {len(local_started)}/{len(worker_shards)} shards... ETA {_format_eta(eta)}")
+            shard_writers[route_shard].append(item, meta)
+
+        for shard in worker_shards:
+            shard_writers[shard].finalize()
+    finally:
+        for writer in shard_writers.values():
+            writer.discard()
+
+
 def warmup_cache(
     assigned_shards: list[str],
-    pre_cache_stream: Iterator[object],
+    pre_cache_stream: Iterator[object] | None,
     groups_spec: tuple[tuple[str, ...], ...] | None,
     plan_fingerprint: str,
     show_progress: bool,
     unsupported_stage_kinds: list[str],
+    *,
+    stream_factory: Callable[[list[str]], Iterator[object]] | None = None,
+    num_workers: int = 1,
 ) -> None:
     """Run the full pre-cache pipeline and materialise cache for each shard.
 
-    Consumes *pre_cache_stream* entirely, groups the output samples by
-    their ``route_shard``, then calls :func:`build_shard_cache` for each
-    assigned shard under an exclusive lock.
+    Consumes the sample stream and routes samples into per-shard temp tars.
+    At the end, each shard is finalized under an exclusive lock by publishing
+    the temp tars and writing the manifest.
+
+    When *stream_factory* and *num_workers* > 1 are provided, shards are
+    split across worker threads that each build their own independent stream,
+    enabling parallel I/O for large datasets with many shards.
 
     Args:
         assigned_shards: Shard paths this worker is responsible for.
         pre_cache_stream: Fully composed pre-cache iterator (source +
-            cache-aware stages) that yields dict samples with
-            ``__cache_meta__`` attached.
+            cache-aware stages).  Used when *stream_factory* is ``None``.
         groups_spec: Field grouping forwarded to :func:`build_shard_cache`.
         plan_fingerprint: Plan fingerprint forwarded to the manifest.
-        show_progress: Whether to print progress to ``stderr``.
-        unsupported_stage_kinds: Stage kinds that appear before the cache
-            boundary but are not tracked for invalidation.  A warning is
-            emitted when non-empty.
+        show_progress: Whether to print progress to stderr.
+        unsupported_stage_kinds: Stage kinds before the cache boundary that
+            are not tracked for invalidation.  A warning is emitted when
+            non-empty.
+        stream_factory: Optional callable ``(shards) -> Iterator`` that
+            builds an independent pre-cache stream for a given shard subset.
+            Required for parallel warm-up (``num_workers`` > 1).
+        num_workers: Number of parallel worker threads.  Only effective when
+            *stream_factory* is also provided.  Defaults to 1 (serial).
     """
+    if show_progress and assigned_shards:
+        _log_info(f"Caching shards: {assigned_shards[0]!r} and {len(assigned_shards) - 1} more...")
+
     if unsupported_stage_kinds:
         warnings.warn(
             f"[CacheInvalidationWarning] The following stage type(s) appear before "
@@ -909,40 +1121,53 @@ def warmup_cache(
             stacklevel=4,
         )
 
-    # Collect all pre-cache outputs grouped by route_shard.
-    shard_samples: dict[str, list[tuple[Sample, CacheMeta]]] = {s: [] for s in assigned_shards}
+    if stream_factory is not None and num_workers > 1 and len(assigned_shards) > 1:
+        # Parallel path: split shards across worker threads, each with its own stream.
+        # Interleaved assignment gives better load balancing than sequential chunks.
+        actual_workers = min(num_workers, len(assigned_shards))
+        chunks = [assigned_shards[i::actual_workers] for i in range(actual_workers)]
 
-    for item in pre_cache_stream:
-        if not isinstance(item, dict):
-            msg = (
-                f"[CacheBoundaryError] cache() boundary requires dict samples; "
-                f"got {type(item).__name__!r}. "
-                f"Stages like batch() must not appear before cache()."
-            )
-            raise TypeError(msg)
-        meta: CacheMeta | None = item.pop(_CACHE_META_KEY, None)
-        if meta is None:
-            # Unsupported stage dropped the meta – route to first assigned shard.
-            route = assigned_shards[0] if assigned_shards else ""
-            meta = CacheMeta(route_shard=route, field_sigs={})
-        route_shard = meta.route_shard
-        if route_shard not in shard_samples:
-            # Assemble may produce output routed to a shard not in assigned_shards.
-            # Skip samples that belong to other slots' shards.
-            continue
-        shard_samples[route_shard].append((item, meta))
+        started_at = time.monotonic()
+        progress_lock = threading.Lock()
+        progress_counter = [0]
 
-    # Build cache per shard (locked).
-    n_shards = len(assigned_shards)
-    started_at = time.monotonic()
-    for i, shard in enumerate(assigned_shards, 1):
-        samples = shard_samples.get(shard, [])
-        build_shard_cache(shard, samples, groups_spec, plan_fingerprint)
-        if show_progress:
-            elapsed = time.monotonic() - started_at
-            avg_per_shard = elapsed / i if i else 0.0
-            eta = avg_per_shard * (n_shards - i)
-            _log_info(f"Caching {i}/{n_shards} shards... ETA {_format_eta(eta)}")
+        with ThreadPoolExecutor(max_workers=actual_workers) as pool:
+            futures = [
+                pool.submit(
+                    _warmup_shards,
+                    chunk,
+                    stream_factory(chunk),
+                    groups_spec,
+                    plan_fingerprint,
+                    show_progress=show_progress,
+                    progress_lock=progress_lock,
+                    progress_counter=progress_counter,
+                    total_shards=len(assigned_shards),
+                    started_at=started_at,
+                )
+                for chunk in chunks
+            ]
+            for fut in as_completed(futures):
+                fut.result()  # re-raise any worker exception
+        return
+
+    # Serial path (stream_factory=None uses pre_cache_stream; factory+1-worker also serial).
+    stream: Iterator[object]
+    if stream_factory is not None:
+        stream = stream_factory(assigned_shards)
+    elif pre_cache_stream is not None:
+        stream = pre_cache_stream
+    else:
+        raise ValueError("warmup_cache requires either pre_cache_stream or stream_factory")
+
+    _warmup_shards(
+        assigned_shards,
+        stream,
+        groups_spec,
+        plan_fingerprint,
+        show_progress=show_progress,
+        started_at=time.monotonic(),
+    )
 
 
 def wait_for_cache(

@@ -768,49 +768,68 @@ class Dataset(torch_iterabledataset_class()):
                 )
             else:
                 # --- Warm-up: build the cache. ---
-                # Build source stream with signature annotation.
-                if self.source_kind == "tars":
-                    shard_stream: Iterator[str] = iter(assigned_shards)
-                    source_stream = iter_tars_with_sigs(
-                        shard_stream,
-                        key_dot_level=tar_key_dot_level,
-                        sidecars=self._sidecar_specs,
-                    )
-                elif self.source_kind == "jsonl":
-                    shard_stream = iter(assigned_shards)
-                    source_stream = iter_jsonls_with_sigs(
-                        shard_stream,
-                        ref_fields=self._ref_fields,
-                        key_dot_level=tar_key_dot_level,
-                        tar_cache_size=tar_cache_size,
-                    )
-                else:
-                    assert assigned_parquet_fragments is not None
-                    source_stream = iter_parquets_with_sigs(
-                        iter(assigned_parquet_fragments),
-                        columns=self._parquet_columns,
-                        batch_size=self._parquet_batch_size,
-                        use_threads=self._parquet_use_threads,
-                    )
-
-                # Apply pre-cache stages with cache-aware versions where available.
-                pre_stream: Iterable[object] = source_stream
+                # Collect unsupported stage kinds once (not per-shard).
                 unsupported_kinds: list[str] = []
                 for spec in pre_specs:
-                    if spec.cache_stage is not None:
-                        pre_stream = spec.cache_stage(pre_stream)
-                    else:
-                        if spec.kind in _UNSUPPORTED_CACHE_KINDS:
-                            unsupported_kinds.append(spec.kind)
-                        pre_stream = spec.apply(pre_stream)
+                    if spec.cache_stage is None and spec.kind in _UNSUPPORTED_CACHE_KINDS:
+                        unsupported_kinds.append(spec.kind)
 
+                # Capture per-shard fragment lookup for parquet sources.
+                fragment_by_key: dict[str, ParquetFragment] = (
+                    {f.cache_key: f for f in assigned_parquet_fragments}
+                    if assigned_parquet_fragments is not None
+                    else {}
+                )
+
+                # Factory that builds an independent pre-cache stream for a shard subset.
+                # Each call produces a fresh iterator; safe to call from multiple threads.
+                source_kind = self.source_kind
+                sidecar_specs = self._sidecar_specs
+                ref_fields = self._ref_fields
+                parquet_columns = self._parquet_columns
+                parquet_batch_size = self._parquet_batch_size
+                parquet_use_threads = self._parquet_use_threads
+
+                def _make_pre_cache_stream(shards: list[str]) -> Iterator[object]:
+                    if source_kind == "tars":
+                        src: Iterable[object] = iter_tars_with_sigs(
+                            iter(shards),
+                            key_dot_level=tar_key_dot_level,
+                            sidecars=sidecar_specs,
+                        )
+                    elif source_kind == "jsonl":
+                        src = iter_jsonls_with_sigs(
+                            iter(shards),
+                            ref_fields=ref_fields,
+                            key_dot_level=tar_key_dot_level,
+                            tar_cache_size=tar_cache_size,
+                        )
+                    else:
+                        frags = [fragment_by_key[s] for s in shards if s in fragment_by_key]
+                        src = iter_parquets_with_sigs(
+                            iter(frags),
+                            columns=parquet_columns,
+                            batch_size=parquet_batch_size,
+                            use_threads=parquet_use_threads,
+                        )
+                    stream: Iterable[object] = src
+                    for spec in pre_specs:
+                        if spec.cache_stage is not None:
+                            stream = spec.cache_stage(stream)
+                        else:
+                            stream = spec.apply(stream)
+                    return iter(stream)
+
+                num_cache_workers = int(os.environ.get("LOADER_CACHE_NUM_WORKERS", "1"))
                 warmup_cache(
                     assigned_shards=assigned_shards,
-                    pre_cache_stream=iter(pre_stream),
+                    pre_cache_stream=None,
                     groups_spec=cache_spec.groups,
                     plan_fingerprint=cache_spec.plan_fingerprint,
                     show_progress=cache_spec.show_progress,
                     unsupported_stage_kinds=unsupported_kinds,
+                    stream_factory=_make_pre_cache_stream,
+                    num_workers=num_cache_workers,
                 )
 
         # --- Serve path: read from cache tars. ---

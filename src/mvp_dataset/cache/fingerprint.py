@@ -10,23 +10,9 @@ from collections.abc import Callable
 from typing import Any
 
 
-def hash_bytes(*parts: Any) -> str:
-    """Return a SHA-256 hex digest over a sequence of typed parts.
+def _update_hash(h: hashlib._Hash, *parts: Any) -> None:
+    """Update *h* using the same typed framing scheme as :func:`hash_bytes`."""
 
-    Each part is type-tagged and length-prefixed so that adjacent parts
-    cannot collide.
-
-    Args:
-        *parts: Values to hash.  Supported types: ``bytes``, ``str``,
-            ``int``, ``float``, ``bool``.
-
-    Returns:
-        A 64-character lowercase hex digest string.
-
-    Raises:
-        TypeError: If any part has an unsupported type.
-    """
-    h = hashlib.sha256()
     for part in parts:
         if isinstance(part, (bytes, bytearray)):
             data = bytes(part)
@@ -49,6 +35,39 @@ def hash_bytes(*parts: Any) -> str:
             h.update(encoded)
         else:
             raise TypeError(f"unsupported hash part type {type(part)!r}")
+
+
+class _HashAccumulator:
+    """Incremental SHA-256 accumulator compatible with :func:`hash_bytes`."""
+
+    def __init__(self) -> None:
+        self._hash = hashlib.sha256()
+
+    def update(self, *parts: Any) -> None:
+        _update_hash(self._hash, *parts)
+
+    def hexdigest(self) -> str:
+        return self._hash.hexdigest()
+
+
+def hash_bytes(*parts: Any) -> str:
+    """Return a SHA-256 hex digest over a sequence of typed parts.
+
+    Each part is type-tagged and length-prefixed so that adjacent parts
+    cannot collide.
+
+    Args:
+        *parts: Values to hash.  Supported types: ``bytes``, ``str``,
+            ``int``, ``float``, ``bool``.
+
+    Returns:
+        A 64-character lowercase hex digest string.
+
+    Raises:
+        TypeError: If any part has an unsupported type.
+    """
+    h = hashlib.sha256()
+    _update_hash(h, *parts)
     return h.hexdigest()
 
 
