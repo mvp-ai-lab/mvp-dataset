@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import time
 
 from mvp_dataset import Dataset, TorchLoader
@@ -24,8 +25,11 @@ def main() -> None:
     parser.add_argument("--max-batches", type=int, default=2, help="Maximum number of output batches")
     args = parser.parse_args()
 
+    shards = [f for pattern in args.shards for f in (glob.glob(pattern, recursive=True) or [pattern])]
+    print(len(shards), "shard(s) found.")
+
     dataset = Dataset.from_parquet(
-        args.shards,
+        shards,
         resample=True,
         columns=args.columns,
         batch_size=args.batch_size,

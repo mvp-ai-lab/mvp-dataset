@@ -19,7 +19,7 @@ class ParquetFragment:
     """One schedulable parquet row-group fragment."""
 
     path: str
-    row_group: int
+    row_groups: tuple[int, ...]
     row_offset: int
     num_rows: int
 
@@ -27,30 +27,55 @@ class ParquetFragment:
     def cache_key(self) -> str:
         """Stable shard identifier used by cache manifests and routing."""
 
-        return f"{self.path}{_FRAGMENT_SUFFIX}{self.row_group}"
+        rg_spec = (
+            str(self.row_groups[0]) if len(self.row_groups) == 1 else f"{self.row_groups[0]}-{self.row_groups[-1]}"
+        )
+        return f"{self.path}{_FRAGMENT_SUFFIX}{rg_spec}"
 
 
 def list_parquet_fragments(
     shard_paths: Sequence[PathLikeStr],
+    *,
+    min_rows_per_fragment: int = 5000,
 ) -> list[ParquetFragment]:
-    """Expand parquet files into schedulable row-group fragments."""
+    """Expand parquet files into schedulable row-group fragments.
+
+    Row groups with fewer than *min_rows_per_fragment* rows are merged with
+    subsequent row groups until the threshold is reached.
+    """
 
     fragments: list[ParquetFragment] = []
     for shard_path in shard_paths:
         shard = str(shard_path)
         parquet_file = pq.ParquetFile(shard)
         row_offset = 0
+        pending_groups: list[int] = []
+        pending_rows = 0
         for row_group in range(parquet_file.num_row_groups):
             num_rows = parquet_file.metadata.row_group(row_group).num_rows
+            pending_groups.append(row_group)
+            pending_rows += num_rows
+            if pending_rows >= min_rows_per_fragment:
+                fragments.append(
+                    ParquetFragment(
+                        path=shard,
+                        row_groups=tuple(pending_groups),
+                        row_offset=row_offset,
+                        num_rows=pending_rows,
+                    )
+                )
+                row_offset += pending_rows
+                pending_groups = []
+                pending_rows = 0
+        if pending_groups:
             fragments.append(
                 ParquetFragment(
                     path=shard,
-                    row_group=row_group,
+                    row_groups=tuple(pending_groups),
                     row_offset=row_offset,
-                    num_rows=num_rows,
+                    num_rows=pending_rows,
                 )
             )
-            row_offset += num_rows
     return fragments
 
 
@@ -68,7 +93,7 @@ def iter_parquet(
 
     for record_batch in parquet_file.iter_batches(
         batch_size=batch_size,
-        row_groups=[fragment.row_group],
+        row_groups=list(fragment.row_groups),
         columns=columns,
         use_threads=use_threads,
     ):

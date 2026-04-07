@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 from types import ModuleType
-from typing import Literal, cast
+from typing import Literal
 
 from ..core.types import (
     Assembler,
@@ -658,37 +658,26 @@ class Dataset(torch_iterabledataset_class()):
         stream: Iterable[object]
 
         tar_key_dot_level = int(os.environ.get("LOADER_TAR_KEY_DOT_LEVEL", 1))
+
+        shard_stream = iter_items(
+            self._source,
+            context=context,
+            resample=self._resample,
+        )
+
         if self.source_kind == "tars":
-            tar_paths = self._as_tar_source()
-            shard_stream = iter_items(
-                tar_paths,
-                context=context,
-                resample=self._resample,
-            )
             stream = iter_tars(
                 shard_stream,
                 key_dot_level=tar_key_dot_level,
                 sidecars=self._sidecar_specs,
             )
         elif self.source_kind == "jsonl":
-            tar_cache_size = int(os.environ.get("LOADER_JSONL_TAR_CACHE_SIZE", 8))
-            shard_stream = iter_items(
-                self._as_jsonl_source(),
-                context=context,
-                resample=self._resample,
-            )
             stream = iter_jsonls(
                 shard_stream,
                 ref_fields=self._ref_fields,
                 key_dot_level=tar_key_dot_level,
-                tar_cache_size=tar_cache_size,
             )
         else:
-            shard_stream = iter_items(
-                self._as_parquet_source(),
-                context=context,
-                resample=self._resample,
-            )
             stream = iter_parquets(
                 shard_stream,
                 columns=self._parquet_columns,
@@ -824,41 +813,3 @@ class Dataset(torch_iterabledataset_class()):
             stream = spec.apply(stream)
 
         yield from stream
-
-    def _as_tar_source(self) -> list[str]:
-        """Return tar shard paths with O(1) source-shape validation.
-
-        Returns:
-            The underlying tar shard path list.
-
-        Raises:
-            TypeError: If this dataset is not backed by tar shard paths.
-        """
-
-        if self._source_shape != "tar_paths":
-            msg = "[InvalidSourceShape] expected tar_paths source shape"
-            raise TypeError(msg)
-        return cast(list[str], self._source)
-
-    def _as_jsonl_source(self) -> list[str]:
-        """Return JSONL shard paths with O(1) source-shape validation.
-
-        Returns:
-            The underlying JSONL shard path list.
-
-        Raises:
-            TypeError: If this dataset is not backed by JSONL shard paths.
-        """
-
-        if self._source_shape != "jsonl_paths":
-            msg = "[InvalidSourceShape] expected jsonl_paths source shape"
-            raise TypeError(msg)
-        return cast(list[str], self._source)
-
-    def _as_parquet_source(self) -> list[ParquetFragment]:
-        """Return parquet row-group fragments with O(1) source-shape validation."""
-
-        if self._source_shape != "parquet_fragments":
-            msg = "[InvalidSourceShape] expected parquet_fragments source shape"
-            raise TypeError(msg)
-        return cast(list[ParquetFragment], self._source)
