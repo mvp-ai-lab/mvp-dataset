@@ -24,6 +24,7 @@ from ..sources.jsonl import (
     parse_tar_uri,
     resolve_ref_field_value,
 )
+from ..sources.parquet import iter_parquets
 from ..sources.tar import iter_tar
 from .codecs import decode_value, encode_value
 from .fingerprint import hash_bytes
@@ -448,6 +449,45 @@ def iter_jsonls_with_sigs(
                         field_sigs=field_sigs,
                     )
                     yield resolved
+
+
+def iter_parquets_with_sigs(
+    shard_paths: Iterator[str],
+    batch_size: int,
+) -> Iterator[Sample]:
+    """Iterate parquet shards and annotate each sample with ``__cache_meta__``."""
+
+    for shard_path in shard_paths:
+        shard_str = str(shard_path)
+        shard_stat = os.stat(shard_str)
+
+        for sample in iter_parquets(iter((shard_str,)), batch_size=batch_size):
+            index_in_file = sample.get("__index_in_file__")
+            if not isinstance(index_in_file, int):
+                msg = f"[InvalidParquetSample] file={shard_str!r} missing integer __index_in_file__"
+                raise ValueError(msg)
+
+            field_sigs: dict[str, str] = {}
+            for field, value in sample.items():
+                if _is_meta_field(field):
+                    continue
+                encoded, codec_tag = encode_value(value)
+                field_sigs[field] = hash_bytes(
+                    shard_str,
+                    shard_stat.st_mtime_ns,
+                    shard_stat.st_size,
+                    index_in_file,
+                    field,
+                    codec_tag,
+                    encoded,
+                )
+
+            resolved = dict(sample)
+            resolved[_CACHE_META_KEY] = CacheMeta(
+                route_shard=shard_str,
+                field_sigs=field_sigs,
+            )
+            yield resolved
 
 
 # ---------------------------------------------------------------------------
