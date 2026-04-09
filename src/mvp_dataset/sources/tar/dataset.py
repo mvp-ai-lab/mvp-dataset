@@ -1,13 +1,16 @@
-from collections.abc import Sequence
+from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import dataclass
 
 from mvp_dataset.core.context import RuntimeContext
 from mvp_dataset.core.dataset import Dataset
 from mvp_dataset.core.types import ShardInput, SidecarSpec
+from mvp_dataset.utils.sharding import iter_items
 from mvp_dataset.utils.url import normalize_paths
 
 from .utils import iter_tars
 
 
+@dataclass(frozen=True, slots=True)
 class TarDataset(Dataset):
     _sidecar_specs: tuple[SidecarSpec, ...]
 
@@ -45,7 +48,23 @@ class TarDataset(Dataset):
             _source=normalized_shards,
             _resample=resample,
             _source_kind="tars",
-            _sidecar_specs=sidecars or (),
             _stages=(),
             _iter_source_stream=iter_tars,
+            _sidecar_specs=tuple(sidecars) if sidecars else (),
         )
+
+    def __iter__(self) -> Iterator[object]:
+        context = RuntimeContext.from_runtime(base=self.context)
+        source_shard_stream = iter_items(
+            self._source,
+            context=context,
+            resample=self._resample,
+        )
+
+        stream: Iterable[object] = iter_tars(
+            source_shard_stream,
+            sidecars=self._sidecar_specs or None,
+        )
+        for spec in self._stages:
+            stream = spec.apply(stream)
+        yield from stream

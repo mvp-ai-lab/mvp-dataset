@@ -62,9 +62,9 @@ class StageSpec:
 
     kind: StageKind
     apply: Stage
-    fn_fingerprint: str | None
-    cache_trace_policy: CacheTracePolicy | None
-    cache_stage: Stage | None
+    fn_fingerprint: str | None = None
+    cache_trace_policy: CacheTracePolicy | None = None
+    cache_stage: Stage | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -138,7 +138,7 @@ def iter_tars(
             merged into the main sample dict.  Duplicate field names across
             shards raise a :class:`ValueError`.
     """
-    key_dot_level = os.environ.get("MVP_DATASET_TAR_KEY_DOT_LEVEL", "1")
+    key_dot_level = int(os.environ.get("MVP_DATASET_TAR_KEY_DOT_LEVEL", "1"))
     for shard_path in shard_paths:
         if not sidecars:
             yield from iter_tar(shard_path, key_dot_level=key_dot_level)
