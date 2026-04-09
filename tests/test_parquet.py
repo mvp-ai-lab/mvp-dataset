@@ -54,6 +54,32 @@ def test_from_source_dispatches_to_parquet(tmp_path):
     assert samples[0]["__index_in_file__"] == 0
 
 
+
+def test_from_parquet_recursive_glob_matches_symlinked_directories(tmp_path):
+    stage1_dir = tmp_path / "stage1"
+    stage1_dir.mkdir()
+    stage1_shard = stage1_dir / "train-00000.parquet"
+    _make_parquet(stage1_shard, [{"text": "stage1"}])
+
+    external_stage2_dir = tmp_path.parent / f"{tmp_path.name}_external_stage2"
+    external_stage2_dir.mkdir()
+    coyo_dir = external_stage2_dir / "coyo"
+    coyo_dir.mkdir()
+    stage2_shard = coyo_dir / "train-00000.parquet"
+    _make_parquet(stage2_shard, [{"text": "stage2"}])
+
+    stage2_link = tmp_path / "stage2"
+    try:
+        stage2_link.symlink_to(external_stage2_dir, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    samples = list(Dataset.from_parquet(str(tmp_path / "**/*.parquet")))
+
+    assert {sample["text"] for sample in samples} == {"stage1", "stage2"}
+    expected_stage2_shard = stage2_link / "coyo" / "train-00000.parquet"
+    assert {sample["__file__"] for sample in samples} == {str(stage1_shard), str(expected_stage2_shard)}
+
 def test_parquet_cache_reuses_warmup_results(tmp_path):
     shard = tmp_path / "train-00000.parquet"
     _make_parquet(

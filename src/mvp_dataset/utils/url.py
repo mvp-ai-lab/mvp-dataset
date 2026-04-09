@@ -41,7 +41,7 @@ def _expand_single_spec(spec: str) -> list[str]:
 
     for expanded in expanded_specs:
         if any(char in expanded for char in "*?["):
-            matches = sorted(glob.glob(expanded))
+            matches = sorted(glob.glob(expanded, recursive=True))
             if matches:
                 expanded_paths.extend(matches)
             else:
