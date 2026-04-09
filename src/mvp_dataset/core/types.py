@@ -98,5 +98,5 @@ class Assembler[T, U](Protocol):
         """Flush remaining state at end of stream."""
 
 
-SourceKind = Literal["jsonl", "tars", "parquet"]
+SourceKind = Literal["jsonl", "tars", "parquet", "lance"]
 SourceStore = list[str] | list[object]
