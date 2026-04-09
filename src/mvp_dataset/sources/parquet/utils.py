@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import Final
 
 import pyarrow.parquet as pq
 
-from ..core.types import PathLikeStr, Sample
+from ...core.types import PathLikeStr, Sample
 
 _DEFAULT_BATCH_SIZE: Final[int] = 65536
 _FRAGMENT_SUFFIX: Final[str] = "@@rg="
@@ -35,14 +36,13 @@ class ParquetFragment:
 
 def list_parquet_fragments(
     shard_paths: Sequence[PathLikeStr],
-    *,
-    min_rows_per_fragment: int = 5000,
 ) -> list[ParquetFragment]:
     """Expand parquet files into schedulable row-group fragments.
 
     Row groups with fewer than *min_rows_per_fragment* rows are merged with
     subsequent row groups until the threshold is reached.
     """
+    min_rows_per_fragment = int(os.environ.get("MVP_DATASET_PARQUET_MIN_ROWS_PER_FRAGMENT", "5000"))
 
     fragments: list[ParquetFragment] = []
     for shard_path in shard_paths:

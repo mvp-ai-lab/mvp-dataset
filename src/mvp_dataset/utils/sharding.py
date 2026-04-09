@@ -5,7 +5,8 @@ from __future__ import annotations
 import random
 from collections.abc import Iterator, Sequence
 
-from ..core.types import RuntimeContext
+from ..core.context import RuntimeContext
+from ..log import get_logger
 
 
 def iter_items[T](items: Sequence[T], context: RuntimeContext, resample: bool = False) -> Iterator[T]:
@@ -36,4 +37,11 @@ def iter_items[T](items: Sequence[T], context: RuntimeContext, resample: bool = 
 
     for i, item in enumerate(_rounds()):
         if i % total_slots == slot:
+            get_logger().debug(
+                "Yielding %s slot=%d total_slots=%d seed=%d",
+                item,
+                slot,
+                total_slots,
+                context.seed,
+            )
             yield item

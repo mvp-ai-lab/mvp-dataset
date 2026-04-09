@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import tarfile
 from collections import OrderedDict
 from collections.abc import Iterator, Sequence
@@ -11,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 
-from ..core.types import PathLikeStr, RefFieldSpec, Sample
+from ...core.types import PathLikeStr, RefFieldSpec, Sample
 
 _TAR_URI_PREFIX = "tar://"
 
@@ -297,10 +298,10 @@ def materialize_jsonl_shards(
 def iter_jsonls(
     shard_paths: Iterator[PathLikeStr],
     ref_fields: tuple[RefFieldSpec, ...],
-    key_dot_level: int = 1,
-    tar_cache_size: int = 8,
 ) -> Iterator[Sample]:
     """Resolve tar data references while streaming JSONL shard files."""
+    key_dot_level = int(os.environ.get("MVP_DATASET_TAR_KEY_DOT_LEVEL", "1"))
+    tar_cache_size = int(os.environ.get("MVP_DATASET_TAR_CACHE_SIZE", "8"))
 
     def _resolve_one(sample: Sample, manager: TarManager) -> Sample:
         resolved = dict(sample)

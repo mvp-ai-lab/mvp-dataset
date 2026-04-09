@@ -1,6 +1,6 @@
 """Pipeline abstractions and transformation operations."""
 
-from .dataset import Dataset
+from ..core.dataset import Dataset
 from .ops import (
     assemble_samples,
     batch_samples,

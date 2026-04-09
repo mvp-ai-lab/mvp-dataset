@@ -9,6 +9,9 @@ from typing import Protocol
 class LoggerLike(Protocol):
     """Minimal logger interface accepted by the package."""
 
+    def debug(self, msg: object, *args: object, **kwargs: object) -> object:
+        """Log a debug-level message."""
+
     def info(self, msg: object, *args: object, **kwargs: object) -> object:
         """Log an info-level message."""
 
