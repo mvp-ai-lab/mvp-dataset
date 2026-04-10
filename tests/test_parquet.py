@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from mvp_dataset import Dataset
+from mvp_dataset.sources import parquet as parquet_source
 
 
 def _make_parquet(path: Path, rows: list[dict]) -> None:
@@ -53,6 +54,51 @@ def test_from_source_dispatches_to_parquet(tmp_path):
     assert samples[0]["text"] == "hello"
     assert samples[0]["__index_in_file__"] == 0
 
+
+def test_from_parquet_reads_nested_rows_without_iter_batches(monkeypatch):
+    rows = [
+        {
+            "messages": [{"from": "human", "value": "describe"}],
+            "images": [{"bytes": b"img-1", "path": "images/a.jpg"}],
+        },
+        {
+            "messages": [{"from": "gpt", "value": "done"}],
+            "images": [{"bytes": b"img-2", "path": "images/b.jpg"}],
+        },
+    ]
+
+    class FakeTable:
+        def __init__(self, rows):
+            self._rows = rows
+            self.num_rows = len(rows)
+
+        def slice(self, offset, length):
+            return FakeTable(self._rows[offset : offset + length])
+
+        def to_pylist(self):
+            return list(self._rows)
+
+    class FakeParquetFile:
+        def __init__(self, _file):
+            self.num_row_groups = 1
+
+        def iter_batches(self, batch_size):
+            raise AssertionError(f"iter_batches should not be called, got batch_size={batch_size}")
+
+        def read_row_group(self, index):
+            assert index == 0
+            return FakeTable(rows)
+
+    class FakeParquetModule:
+        ParquetFile = FakeParquetFile
+
+    monkeypatch.setattr(parquet_source, "_load_pyarrow_parquet", lambda: FakeParquetModule)
+
+    samples = list(Dataset.from_parquet(["ignored.parquet"]))
+
+    assert [sample["__index_in_file__"] for sample in samples] == [0, 1]
+    assert samples[0]["messages"][0]["from"] == "human"
+    assert samples[1]["images"][0]["path"] == "images/b.jpg"
 
 
 def test_from_parquet_recursive_glob_matches_symlinked_directories(tmp_path):

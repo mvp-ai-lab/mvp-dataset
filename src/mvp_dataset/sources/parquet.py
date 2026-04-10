@@ -42,8 +42,9 @@ def _iter_one_parquet(
     parquet_file = parquet.ParquetFile(file)
 
     row_index = 0
-    for batch in parquet_file.iter_batches(batch_size=batch_size):
-        for row in batch.to_pylist():
+    for row_group_index in range(parquet_file.num_row_groups):
+        table = parquet_file.read_row_group(row_group_index)
+        for row in _iter_table_rows(table, batch_size=batch_size):
             yield _parse_parquet_row(
                 file,
                 row_index,
@@ -51,6 +52,12 @@ def _iter_one_parquet(
                 allow_preannotated=True,
             )
             row_index += 1
+
+
+def _iter_table_rows(table: object, *, batch_size: int) -> Iterator[object]:
+    num_rows = getattr(table, "num_rows")
+    for offset in range(0, num_rows, batch_size):
+        yield from table.slice(offset, batch_size).to_pylist()
 
 
 def _parse_parquet_row(
