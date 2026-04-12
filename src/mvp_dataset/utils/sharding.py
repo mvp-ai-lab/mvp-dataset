@@ -9,30 +9,6 @@ from ..core.context import RuntimeContext
 from ..log import get_logger
 
 
-def select_items_for_slots[T](
-    items: Sequence[T],
-    *,
-    slot_ids: Sequence[int],
-    total_slots: int,
-    seed: int,
-) -> list[T]:
-    """Select the deterministic one-round item assignment for a set of slots."""
-    ordered = list(items)
-    if len(ordered) == 0:
-        return []
-    if total_slots <= 0:
-        msg = f"[InvalidSlotCount] total_slots must be > 0, got {total_slots}"
-        raise ValueError(msg)
-
-    slot_id_set = set(slot_ids)
-    if not slot_id_set:
-        return []
-
-    rng = random.Random(seed)
-    rng.shuffle(ordered)
-    return [item for index, item in enumerate(ordered) if index % total_slots in slot_id_set]
-
-
 def iter_items[T](items: Sequence[T], context: RuntimeContext, resample: bool = False) -> Iterator[T]:
     """Yield slot-assigned items in deterministic rounds.
 

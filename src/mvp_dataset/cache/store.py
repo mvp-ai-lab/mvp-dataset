@@ -6,8 +6,7 @@ import json
 import os
 import pickle
 import shutil
-import time
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Iterator
 from itertools import islice
 from pathlib import Path
 from typing import Any
@@ -17,44 +16,11 @@ import pyarrow as pa
 from lance import DatasetBasePath
 from lance.fragment import FragmentMetadata
 
-from ..core.types import Sample, StageSpec
+from ..core.types import Sample
 
 # ---------------------------------------------------------------------------
 # Type conversion helpers
 # ---------------------------------------------------------------------------
-
-
-def _build_pre_cache_stream(
-    iter_source_stream: Callable[[Iterable[object]], Iterable[object]],
-    source_items: list[object],
-    pre_specs: tuple[StageSpec, ...],
-) -> Iterator[object]:
-    """Build the pre-cache iterator over a fixed list of source items."""
-    stream: Iterable[object] = iter_source_stream(iter(source_items))
-    for spec in pre_specs:
-        stream = spec.apply(stream)
-    return iter(stream)
-
-
-def _split_cache_work(
-    source_items: list[object],
-    num_workers: int,
-) -> list[list[object]]:
-    """Split source items into contiguous chunks to preserve source order."""
-    actual_workers = min(num_workers, len(source_items))
-    if actual_workers <= 1:
-        return [source_items]
-
-    base, extra = divmod(len(source_items), actual_workers)
-    chunks: list[list[object]] = []
-    start = 0
-    for worker_index in range(actual_workers):
-        size = base + (1 if worker_index < extra else 0)
-        end = start + size
-        if start != end:
-            chunks.append(source_items[start:end])
-        start = end
-    return chunks
 
 
 def _infer_arrow_type(value: object) -> pa.DataType:
@@ -139,74 +105,7 @@ def _samples_to_record_batch(samples: list[Sample], schema: pa.Schema) -> pa.Rec
 
 
 # ---------------------------------------------------------------------------
-# Warm/cold detection
-# ---------------------------------------------------------------------------
-
-
-def _full_cache_uri(cache_dir: str, fingerprint: str) -> str:
-    return os.path.join(cache_dir, f"{fingerprint}.lance")
-
-
-def _node_partial_cache_uri(cache_dir: str, fingerprint: str, node_rank: int) -> str:
-    return os.path.join(cache_dir, f".{fingerprint}.node-{node_rank:05d}.tmp.lance")
-
-
-def is_lance_dataset_warm(uri: str) -> bool:
-    """Check if a Lance dataset exists and contains at least one row."""
-    if not os.path.isdir(uri):
-        return False
-    try:
-        ds = _lance.dataset(uri)
-        return ds.count_rows() > 0
-    except Exception:
-        return False
-
-
-def is_full_cache_warm(cache_dir: str, fingerprint: str) -> bool:
-    """Check if a full-mode cache dataset exists and is valid."""
-    return is_lance_dataset_warm(_full_cache_uri(cache_dir, fingerprint))
-
-
-def wait_for_lance_datasets(
-    uris: Sequence[str],
-    *,
-    poll_interval: float = 0.5,
-    timeout: float = 3600.0,
-) -> None:
-    """Block until all specified Lance datasets exist and are readable."""
-    pending = {uri for uri in uris}
-    deadline = time.monotonic() + timeout
-    while pending:
-        if time.monotonic() > deadline:
-            msg = f"[CacheWaitTimeout] timed out after {timeout}s waiting for {len(pending)} cache dataset(s)"
-            raise TimeoutError(msg)
-        time.sleep(poll_interval)
-        pending = {uri for uri in pending if not is_lance_dataset_warm(uri)}
-
-
-def is_incremental_cache_warm(
-    source_uri: str,
-    fingerprint: str,
-) -> bool:
-    """Check if an incremental cache has already been written."""
-    try:
-        ds = _lance.dataset(source_uri)
-    except Exception:
-        return False
-
-    meta = ds.schema.metadata
-    if meta is None:
-        return False
-
-    stored_fp = meta.get(b"mvp_cache_fp")
-    if stored_fp is None or stored_fp.decode() != fingerprint:
-        return False
-
-    return True
-
-
-# ---------------------------------------------------------------------------
-# Cold write — full mode
+# Cold write
 # ---------------------------------------------------------------------------
 
 _DEFAULT_BATCH_SIZE = 8192
@@ -249,113 +148,9 @@ def _write_lance_dataset(
     return uri
 
 
-def write_full_cache(
-    stream: Iterator[Sample],
-    cache_dir: str,
-    fingerprint: str,
-    *,
-    batch_size: int = _DEFAULT_BATCH_SIZE,
-) -> str:
-    """Consume *stream*, write to a standalone Lance cache dataset.
-
-    Returns the URI of the written dataset.
-    """
-    uri = _full_cache_uri(cache_dir, fingerprint)
-    return _write_lance_dataset(stream, uri, batch_size=batch_size)
-
-
-def merge_full_cache_parts(
-    part_uris: Sequence[str],
-    cache_dir: str,
-    fingerprint: str,
-    *,
-    batch_size: int = 65536,
-) -> str:
-    """Merge ordered partial full-cache datasets into the final Lance cache."""
-    existing_parts = [uri for uri in part_uris if os.path.isdir(uri)]
-    final_uri = _full_cache_uri(cache_dir, fingerprint)
-    if not existing_parts:
-        return final_uri
-
-    datasets = [_lance.dataset(uri) for uri in existing_parts]
-    schema = datasets[0].schema
-    for dataset in datasets[1:]:
-        if dataset.schema != schema:
-            msg = "[CacheSchemaError] partial cache datasets produced different schemas"
-            raise ValueError(msg)
-
-    def _iter_batches() -> Iterator[pa.RecordBatch]:
-        for dataset in datasets:
-            yield from dataset.scanner(batch_size=batch_size).to_batches()
-
-    if os.path.isdir(final_uri):
-        shutil.rmtree(final_uri, ignore_errors=True)
-
-    reader = pa.RecordBatchReader.from_batches(schema, _iter_batches())
-    _lance.write_dataset(
-        reader,
-        final_uri,
-        schema=schema,
-        max_rows_per_group=batch_size,
-    )
-    return final_uri
-
-
 # ---------------------------------------------------------------------------
-# Cold write — incremental mode
+# Merge
 # ---------------------------------------------------------------------------
-
-
-def write_incremental_cache(
-    source_uri: str,
-    pre_cache_stream: Iterator[Sample],
-    fingerprint: str,
-) -> None:
-    """Append cached outputs to an existing Lance dataset."""
-    ds = _lance.dataset(source_uri)
-    col_data: dict[str, list[Any]] = {}
-
-    for sample in pre_cache_stream:
-        keys = [k for k in sample if not (k.startswith("__") and k.endswith("__"))]
-        for col in keys:
-            col_data.setdefault(col, []).append(sample.get(col))
-
-    if not col_data:
-        return
-
-    new_table = pa.table(col_data)
-    ds.add_columns(new_table)
-
-    # Stamp fingerprint
-    ds = _lance.dataset(source_uri)
-    ds.update_schema_metadata({"mvp_cache_fp": fingerprint}, replace=False)
-
-
-# ---------------------------------------------------------------------------
-# Warm read — full mode
-# ---------------------------------------------------------------------------
-
-
-def iter_full_cache(
-    cache_dir: str,
-    fingerprint: str,
-    *,
-    columns: Sequence[str] | None = None,
-    batch_size: int = 65536,
-) -> Iterator[Sample]:
-    """Iterate a full-mode cache dataset and yield sample dicts."""
-    uri = _full_cache_uri(cache_dir, fingerprint)
-    ds = _lance.dataset(uri)
-    scanner = ds.scanner(columns=columns, batch_size=batch_size)
-
-    for batch in scanner.to_batches():
-        col_names = batch.schema.names
-        col_arrays = [batch.column(i) for i in range(batch.num_columns)]
-        for row_idx in range(batch.num_rows):
-            yield {
-                _unescape_field_name(name): col_arrays[col_idx][row_idx].as_py()
-                for col_idx, name in enumerate(col_names)
-            }
 
 
 def merge_lance(
