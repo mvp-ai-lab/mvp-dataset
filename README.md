@@ -13,26 +13,31 @@ A minimal, high-performance data loading library for multimodal training pipelin
 
 ## Features
 
-- `Dataset.from_tars(...)` for local `.tar` shard inputs
-- `Dataset.from_jsonl(...)` for local `.jsonl` inputs
-- `Dataset.from_parquet(...)` for local `.parquet` inputs
-- `Dataset.from_source(...)` as a compatibility dispatcher for mixed call sites
+- `Dataset.from_source("tars", ...)` for local `.tar` shard inputs
+- `Dataset.from_source("jsonl", ...)` for local `.jsonl` inputs
+- `Dataset.from_source("parquet", ...)` for local `.parquet` inputs
+- `Dataset.from_source("lance", ...)` for local Lance dataset inputs
 - Chainable pipeline ops:
   - `.map(...)`
+  - `.select([...])`
   - `.shuffle(buffer_size, initial=...)`
+  - `.assemble(factory, drop_last=...)`
   - `.batch(batch_size, drop_last=..., collate_fn=...)`
   - `.unbatch()`
-  - `.cache(groups=...)` — materialize expensive preprocessing to disk with automatic invalidation
+  - `.cache(cache_dir=..., cache_num_workers=...)`
 - Tar workflows:
   - sample parsing from shard members
-  - optional sidecar merge via `.join([...])`. In this way, you can store different modalities in separate tars and join them on the fly via member naming conventions.
+  - optional sidecar merge via `from_source("tars", sidecars=[...])`
 - JSONL workflows:
-  - optional linked-tar reference resolution via `.resolve_refs([...])`. In this way, you can use JSONL to store data like conversations and reference external image data in tar shards.
-  - optional spill sharding via `from_jsonl(..., group_key=..., num_shards=...)` for bounded-memory preprocessing and better tar locality.
+  - optional linked-tar reference resolution via `from_source("jsonl", ref_fields=[...])`
+  - JSONL files are split into slot-aligned logical shards internally
 - Parquet workflows:
   - row-group-parallel sample iteration from local `.parquet` shards
-  - optional column projection via `from_parquet(..., columns=[...])`
+  - optional column projection via `from_source("parquet", columns=[...])`
   - each row is exposed as one `dict[str, object]` sample with `__file__`, `__index_in_file__`, and `__key__`
+- Lance workflows:
+  - fragment-parallel iteration from local Lance datasets
+  - optional column projection via `from_source("lance", columns=[...])`
 - `TorchLoader` for PyTorch `DataLoader` integration with post-merge stages
 
 ## Installation
@@ -56,7 +61,7 @@ If you use `TorchLoader`, install PyTorch separately.
 from mvp_dataset import Dataset, TorchLoader
 
 dataset = (
-    Dataset.from_tars("/data/shards/shard_{000000..000006}.tar", resample=True)
+    Dataset.from_source("tars", "/data/shards/shard_{000000..000006}.tar", resample=True)
     .shuffle(buffer_size=1024)
     .map(lambda s: s)
 )
@@ -78,10 +83,14 @@ for batch in loader:
 from mvp_dataset import Dataset, TorchLoader
 
 dataset = (
-    Dataset.from_tars("/data/images/shard_{000000..000006}.tar", resample=True)
-    .join([
-      ("depth", lambda s: s.replace("image", "depth))
-    ])
+    Dataset.from_source(
+        "tars",
+        "/data/images/shard_{000000..000006}.tar",
+        resample=True,
+        sidecars=[
+            ("depth", lambda shard: shard.replace("/images/", "/depth/")),
+        ],
+    )
     .shuffle(buffer_size=1024)
     .map(lambda s: s)
 )
@@ -103,13 +112,12 @@ for batch in loader:
 from mvp_dataset import Dataset
 
 dataset = (
-    Dataset.from_jsonl(
+    Dataset.from_source(
+        "jsonl",
         "/data/meta/train.jsonl",
         resample=True,
-        group_key="image",
-        num_shards=64,
+        ref_fields=[("image", "/data")],
     )
-    .resolve_refs([("image", "/data")])  # tar://... URI base dir
     .map(lambda s: s)
 )
 
@@ -122,13 +130,17 @@ for sample in dataset:
 ```python
 from mvp_dataset import Dataset
 
+def add_length(sample: dict[str, object]) -> dict[str, object]:
+    return {**sample, "length": len(str(sample["text"]))}
+
 dataset = (
-    Dataset.from_parquet(
+    Dataset.from_source(
+        "parquet",
         "/data/meta/train_{000000..000003}.parquet",
         columns=["text", "label"],
         batch_size=8192,
     )
-    .map(lambda s: {**s, "length": len(s["text"])})
+    .map(add_length)
     .cache()
 )
 
@@ -160,13 +172,13 @@ python3 examples/parquet.py "examples/demo_data/*.parquet" --max-batches 2
 
 ## Caching
 
-`.cache()` materializes all upstream stages into tar files on disk so that expensive preprocessing (decoding, tokenization, augmentation, etc.) runs once and is reused on every subsequent iteration.
+`.cache()` materializes all upstream outputs into a local Lance dataset on disk so that expensive preprocessing (decoding, tokenization, augmentation, etc.) runs once and is reused on every subsequent iteration.
 
 ### Basic usage
 
 ```python
 ds = (
-    Dataset.from_tars("shards/shard_{000000..000099}.tar")
+    Dataset.from_source("tars", "shards/shard_{000000..000099}.tar")
     .map(expensive_preprocess)   # runs only on first iteration
     .cache()                     # <-- cache boundary
     .shuffle(buffer_size=4096)   # runs every iteration
@@ -179,35 +191,43 @@ for sample in ds:  # 2nd iter: reads from cache, skips expensive_preprocess
     train_step(sample)
 ```
 
-Cache tars are written to a `.cache/` directory next to the source shards, including parquet-backed datasets.
+Cached Lance datasets are written under `cache_dir` (default: `.cache` in the current working directory).
 
 ### How invalidation works
 
-Each `.map()` / `.assemble()` stage is fingerprinted from its bytecode, defaults, and closure state. A **plan fingerprint** (SHA-256 of all pre-cache stage fingerprints + the groups spec) is stored in the manifest. When any pre-cache stage changes, the fingerprint changes and the cache is rebuilt automatically.
+The cache key is a SHA-256 plan fingerprint over:
 
-### Field grouping
+- the source listing / fragment identity
+- every pre-cache stage marked as traceable
 
-By default all fields go into one tar per shard. Pass `groups` to split fields into separate tars — useful when only a subset of fields change between experiments:
+Today:
 
-```python
-ds = (
-    Dataset.from_tars(shards)
-    .map(preprocess)
-    .cache(groups=[["image"], ["label"]])
-    # "image", "label" each get their own tar; any remaining fields
-    # (e.g. "tag") become singleton groups automatically.
-)
-```
+- `.map()` participates in cache invalidation
+- `.select()` participates in cache invalidation
+- `.assemble()` participates in cache invalidation, including `drop_last`
+- `.shuffle()` is intentionally allowed before `.cache()`, but it does not participate in invalidation; a warning is logged when this happens
 
-Only the group tars whose content signatures changed are rewritten.
+Any lambda or local closure used before `.cache()` is rejected because its identity is not stable across process restarts.
+
+### Supported pre-cache stages
+
+- Supported: `map`, `select`, `shuffle`, `assemble`
+- Rejected: `batch`, `unbatch`
+
+Cache warm-up preserves full-stream semantics:
+
+- only the leading contiguous `map(...)` prefix is parallelized with `cache_num_workers`
+- once a non-`map` stage is reached, all remaining pre-cache stages run on the merged stream in declaration order
+
+This keeps `shuffle` / `assemble` semantics identical between cached and uncached pipelines.
 
 ### Post-cache stages
 
-Stages appended **after** `.cache()` run on every iteration, reading from the cached tars:
+Stages appended **after** `.cache()` run on every iteration, reading from the cached Lance dataset:
 
 ```python
 ds = (
-    Dataset.from_tars(shards)
+    Dataset.from_source("tars", shards)
     .map(tokenize)       # cached
     .cache()
     .map(random_augment) # NOT cached — runs every time
@@ -217,11 +237,16 @@ ds = (
 
 ### Distributed / tensor-parallel awareness
 
-When using a `DataLoadMesh` with model-parallel dimensions (e.g. tensor parallelism), multiple ranks receive the same shards. The cache layer automatically elects one **cache leader** per model-parallel group (the rank whose non-DP local ranks are all 0) to build the cache. All other co-members wait for the leader to finish and then read directly from the cached tars, avoiding redundant computation.
+When using a `DataLoadMesh` with model-parallel dimensions (for example tensor parallelism), multiple ranks may intentionally receive identical input shards. `RuntimeContext.slot` and `total_slots` are derived from the mesh's data-parallel dimensions, so TP co-members share data while DP ranks remain distinct.
+
+The cache layer is mesh-aware as well:
+
+- per-slot cache shards are keyed by `dp_rank`, not global `rank`
+- only one DP leader writes each per-slot cache shard
+- the final merge consumes one cache shard per DP slot, so TP co-members do not duplicate cached samples
 
 ```python
-from mvp_dataset import Dataset
-from mvp_dataset.core.types import RuntimeContext
+from mvp_dataset import Dataset, RuntimeContext
 
 ctx = RuntimeContext.from_runtime(
     device_mesh=mesh,
@@ -229,7 +254,7 @@ ctx = RuntimeContext.from_runtime(
 )
 
 ds = (
-    Dataset.from_tars(shards, context=ctx)
+    Dataset.from_source("tars", shards, context=ctx)
     .map(expensive_fn)
     .cache()
 )
@@ -274,10 +299,10 @@ Parquet rows are yielded as ordinary sample dicts. Each sample includes:
 - `__index_in_file__`: zero-based row index
 - `__key__`: synthesized as `<file>:<row_index>`
 
-Specialized source helpers remain unchanged:
+Source-specific options remain source-local:
 
-- `.join(...)` is tar-only
-- `.resolve_refs(...)` is jsonl-only
+- `sidecars=...` is tar-only
+- `ref_fields=...` is jsonl-only
 
 Parquet scheduling uses row groups as the unit of work, so different slots can
 read different row groups from the same parquet file.
@@ -293,14 +318,14 @@ read different row groups from the same parquet file.
   - `LOADER_TAR_KEY_DOT_LEVEL` (default: `1`)
   - `LOADER_JSONL_TAR_CACHE_SIZE` (default: `8`)
 - JSONL preprocessing:
-  - `from_jsonl(..., group_key=..., num_shards=..., spill_buckets=..., output_dir=...)`
+  - JSONL logical splitting is internal to `from_source("jsonl", ...)`
 
 ## Performance notes
 
 - Iterator pipeline is lazy; data transforms are applied on demand.
 - Shuffle uses bounded buffer memory (`buffer_size`, optional `initial`).
 - JSONL reference resolution uses LRU tar-handle caching.
-- `from_jsonl(...)` can pre-materialize balanced local JSONL shards so workers shard by file instead of holding the full JSONL in memory.
+- `from_source("jsonl", ...)` internally splits JSONL inputs into slot-aligned logical shards.
 - parquet row groups are scheduled as shards and streamed row-by-row via `pyarrow`.
 - Recommended high-throughput pattern with PyTorch:
   1. worker micro-batch (`batch_size` on `TorchLoader` + identity collate)
