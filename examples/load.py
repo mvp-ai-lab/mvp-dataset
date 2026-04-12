@@ -6,7 +6,6 @@ from mvp_dataset import Dataset, set_log_level
 
 
 def map_func(sample: dict) -> dict:
-    time.sleep(0.1)  # Simulate some processing time
     sample["mapped"] = True
     return sample
 
@@ -62,9 +61,11 @@ def main(
         flush=True,
     )
 
-    ds = Dataset.from_source(source_kind, shards=source).map(map_func).shuffle(2)
+    ds = Dataset.from_source(source_kind, shards=source).map(map_func).shuffle(1000)
     if cache:
-        ds = ds.cache()
+        ds = ds.cache(cache_num_workers=8)
+
+    exit()
 
     t0 = time.monotonic()
     count = 0

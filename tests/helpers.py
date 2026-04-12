@@ -58,6 +58,19 @@ def write_parquet_file(root: Path, records: list[dict[str, object]]) -> str:
     return str(path)
 
 
+def write_nested_parquet_file(root: Path, records: list[dict[str, object]], *, row_group_size: int = 2) -> str:
+    path = root / "nested_samples.parquet"
+    table = pa.table(
+        {
+            "id": [str(record["id"]) for record in records],
+            "meta": [dict(record["meta"]) for record in records],
+            "tags": [list(record["tags"]) for record in records],
+        }
+    )
+    pq.write_table(table, path, row_group_size=row_group_size)
+    return str(path)
+
+
 def write_lance_dataset(root: Path, records: list[dict[str, object]]) -> str:
     import lance
 

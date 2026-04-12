@@ -303,7 +303,7 @@ class Dataset(torch_iterabledataset_class()):
                     for item in data:
                         count += 1
                         now = time.monotonic()
-                        if now - last_log >= 10.0:
+                        if now - last_log >= 30.0:
                             elapsed = now - t0
                             logger.info(
                                 "<MVP Dataset - rank %d> cache: %d samples written (%.1f samples/s)",

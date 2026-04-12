@@ -7,12 +7,16 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import Final
 
+import pyarrow as pa
+import pyarrow.dataset as ds
+import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 
 from ...core.types import PathLikeStr, Sample
 
 _DEFAULT_BATCH_SIZE: Final[int] = 65536
 _FRAGMENT_SUFFIX: Final[str] = "@@rg="
+_LOCAL_FILESYSTEM = pafs.LocalFileSystem()
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,10 +108,11 @@ def iter_parquet(
     parquet_file = pq.ParquetFile(fragment.path)
     index_in_file = fragment.row_offset
 
-    for record_batch in parquet_file.iter_batches(
-        batch_size=batch_size,
-        row_groups=list(fragment.row_groups),
+    for record_batch in _iter_record_batches(
+        parquet_file,
+        fragment,
         columns=columns,
+        batch_size=batch_size,
         use_threads=use_threads,
     ):
         column_names = record_batch.schema.names
@@ -122,6 +127,71 @@ def iter_parquet(
             sample["__key__"] = f"{fragment.path}:{index_in_file}"
             yield sample
             index_in_file += 1
+
+
+def _iter_record_batches(
+    parquet_file: pq.ParquetFile,
+    fragment: ParquetFragment,
+    *,
+    columns: Sequence[str] | None,
+    batch_size: int,
+    use_threads: bool,
+) -> Iterator[pa.RecordBatch]:
+    """Stream record batches for one fragment without materializing whole row groups."""
+
+    if _requires_dataset_scanner(parquet_file.schema_arrow, columns):
+        yield from _iter_record_batches_via_scanner(
+            fragment,
+            columns=columns,
+            batch_size=batch_size,
+            use_threads=use_threads,
+        )
+        return
+
+    yield from parquet_file.iter_batches(
+        batch_size=batch_size,
+        row_groups=list(fragment.row_groups),
+        columns=columns,
+        use_threads=use_threads,
+    )
+
+
+def _requires_dataset_scanner(schema: pa.Schema, columns: Sequence[str] | None) -> bool:
+    """Use Scanner for nested columns to avoid ParquetFile.iter_batches conversion limits."""
+
+    selected_columns = schema.names if columns is None else columns
+    for column_name in selected_columns:
+        field_index = schema.get_field_index(column_name)
+        if field_index < 0:
+            return True
+        if pa.types.is_nested(schema.field(field_index).type):
+            return True
+    return False
+
+
+def _iter_record_batches_via_scanner(
+    fragment: ParquetFragment,
+    *,
+    columns: Sequence[str] | None,
+    batch_size: int,
+    use_threads: bool,
+) -> Iterator[pa.RecordBatch]:
+    """Stream one parquet fragment through Scanner with bounded readahead."""
+
+    parquet_fragment = ds.ParquetFileFormat().make_fragment(
+        fragment.path,
+        filesystem=_LOCAL_FILESYSTEM,
+        row_groups=list(fragment.row_groups),
+    )
+    scanner = ds.Scanner.from_fragment(
+        parquet_fragment,
+        columns=columns,
+        batch_size=batch_size,
+        batch_readahead=1,
+        fragment_readahead=1,
+        use_threads=use_threads,
+    )
+    yield from scanner.to_batches()
 
 
 def iter_parquets(

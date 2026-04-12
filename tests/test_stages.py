@@ -5,14 +5,17 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+import pyarrow as pa
 import pytest
 
+import mvp_dataset.cache.store as store_module
 import mvp_dataset.core.dataset as dataset_module
 import mvp_dataset.core.stages as stages_module
+import mvp_dataset.sources.parquet.utils as parquet_utils_module
 from mvp_dataset import Dataset, RuntimeContext, TorchLoader
 from mvp_dataset.log import reset_logger, set_logger
 
-from .helpers import build_records, write_parquet_file
+from .helpers import build_records, write_nested_parquet_file, write_parquet_file
 
 _OBSERVED_CACHE_THREAD_IDS: set[int] = set()
 _OBSERVED_CACHE_THREAD_IDS_LOCK = threading.Lock()
@@ -68,6 +71,16 @@ def record_cache_thread_stage_two(sample: object) -> object:
     with _OBSERVED_CACHE_STAGE_TWO_THREAD_IDS_LOCK:
         _OBSERVED_CACHE_STAGE_TWO_THREAD_IDS.add(threading.get_ident())
     return sample
+
+
+def add_chunked_array_field(sample: object) -> object:
+    if not isinstance(sample, dict):
+        return sample
+    value = int(sample["value"])
+    return {
+        **sample,
+        "chunked": pa.chunked_array([[value], [value + 1]]),
+    }
 
 
 def test_map_stage_transforms_each_sample(tmp_path) -> None:
@@ -331,6 +344,80 @@ def test_cache_preserves_shuffle_stream_semantics(tmp_path) -> None:
     cached_samples = [_select_user_fields(sample, ("id", "text", "value")) for sample in cached]
 
     assert cached_samples == uncached_samples
+
+
+def test_cache_handles_nested_parquet_columns_with_scanner_fallback(tmp_path, monkeypatch) -> None:
+    records = [
+        {
+            "id": f"sample-{index}",
+            "meta": {"index": index, "parity": "even" if index % 2 == 0 else "odd"},
+            "tags": [f"tag-{index}", f"group-{index % 2}"],
+        }
+        for index in range(6)
+    ]
+    path = write_nested_parquet_file(tmp_path, records, row_group_size=2)
+    context = RuntimeContext(seed=13)
+    scanner_used = False
+    original = parquet_utils_module._iter_record_batches_via_scanner
+
+    def _recording_scanner(*args, **kwargs):
+        nonlocal scanner_used
+        scanner_used = True
+        yield from original(*args, **kwargs)
+
+    monkeypatch.setattr(parquet_utils_module, "_iter_record_batches_via_scanner", _recording_scanner)
+
+    uncached = Dataset.from_source("parquet", shards=path, context=context)
+    cached = Dataset.from_source("parquet", shards=path, context=context).cache(cache_dir=str(tmp_path / "cache"))
+
+    uncached_samples = [_select_user_fields(sample, ("id", "meta", "tags")) for sample in uncached]
+    cached_samples = [_select_user_fields(sample, ("id", "meta", "tags")) for sample in cached]
+
+    assert scanner_used is True
+    assert cached_samples == uncached_samples
+
+
+def test_cache_normalizes_chunked_array_field_values(tmp_path) -> None:
+    records = build_records()
+    cached = (
+        _build_parquet_dataset(tmp_path, records).map(add_chunked_array_field).cache(cache_dir=str(tmp_path / "cache"))
+    )
+
+    observed = [_select_user_fields(sample, ("id", "chunked")) for sample in cached]
+
+    assert observed == [
+        {
+            "id": f"sample-{index}",
+            "chunked": [index, index + 1],
+        }
+        for index in range(len(records))
+    ]
+
+
+def test_cache_schema_uses_large_offsets_for_nested_variable_width_fields() -> None:
+    images_type = store_module._infer_arrow_type(
+        [
+            [{"bytes": b"a", "path": None}],
+            [{"bytes": b"b", "path": None}],
+        ]
+    )
+    img_size_type = store_module._infer_arrow_type(
+        [
+            [[1, 2]],
+            None,
+            [[3, 4]],
+        ]
+    )
+
+    assert images_type == pa.large_list(
+        pa.struct(
+            [
+                pa.field("bytes", pa.large_binary()),
+                pa.field("path", pa.null()),
+            ]
+        )
+    )
+    assert img_size_type == pa.large_list(pa.large_list(pa.int64()))
 
 
 def test_cache_warns_when_shuffle_is_not_fingerprinted(tmp_path) -> None:

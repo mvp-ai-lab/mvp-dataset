@@ -6,7 +6,7 @@ import json
 import os
 import pickle
 import shutil
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from itertools import islice
 from pathlib import Path
 from typing import Any
@@ -23,28 +23,98 @@ from ..core.types import Sample
 # ---------------------------------------------------------------------------
 
 
-def _infer_arrow_type(value: object) -> pa.DataType:
-    """Infer a pyarrow type from a single Python value."""
-    if isinstance(value, (bytes, bytearray)):
-        return pa.large_binary()
-    if isinstance(value, str):
-        return pa.large_utf8()
-    if isinstance(value, bool):
-        return pa.bool_()
-    if isinstance(value, int):
-        return pa.int64()
-    if isinstance(value, float):
-        return pa.float64()
-    # numpy arrays
+def _normalize_value_for_arrow(value: object) -> object:
+    """Convert Arrow / NumPy containers into plain Python containers."""
+
+    if isinstance(value, pa.ChunkedArray | pa.Array):
+        return [_normalize_value_for_arrow(item) for item in value.to_pylist()]
+    if isinstance(value, pa.Scalar):
+        return _normalize_value_for_arrow(value.as_py())
+    if isinstance(value, pa.RecordBatch | pa.Table):
+        return [_normalize_value_for_arrow(item) for item in value.to_pylist()]
+    if isinstance(value, Mapping):
+        return {key: _normalize_value_for_arrow(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        return [_normalize_value_for_arrow(item) for item in value]
+
     try:
         import numpy as np
 
         if isinstance(value, np.ndarray):
-            return pa.from_numpy_dtype(value.dtype)
+            return [_normalize_value_for_arrow(item) for item in value.tolist()]
+        if isinstance(value, np.generic):
+            return value.item()
     except ImportError:
         pass
+
+    return value
+
+
+def _infer_arrow_type(values: list[object]) -> pa.DataType:
+    """Infer a pyarrow type from sample values for one field."""
+    non_null_values = [value for value in values if value is not None]
+    if not non_null_values:
+        return pa.null()
+
+    first_value = non_null_values[0]
+    if isinstance(first_value, (bytes, bytearray)):
+        return pa.large_binary()
+    if isinstance(first_value, str):
+        return pa.large_utf8()
+    if isinstance(first_value, bool):
+        return pa.bool_()
+    if isinstance(first_value, int):
+        return pa.int64()
+    if isinstance(first_value, float):
+        return pa.float64()
+    try:
+        inferred_type = pa.infer_type(non_null_values, from_pandas=False)
+    except (TypeError, ValueError, pa.ArrowInvalid, pa.ArrowNotImplementedError):
+        inferred_type = None
+    if inferred_type is not None and inferred_type != pa.null():
+        return _promote_to_large_offsets(inferred_type)
     # fallback: pickle to binary
     return pa.large_binary()
+
+
+def _promote_to_large_offsets(data_type: pa.DataType) -> pa.DataType:
+    """Recursively widen variable-width Arrow offsets to their large variants."""
+
+    if pa.types.is_string(data_type):
+        return pa.large_utf8()
+    if pa.types.is_binary(data_type):
+        return pa.large_binary()
+    if pa.types.is_list(data_type):
+        return pa.large_list(_promote_to_large_offsets(data_type.value_type))
+    if pa.types.is_large_list(data_type):
+        return pa.large_list(_promote_to_large_offsets(data_type.value_type))
+    if pa.types.is_fixed_size_list(data_type):
+        return pa.list_(_promote_to_large_offsets(data_type.value_type), data_type.list_size)
+    if pa.types.is_struct(data_type):
+        return pa.struct(
+            [
+                pa.field(
+                    field.name,
+                    _promote_to_large_offsets(field.type),
+                    nullable=field.nullable,
+                    metadata=field.metadata,
+                )
+                for field in data_type
+            ]
+        )
+    if pa.types.is_map(data_type):
+        return pa.map_(
+            _promote_to_large_offsets(data_type.key_type),
+            _promote_to_large_offsets(data_type.item_type),
+            keys_sorted=data_type.keys_sorted,
+        )
+    if pa.types.is_dictionary(data_type):
+        return pa.dictionary(
+            data_type.index_type,
+            _promote_to_large_offsets(data_type.value_type),
+            ordered=data_type.ordered,
+        )
+    return data_type
 
 
 def _escape_field_name(name: str) -> str:
@@ -59,7 +129,7 @@ def _unescape_field_name(name: str) -> str:
 
 def _escape_sample(sample: Sample) -> Sample:
     """Escape all field names in a sample dict."""
-    return {_escape_field_name(k): v for k, v in sample.items()}
+    return {_escape_field_name(k): _normalize_value_for_arrow(v) for k, v in sample.items()}
 
 
 def _unescape_sample(sample: Sample) -> Sample:
@@ -76,21 +146,116 @@ def _convert_value(value: object, target_type: pa.DataType) -> object:
 
 def _schema_from_samples(samples: list[Sample]) -> pa.Schema:
     """Infer a stable Arrow schema from the first non-empty sample batch."""
-    fields: list[tuple[str, pa.DataType]] = []
+    field_names: list[str] = []
     seen: set[str] = set()
     for sample in samples:
-        for key, value in sample.items():
+        for key in sample:
             if key in seen:
                 continue
-            fields.append((key, _infer_arrow_type(value)))
+            field_names.append(key)
             seen.add(key)
+    fields = [(key, _infer_arrow_type([sample.get(key) for sample in samples])) for key in field_names]
     return pa.schema(fields)
+
+
+def _summarize_value(value: object) -> str:
+    """Return a compact type/value summary for cache write diagnostics."""
+
+    if isinstance(value, pa.ChunkedArray):
+        return f"ChunkedArray(type={value.type}, chunks={value.num_chunks}, len={len(value)})"
+    if isinstance(value, pa.Array):
+        return f"Array(type={value.type}, len={len(value)})"
+    if isinstance(value, pa.Scalar):
+        return f"Scalar(type={value.type}, value={value.as_py()!r})"
+    if isinstance(value, pa.RecordBatch):
+        return f"RecordBatch(rows={value.num_rows}, cols={value.num_columns}, schema={value.schema})"
+    if isinstance(value, pa.Table):
+        return f"Table(rows={value.num_rows}, cols={value.num_columns}, schema={value.schema})"
+
+    try:
+        import numpy as np
+
+        if isinstance(value, np.ndarray):
+            return f"ndarray(shape={value.shape}, dtype={value.dtype})"
+        if isinstance(value, np.generic):
+            return f"{type(value).__name__}(dtype={value.dtype}, value={value.item()!r})"
+    except ImportError:
+        pass
+
+    if isinstance(value, dict):
+        keys = list(value)[:5]
+        return f"dict(keys={keys!r}, len={len(value)})"
+    if isinstance(value, list):
+        return f"list(len={len(value)})"
+    if isinstance(value, tuple):
+        return f"tuple(len={len(value)})"
+    return f"{type(value).__name__}({value!r})"
+
+
+def _collect_non_python_paths(value: object, path: str = "") -> list[tuple[str, str]]:
+    """Find residual Arrow/NumPy containers that should not reach from_pylist."""
+
+    results: list[tuple[str, str]] = []
+    if isinstance(value, pa.ChunkedArray | pa.Array | pa.Scalar | pa.RecordBatch | pa.Table):
+        results.append((path or "<root>", _summarize_value(value)))
+        return results
+
+    try:
+        import numpy as np
+
+        if isinstance(value, np.ndarray | np.generic):
+            results.append((path or "<root>", _summarize_value(value)))
+            return results
+    except ImportError:
+        pass
+
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            results.extend(_collect_non_python_paths(item, child_path))
+    elif isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        for index, item in enumerate(value):
+            child_path = f"{path}[{index}]" if path else f"[{index}]"
+            results.extend(_collect_non_python_paths(item, child_path))
+            if len(results) >= 32:
+                break
+    return results
+
+
+def _values_to_array(values: list[object], target_type: pa.DataType, *, field_name: str) -> pa.Array:
+    """Build one Arrow array and surface field-local diagnostics on failure."""
+
+    try:
+        array = pa.array(values, type=target_type)
+    except (TypeError, ValueError, pa.ArrowInvalid, pa.ArrowNotImplementedError) as exc:
+        diagnostics: list[str] = []
+        for sample_index, value in enumerate(values[:4]):
+            paths = _collect_non_python_paths(value)
+            for value_path, summary in paths[:8]:
+                prefix = f"sample[{sample_index}]"
+                diagnostics.append(f"{prefix} {value_path}: {summary}")
+            if not paths:
+                diagnostics.append(
+                    f"sample[{sample_index}] type={type(value).__name__} summary={_summarize_value(value)}"
+                )
+        msg = (
+            f"[CacheArrowFieldError] failed to convert field={field_name!r} to type={target_type}. "
+            f"diagnostics={' | '.join(diagnostics)}"
+        )
+        raise TypeError(msg) from exc
+
+    if isinstance(array, pa.ChunkedArray):
+        array = array.combine_chunks()
+    if isinstance(array, pa.ChunkedArray):
+        msg = f"[CacheArrowFieldError] field={field_name!r} unexpectedly produced ChunkedArray type={target_type}"
+        raise TypeError(msg)
+    return array
 
 
 def _samples_to_record_batch(samples: list[Sample], schema: pa.Schema) -> pa.RecordBatch:
     """Convert a list of sample dicts to a RecordBatch under a fixed schema."""
-    arrays: dict[str, list[Any]] = {field.name: [] for field in schema}
-    schema_names = set(arrays)
+    schema_names = {field.name for field in schema}
+    columns_by_name: dict[str, list[Any]] = {field.name: [] for field in schema}
 
     for sample in samples:
         extra_fields = [key for key in sample if key not in schema_names]
@@ -98,10 +263,34 @@ def _samples_to_record_batch(samples: list[Sample], schema: pa.Schema) -> pa.Rec
             msg = f"[CacheSchemaError] encountered unexpected field(s) {extra_fields!r} after schema inference"
             raise ValueError(msg)
         for field in schema:
-            arrays[field.name].append(_convert_value(sample.get(field.name), field.type))
+            columns_by_name[field.name].append(_convert_value(sample.get(field.name), field.type))
 
-    columns = [pa.array(arrays[field.name], type=field.type) for field in schema]
-    return pa.RecordBatch.from_arrays(columns, schema=schema)
+    try:
+        columns = [_values_to_array(columns_by_name[field.name], field.type, field_name=field.name) for field in schema]
+        return pa.RecordBatch.from_arrays(columns, schema=schema)
+    except (TypeError, pa.ArrowInvalid) as exc:
+        diagnostics: list[str] = []
+        for field in schema:
+            values = columns_by_name[field.name]
+            for sample_index, value in enumerate(values[:4]):
+                paths = _collect_non_python_paths(value, field.name)
+                for value_path, summary in paths[:8]:
+                    diagnostics.append(f"sample[{sample_index}] {value_path}: {summary}")
+                if len(diagnostics) >= 16:
+                    break
+            if len(diagnostics) >= 16:
+                break
+        if not diagnostics:
+            for field in schema:
+                values = columns_by_name[field.name][:4]
+                diagnostics.append(
+                    f"field {field.name}: schema={field.type}, value_types={[type(v).__name__ for v in values]!r}"
+                )
+        msg = (
+            "[CacheArrowConversionError] failed to build RecordBatch from normalized samples. "
+            f"schema={schema}. diagnostics={' | '.join(diagnostics)}"
+        )
+        raise TypeError(msg) from exc
 
 
 # ---------------------------------------------------------------------------
