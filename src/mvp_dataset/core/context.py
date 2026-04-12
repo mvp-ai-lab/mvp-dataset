@@ -134,52 +134,6 @@ class RuntimeContext:
         return dp_size * self.num_workers
 
     @property
-    def is_cache_leader(self) -> bool:
-        """Whether this rank should lead cache warm-up for its model-parallel group.
-
-        When no mesh is set every rank is its own leader.  With a mesh,
-        delegates to :attr:`DataLoadMesh.is_cache_leader`.
-
-        Returns:
-            ``True`` if this rank should build the cache, ``False`` if it
-            should wait for a co-member to do so.
-        """
-        if self.mesh is None:
-            return True
-        return self.mesh.is_cache_leader
-
-    @property
-    def is_node_cache_leader(self) -> bool:
-        """Whether this process should lead cache building for its node."""
-        return self.is_cache_leader and self.local_rank == 0 and self.worker_id == 0
-
-    @property
-    def is_global_cache_merge_leader(self) -> bool:
-        """Whether this process should perform the final global cache merge."""
-        return self.is_node_cache_leader and self.node_rank == 0
-
-    @property
-    def node_slot_ids(self) -> tuple[int, ...]:
-        """Return the global slot ids owned by this node.
-
-        This helper assumes the default non-mesh rank->slot mapping where each
-        rank contributes ``num_workers`` adjacent slots. It is currently used by
-        the distributed cache builder to let a single node leader build cache on
-        behalf of every local slot.
-        """
-        return self.slot_ids_for_node(self.node_rank)
-
-    def slot_ids_for_node(self, node_rank: int) -> tuple[int, ...]:
-        """Return the global slot ids owned by *node_rank*."""
-        start_rank = node_rank * self.local_world_size
-        end_rank = min(start_rank + self.local_world_size, self.world_size)
-        slot_ids: list[int] = []
-        for rank in range(start_rank, end_rank):
-            for worker_id in range(self.num_workers):
-                slot_ids.append(rank * self.num_workers + worker_id)
-        return tuple(slot_ids)
-
-    @property
     def sample_shuffle_seed(self) -> int:
         """Return the deterministic seed for sample-level shuffle."""
 
