@@ -3,11 +3,12 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
-from mvp_dataset import Dataset
+from mvp_dataset import Dataset, RuntimeContext
 
 from .helpers import build_records, write_tar_shards
 
@@ -19,6 +20,29 @@ else:
     mp = None
 
 pytestmark = pytest.mark.skipif(dist is None or mp is None, reason="torch is not installed")
+
+
+@dataclass(frozen=True, slots=True)
+class FakeDeviceMesh:
+    dp_size: int
+    tp_size: int
+    rank: int
+
+    mesh_dim_names = ("dp", "tp")
+
+    def size(self, dim: str) -> int:
+        if dim == "dp":
+            return self.dp_size
+        if dim == "tp":
+            return self.tp_size
+        raise KeyError(dim)
+
+    def get_local_rank(self, dim: str) -> int:
+        if dim == "dp":
+            return self.rank // self.tp_size
+        if dim == "tp":
+            return self.rank % self.tp_size
+        raise KeyError(dim)
 
 
 def _distributed_reader_worker(
@@ -49,6 +73,66 @@ def _distributed_reader_worker(
         dist.destroy_process_group()
 
 
+def _tp_group_reader_worker(
+    rank: int,
+    world_size: int,
+    shards: list[str],
+    init_file: str,
+    output_dir: str,
+) -> None:
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["LOCAL_WORLD_SIZE"] = str(world_size)
+
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        mesh = FakeDeviceMesh(dp_size=2, tp_size=2, rank=rank)
+        context = RuntimeContext.from_runtime(device_mesh=mesh, dp_dims=("dp",))
+        dataset = Dataset.from_source("tars", shards=shards, context=context)
+        ids = [sample["id"].decode("utf-8") for sample in dataset]
+        output_path = Path(output_dir) / f"rank_{rank}.json"
+        output_path.write_text(json.dumps(ids), encoding="utf-8")
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def _tp_group_shuffle_reader_worker(
+    rank: int,
+    world_size: int,
+    shards: list[str],
+    init_file: str,
+    output_dir: str,
+) -> None:
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["LOCAL_WORLD_SIZE"] = str(world_size)
+
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        mesh = FakeDeviceMesh(dp_size=2, tp_size=2, rank=rank)
+        context = RuntimeContext.from_runtime(device_mesh=mesh, dp_dims=("dp",), seed=17)
+        dataset = Dataset.from_source("tars", shards=shards, context=context).shuffle(buffer_size=3)
+        ids = [sample["id"].decode("utf-8") for sample in dataset]
+        output_path = Path(output_dir) / f"rank_{rank}.json"
+        output_path.write_text(json.dumps(ids), encoding="utf-8")
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
 def test_torch_distributed_reading_shards_samples_by_rank(tmp_path) -> None:
     records = build_records(count=4)
     shards = write_tar_shards(tmp_path, records, num_shards=2)
@@ -68,3 +152,48 @@ def test_torch_distributed_reading_shards_samples_by_rank(tmp_path) -> None:
 
     assert set(rank0_ids).isdisjoint(rank1_ids)
     assert set(rank0_ids) | set(rank1_ids) == {str(record["id"]) for record in records}
+
+
+def test_tp_group_members_receive_identical_data(tmp_path) -> None:
+    records = build_records(count=4)
+    shards = write_tar_shards(tmp_path, records, num_shards=2)
+    init_file = tmp_path / "tp_dist_init"
+    output_dir = tmp_path / "tp_outputs"
+    output_dir.mkdir()
+
+    mp.spawn(
+        _tp_group_reader_worker,
+        args=(4, shards, str(init_file), str(output_dir)),
+        nprocs=4,
+        join=True,
+    )
+
+    outputs = {rank: json.loads((output_dir / f"rank_{rank}.json").read_text(encoding="utf-8")) for rank in range(4)}
+
+    assert outputs[0] == outputs[1]
+    assert outputs[2] == outputs[3]
+    assert set(outputs[0]).isdisjoint(outputs[2])
+    assert set(outputs[0]) | set(outputs[2]) == {str(record["id"]) for record in records}
+
+
+def test_tp_group_members_receive_identical_shuffled_data(tmp_path) -> None:
+    records = build_records(count=8)
+    shards = write_tar_shards(tmp_path, records, num_shards=4)
+    init_file = tmp_path / "tp_shuffle_dist_init"
+    output_dir = tmp_path / "tp_shuffle_outputs"
+    output_dir.mkdir()
+
+    mp.spawn(
+        _tp_group_shuffle_reader_worker,
+        args=(4, shards, str(init_file), str(output_dir)),
+        nprocs=4,
+        join=True,
+    )
+
+    outputs = {rank: json.loads((output_dir / f"rank_{rank}.json").read_text(encoding="utf-8")) for rank in range(4)}
+
+    assert outputs[0] == outputs[1]
+    assert outputs[2] == outputs[3]
+    assert outputs[0] != outputs[2]
+    assert set(outputs[0]).isdisjoint(outputs[2])
+    assert set(outputs[0]) | set(outputs[2]) == {str(record["id"]) for record in records}
