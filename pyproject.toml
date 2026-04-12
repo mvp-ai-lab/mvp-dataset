@@ -12,7 +12,9 @@ authors = [
   { name = "MVP AI Lab" }
 ]
 license = { file = "LICENSE" }
-dependencies = []
+dependencies = [
+  "pyarrow>=18.0.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/mvp-ai-lab/mvp-dataset"
@@ -27,7 +29,7 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ["src", "tests"]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-v --tb=short"
 
 [tool.ruff]
 target-version = "py312"

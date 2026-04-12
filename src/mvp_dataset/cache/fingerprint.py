@@ -4,29 +4,16 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import os
 import struct
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 
-def hash_bytes(*parts: Any) -> str:
-    """Return a SHA-256 hex digest over a sequence of typed parts.
+def _update_hash(h: hashlib._Hash, *parts: Any) -> None:
+    """Update *h* using the same typed framing scheme as :func:`hash_bytes`."""
 
-    Each part is type-tagged and length-prefixed so that adjacent parts
-    cannot collide.
-
-    Args:
-        *parts: Values to hash.  Supported types: ``bytes``, ``str``,
-            ``int``, ``float``, ``bool``.
-
-    Returns:
-        A 64-character lowercase hex digest string.
-
-    Raises:
-        TypeError: If any part has an unsupported type.
-    """
-    h = hashlib.sha256()
     for part in parts:
         if isinstance(part, (bytes, bytearray)):
             data = bytes(part)
@@ -49,7 +36,66 @@ def hash_bytes(*parts: Any) -> str:
             h.update(encoded)
         else:
             raise TypeError(f"unsupported hash part type {type(part)!r}")
+
+
+class _HashAccumulator:
+    """Incremental SHA-256 accumulator compatible with :func:`hash_bytes`."""
+
+    def __init__(self) -> None:
+        self._hash = hashlib.sha256()
+
+    def update(self, *parts: Any) -> None:
+        _update_hash(self._hash, *parts)
+
+    def hexdigest(self) -> str:
+        return self._hash.hexdigest()
+
+
+def hash_bytes(*parts: Any) -> str:
+    """Return a SHA-256 hex digest over a sequence of typed parts.
+
+    Each part is type-tagged and length-prefixed so that adjacent parts
+    cannot collide.
+
+    Args:
+        *parts: Values to hash.  Supported types: ``bytes``, ``str``,
+            ``int``, ``float``, ``bool``.
+
+    Returns:
+        A 64-character lowercase hex digest string.
+
+    Raises:
+        TypeError: If any part has an unsupported type.
+    """
+    h = hashlib.sha256()
+    _update_hash(h, *parts)
     return h.hexdigest()
+
+
+def source_fingerprint(source: Iterable[object]) -> str:
+    """Return a stable fingerprint for a dataset source listing.
+
+    Local file-backed sources are fingerprinted from their path, size, and
+    modification time. Fragment-like source objects additionally incorporate
+    their fragment identity so multiple fragments from the same backing file
+    remain distinct.
+    """
+
+    item_fps = sorted(_source_item_fingerprint(item) for item in source)
+    return hash_bytes(*item_fps)
+
+
+def is_stable_function(fn: Callable[..., Any]) -> bool:
+    """Return ``True`` if *fn* is safe to use with cache fingerprinting.
+
+    Lambdas and local closures are rejected because their bytecode identity
+    is not stable across process restarts.
+    """
+    if getattr(fn, "__name__", None) == "<lambda>":
+        return False
+    if "<locals>" in (getattr(fn, "__qualname__", "") or ""):
+        return False
+    return True
 
 
 def callable_fingerprint(fn: Callable[..., Any]) -> str:
@@ -121,6 +167,37 @@ def _collect_callable(fn: Any, parts: list[Any], seen: set[int]) -> None:
         except ValueError:
             continue  # empty cell
         _collect_value(val, parts)
+
+
+def _source_item_fingerprint(item: object) -> str:
+    if isinstance(item, (str, os.PathLike)):
+        return _path_fingerprint(os.fspath(item))
+
+    cache_key = getattr(item, "cache_key", None)
+    if cache_key is not None:
+        backing_path = getattr(item, "path", None)
+        if backing_path is None:
+            backing_path = getattr(item, "uri", None)
+        if isinstance(backing_path, (str, os.PathLike)):
+            return hash_bytes(
+                "<source-fragment>",
+                str(cache_key),
+                _path_fingerprint(os.fspath(backing_path)),
+            )
+
+    fp_method = getattr(item, "__fingerprint__", None)
+    if callable(fp_method):
+        fp = fp_method()
+        if not isinstance(fp, str):
+            raise TypeError(f"__fingerprint__ must return str, got {type(fp).__name__!r}")
+        return hash_bytes("<source-object>", fp)
+
+    return hash_bytes("<source-repr>", repr(item))
+
+
+def _path_fingerprint(path: str) -> str:
+    stat_result = os.stat(path)
+    return hash_bytes("<source-path>", path, stat_result.st_size, stat_result.st_mtime_ns)
 
 
 def _collect_value(val: Any, parts: list[Any]) -> None:

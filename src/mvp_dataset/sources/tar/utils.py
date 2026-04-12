@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import itertools
+import os
 import tarfile
 from collections.abc import Iterator, Sequence
 from pathlib import PurePosixPath
 from typing import Final, cast
 
-from ..core.types import PathLikeStr, Sample, SidecarSpec
+from ...core.types import PathLikeStr, Sample, SidecarSpec
 
 
 def _is_meta_member(name: str) -> bool:
@@ -121,14 +122,12 @@ def _require_sample_key(sample: Sample, *, shard_path: PathLikeStr, source_name:
 
 def iter_tars(
     shard_paths: Iterator[PathLikeStr],
-    key_dot_level: int = 1,
     sidecars: Sequence[SidecarSpec] | None = None,
 ) -> Iterator[Sample]:
     """Iterate multiple tar shards, optionally merging sidecar tars.
 
     Args:
         shard_paths: Iterator of paths to the main tar shards.
-        key_dot_level: Number of dot-separated segments used as the sample key.
         sidecars: Optional list of ``(name, path_fn)`` pairs.  For each main
             shard path, ``path_fn(shard_path)`` is called to locate the
             corresponding sidecar shard.  After yielding one sample from the
@@ -139,6 +138,7 @@ def iter_tars(
             merged into the main sample dict.  Duplicate field names across
             shards raise a :class:`ValueError`.
     """
+    key_dot_level = int(os.environ.get("MVP_DATASET_TAR_KEY_DOT_LEVEL", "1"))
     for shard_path in shard_paths:
         if not sidecars:
             yield from iter_tar(shard_path, key_dot_level=key_dot_level)

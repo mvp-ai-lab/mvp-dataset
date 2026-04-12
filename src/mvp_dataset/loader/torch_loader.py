@@ -32,6 +32,43 @@ def _torch_dataloader_class() -> type:
     return torch_utils_data.DataLoader
 
 
+class _LoaderUnbatchStage:
+    def __call__(self, data: Iterable[object]) -> Iterable[object]:
+        return unbatch_samples(data)
+
+
+class _LoaderShuffleStage:
+    def __init__(self, *, buffer_size: int, initial: int | None, seed: int) -> None:
+        self.buffer_size = buffer_size
+        self.initial = initial
+        self.seed = seed
+
+    def __call__(self, data: Iterable[object]) -> Iterable[object]:
+        rng = random.Random(self.seed)
+        return shuffle_samples(data, buffer_size=self.buffer_size, initial=self.initial, rng=rng)
+
+
+class _LoaderBatchStage:
+    def __init__(
+        self,
+        *,
+        batch_size: int,
+        drop_last: bool,
+        collate_fn: Callable[[list[object]], object] | None,
+    ) -> None:
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.collate_fn = collate_fn
+
+    def __call__(self, data: Iterable[object]) -> Iterable[object]:
+        return batch_samples(
+            data,
+            batch_size=self.batch_size,
+            drop_last=self.drop_last,
+            collate_fn=self.collate_fn,
+        )
+
+
 class TorchLoader:
     """Parallel loader that delegates worker processes to PyTorch DataLoader.
 
@@ -158,13 +195,13 @@ class TorchLoader:
         """Derive a deterministic shuffle seed from dataset runtime context.
 
         Returns:
-            ``context.seed + context.rank`` when the upstream dataset exposes a
+            ``context.sample_shuffle_seed`` when the upstream dataset exposes a
             :class:`RuntimeContext`; otherwise ``0``.
         """
 
         context = getattr(self._dataset, "context", None)
         if isinstance(context, RuntimeContext):
-            return context.seed + context.rank
+            return context.sample_shuffle_seed
         return 0
 
     def unbatch(self) -> TorchLoader:
@@ -177,11 +214,7 @@ class TorchLoader:
             A new loader that expands merged batches back into samples before
             any later loader-side stages run.
         """
-
-        def stage(data: Iterable[object]) -> Iterable[object]:
-            return unbatch_samples(data)
-
-        return self._append_stage(stage)
+        return self._append_stage(_LoaderUnbatchStage())
 
     def shuffle(
         self,
@@ -201,13 +234,14 @@ class TorchLoader:
             A new loader that performs bounded-memory global shuffling after
             worker output has been merged.
         """
-
-        def stage(data: Iterable[object]) -> Iterable[object]:
-            rng_seed = self._default_shuffle_seed() if seed is None else seed
-            rng = random.Random(rng_seed)
-            return shuffle_samples(data, buffer_size=buffer_size, initial=initial, rng=rng)
-
-        return self._append_stage(stage)
+        resolved_seed = self._default_shuffle_seed() if seed is None else seed
+        return self._append_stage(
+            _LoaderShuffleStage(
+                buffer_size=buffer_size,
+                initial=initial,
+                seed=resolved_seed,
+            )
+        )
 
     def batch(
         self,
@@ -227,16 +261,13 @@ class TorchLoader:
             A new loader that batches the merged sample stream in the main
             process.
         """
-
-        def stage(data: Iterable[object]) -> Iterable[object]:
-            return batch_samples(
-                data,
+        return self._append_stage(
+            _LoaderBatchStage(
                 batch_size=batch_size,
                 drop_last=drop_last,
                 collate_fn=collate_fn,
             )
-
-        return self._append_stage(stage)
+        )
 
     def __iter__(self) -> Iterator[object]:
         """Iterate the merged stream after applying all loader-side stages.

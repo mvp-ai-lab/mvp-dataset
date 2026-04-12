@@ -1,221 +1,457 @@
 # MVP Dataset
 
-A minimal, high-performance data loading library for multimodal training pipelines.
+`mvp-dataset` is a efficient data loading library for multimodal training.
 
-`mvp-dataset` focuses on a small API surface, deterministic behavior, and practical throughput for local shard-based datasets.
+It is built around a few ideas:
 
-## Why this project
-
-- Minimal: only a few core abstractions (`Dataset`, `TorchLoader`, `RuntimeContext`)
-- Fast: lazy iterator stages, bounded-memory shuffle, tar sidecar join, and loader-side pipeline composition
-- Deterministic: seed-aware sharding and shuffle behavior across distributed + worker processes
-- Extensible: source-level operations for TAR and JSONL-with-TAR-reference workflows
-
-## Features
-
-- `Dataset.from_tars(...)` for local `.tar` shard inputs
-- `Dataset.from_jsonl(...)` for local `.jsonl` inputs
-- `Dataset.from_source(...)` as a compatibility dispatcher for mixed call sites
-- Chainable pipeline ops:
-  - `.map(...)`
-  - `.shuffle(buffer_size, initial=...)`
-  - `.batch(batch_size, drop_last=..., collate_fn=...)`
-  - `.unbatch()`
-  - `.cache(groups=...)` — materialize expensive preprocessing to disk with automatic invalidation
-- Tar workflows:
-  - sample parsing from shard members
-  - optional sidecar merge via `.join([...])`. In this way, you can store different modalities in separate tars and join them on the fly via member naming conventions.
-- JSONL workflows:
-  - optional linked-tar reference resolution via `.resolve_refs([...])`. In this way, you can use JSONL to store data like conversations and reference external image data in tar shards.
-  - optional spill sharding via `from_jsonl(..., group_key=..., num_shards=...)` for bounded-memory preprocessing and better tar locality.
-- `TorchLoader` for PyTorch `DataLoader` integration with post-merge stages
+- one immutable `Dataset` pipeline
+- deterministic sharding across distributed ranks and worker processes
+- simple on-the-fly transforms
+- a practical `.cache()` boundary for expensive preprocessing
+- optional `TorchLoader` integration for PyTorch `DataLoader`
 
 ## Installation
-
-Python requirement: `>=3.12,<3.13`
 
 ```bash
 uv pip install "git+https://github.com/mvp-ai-lab/mvp-dataset.git"
 
-# For development:
+# Development install
 uv pip install -e .
 ```
 
 If you use `TorchLoader`, install PyTorch separately.
 
-## Quick start
+## Public API
 
-### TAR pipeline
+Top-level exports:
 
-```python
-from mvp_dataset import Dataset, TorchLoader
+- `Dataset`
+- `RuntimeContext`
+- `DataLoadMesh`
+- `TorchLoader`
+- `set_logger(...)` / `get_logger(...)`
+- `set_log_level(...)` / `get_log_level(...)`
 
-dataset = (
-    Dataset.from_tars("/data/shards/shard_{000000..000006}.tar", resample=True)
-    .shuffle(buffer_size=1024)
-    .map(lambda s: s)
-)
-
-loader = (
-    TorchLoader(dataset, num_workers=8, batch_size=32, collate_fn=lambda x: x)
-    .unbatch()
-    .shuffle(buffer_size=4096)
-    .batch(batch_size=64)
-)
-
-for batch in loader:
-    train_step(batch)
-```
-
-### Joint TAR pipeline
+Dataset construction uses a single entrypoint:
 
 ```python
-from mvp_dataset import Dataset, TorchLoader
-
-dataset = (
-    Dataset.from_tars("/data/images/shard_{000000..000006}.tar", resample=True)
-    .join([
-      ("depth", lambda s: s.replace("image", "depth))
-    ])
-    .shuffle(buffer_size=1024)
-    .map(lambda s: s)
-)
-
-loader = (
-    TorchLoader(dataset, num_workers=8, batch_size=32, collate_fn=lambda x: x)
-    .unbatch()
-    .shuffle(buffer_size=4096)
-    .batch(batch_size=64)
-)
-
-for batch in loader:
-    train_step(batch)
+Dataset.from_source(source_kind, ...)
 ```
 
-### JSONL + TAR reference pipeline
+Supported `source_kind` values:
+
+- `"tars"`
+- `"jsonl"`
+- `"parquet"`
+- `"lance"`
+
+Chainable dataset stages:
+
+- `.map(fn)`
+- `.select(fields)`
+- `.shuffle(buffer_size, initial=None)`
+- `.assemble(factory, drop_last=False)`
+- `.batch(batch_size, drop_last=False, collate_fn=None)`
+- `.unbatch()`
+- `.cache(cache_dir=".cache", cache_num_workers=1, max_rows_per_fragment=5000)`
+
+`TorchLoader` supports post-merge stages:
+
+- `.unbatch()`
+- `.shuffle(buffer_size, initial=None, seed=None)`
+- `.batch(batch_size, drop_last=False, collate_fn=None)`
+
+## Core Concepts
+
+### Dataset
+
+`Dataset` is an immutable iterable pipeline. Every stage returns a new dataset.
 
 ```python
 from mvp_dataset import Dataset
 
 dataset = (
-    Dataset.from_jsonl(
-        "/data/meta/train.jsonl",
-        resample=True,
-        group_key="image",
-        num_shards=64,
-    )
-    .resolve_refs([("image", "/data")])  # tar://... URI base dir
-    .map(lambda s: s)
+    Dataset.from_source("tars", "/data/shards/shard_{000000..000127}.tar")
+    .shuffle(buffer_size=1024)
+    .map(preprocess)
+)
+```
+
+### RuntimeContext
+
+`RuntimeContext` carries rank, worker, seed, and optional mesh information.
+
+Most users do not need to construct it manually. If `context=` is omitted, runtime values are inferred from:
+
+- `torch.distributed`
+- `torch.utils.data.get_worker_info()`
+- environment variables such as `RANK` and `WORLD_SIZE`
+
+### DataLoadMesh
+
+`DataLoadMesh` is used when the training mesh contains model-parallel dimensions such as tensor parallelism.
+
+Its purpose is to separate:
+
+- data-parallel dimensions: different data
+- model-parallel dimensions: same data
+
+This lets TP co-members receive identical dataset shards while DP ranks remain distinct.
+
+## Quick Start
+
+### TAR
+
+```python
+from mvp_dataset import Dataset, TorchLoader
+
+dataset = (
+    Dataset.from_source("tars", "/data/shards/shard_{000000..000006}.tar", resample=True)
+    .shuffle(buffer_size=1024)
+    .map(decode_sample)
 )
 
-for sample in dataset:
-    consume(sample)
+loader = (
+    TorchLoader(dataset, num_workers=8, batch_size=32, collate_fn=lambda x: x)
+    .unbatch()
+    .shuffle(buffer_size=4096)
+    .batch(batch_size=64)
+)
+
+for batch in loader:
+    train_step(batch)
 ```
 
-### Demo
+### TAR With Sidecars
 
-Generate demo shards and metadata:
+Use `sidecars=` when related modalities live in separate tar shards with matching shard layouts.
 
-Read image/depth tar shards:
+```python
+from mvp_dataset import Dataset
 
-```bash
-python3 examples/tar.py examples/demo_data/image/shard_{000000..000003}.tar --max-batches 2
+dataset = Dataset.from_source(
+    "tars",
+    "/data/images/shard_{000000..000006}.tar",
+    sidecars=[
+        ("depth", lambda shard: shard.replace("/images/", "/depth/")),
+    ],
+)
 ```
 
-Read JSONL with `tar://` references:
+### JSONL With TAR References
 
-```bash
-python3 examples/jsonl.py examples/demo_data/samples.jsonl --max-batches 2
+```python
+from mvp_dataset import Dataset
+
+dataset = Dataset.from_source(
+    "jsonl",
+    "/data/meta/train.jsonl",
+    ref_fields=[("image", "/data")],
+)
 ```
+
+### Parquet
+
+```python
+from mvp_dataset import Dataset
+
+def add_length(sample: dict[str, object]) -> dict[str, object]:
+    return {**sample, "length": len(str(sample["text"]))}
+
+dataset = (
+    Dataset.from_source(
+        "parquet",
+        "/data/meta/train_{000000..000003}.parquet",
+        columns=["text", "label"],
+        batch_size=8192,
+    )
+    .map(add_length)
+)
+```
+
+### Lance
+
+```python
+from mvp_dataset import Dataset
+
+dataset = Dataset.from_source(
+    "lance",
+    "/data/cache/train.lance",
+    columns=["tokens", "label"],
+)
+```
+
+## Source Types
+
+### TAR
+
+```python
+Dataset.from_source(
+    "tars",
+    shards,
+    context=None,
+    resample=False,
+    sidecars=None,
+)
+```
+
+Notes:
+
+- inputs must resolve to `.tar` files
+- tar shard count must be at least `context.total_slots`
+- samples are parsed from tar members as keyed field dictionaries
+
+### JSONL
+
+```python
+Dataset.from_source(
+    "jsonl",
+    shards,
+    context=None,
+    resample=False,
+    ref_fields=None,
+)
+```
+
+Notes:
+
+- inputs must resolve to `.jsonl` files
+- JSONL inputs are internally split into slot-aligned logical shards
+- `ref_fields=[(field_name, base_dir), ...]` resolves `tar://...`-style references
+
+### Parquet
+
+```python
+Dataset.from_source(
+    "parquet",
+    shards,
+    context=None,
+    resample=False,
+    columns=None,
+    batch_size=65536,
+    use_threads=True,
+)
+```
+
+Notes:
+
+- inputs must resolve to `.parquet` files
+- work is scheduled by parquet fragment / row group
+- each row becomes one sample dict
+
+### Lance
+
+```python
+Dataset.from_source(
+    "lance",
+    shards,
+    context=None,
+    resample=False,
+    columns=None,
+    batch_size=65536,
+)
+```
+
+Notes:
+
+- inputs are local Lance dataset paths or URIs
+- work is scheduled by Lance fragments
+
+## Pipeline Semantics
+
+### `map`
+
+Applies a pure per-sample transform.
+
+### `select`
+
+Projects user fields while preserving internal metadata such as `__key__`.
+
+### `shuffle`
+
+Applies bounded-memory sample shuffle with deterministic seeding derived from runtime context.
+
+### `assemble`
+
+Builds a stateful stream assembler from `factory(context)` and allows many-input to many-output transformations. It is very useful for data packing in LLM/VLM training.
+
+The `factory` receives the runtime-resolved `RuntimeContext`, so it can safely depend on:
+
+- `worker_id`
+- `num_workers`
+- distributed rank information
+- mesh-aware DP semantics
+
+### `batch` / `unbatch`
+
+Operate directly on the dataset stream. These are valid for normal iteration, but `batch` and `unbatch` are intentionally rejected before `.cache()`.
 
 ## Caching
 
-`.cache()` materializes all upstream stages into tar files on disk so that expensive preprocessing (decoding, tokenization, augmentation, etc.) runs once and is reused on every subsequent iteration.
+`.cache()` materializes all upstream outputs into a local Lance dataset.
 
-### Basic usage
+This is intended for expensive preprocessing such as:
 
-```python
-ds = (
-    Dataset.from_tars("shards/shard_{000000..000099}.tar")
-    .map(expensive_preprocess)   # runs only on first iteration
-    .cache()                     # <-- cache boundary
-    .shuffle(buffer_size=4096)   # runs every iteration
-)
+- image decode
+- tokenization
+- feature extraction
+- multimodal assembly
 
-for sample in ds:  # 1st iter: builds cache
-    train_step(sample)
-
-for sample in ds:  # 2nd iter: reads from cache, skips expensive_preprocess
-    train_step(sample)
-```
-
-Cache tars are written to a `.cache/` directory next to the source shards.
-
-### How invalidation works
-
-Each `.map()` / `.assemble()` stage is fingerprinted from its bytecode, defaults, and closure state. A **plan fingerprint** (SHA-256 of all pre-cache stage fingerprints + the groups spec) is stored in the manifest. When any pre-cache stage changes, the fingerprint changes and the cache is rebuilt automatically.
-
-### Field grouping
-
-By default all fields go into one tar per shard. Pass `groups` to split fields into separate tars — useful when only a subset of fields change between experiments:
-
-```python
-ds = (
-    Dataset.from_tars(shards)
-    .map(preprocess)
-    .cache(groups=[["image"], ["label"]])
-    # "image", "label" each get their own tar; any remaining fields
-    # (e.g. "tag") become singleton groups automatically.
-)
-```
-
-Only the group tars whose content signatures changed are rewritten.
-
-### Post-cache stages
-
-Stages appended **after** `.cache()` run on every iteration, reading from the cached tars:
-
-```python
-ds = (
-    Dataset.from_tars(shards)
-    .map(tokenize)       # cached
-    .cache()
-    .map(random_augment) # NOT cached — runs every time
-    .shuffle(buffer_size=2048)
-)
-```
-
-### Distributed / tensor-parallel awareness
-
-When using a `DataLoadMesh` with model-parallel dimensions (e.g. tensor parallelism), multiple ranks receive the same shards. The cache layer automatically elects one **cache leader** per model-parallel group (the rank whose non-DP local ranks are all 0) to build the cache. All other co-members wait for the leader to finish and then read directly from the cached tars, avoiding redundant computation.
+Basic example:
 
 ```python
 from mvp_dataset import Dataset
-from mvp_dataset.core.types import RuntimeContext
 
-ctx = RuntimeContext.from_runtime(
-    device_mesh=mesh,
-    dp_dims=("replicate", "shard"),  # TP dim excluded → co-members share shards
-)
+def tokenize(sample: dict[str, object]) -> dict[str, object]:
+    return {**sample, "tokens": sample["text"].split()}
 
-ds = (
-    Dataset.from_tars(shards, context=ctx)
-    .map(expensive_fn)
+dataset = (
+    Dataset.from_source("jsonl", "/data/train.jsonl")
+    .map(tokenize)
     .cache()
+    .shuffle(buffer_size=4096)
 )
 ```
 
-## Data conventions
+### What Is Cached
 
-### TAR member naming
+All stages before `.cache()` are materialized once. All stages after `.cache()` run on every iteration.
 
-Tar members are parsed as `<key>.<field>` (or multi-segment keys controlled by `key_dot_level`).
+```python
+dataset = (
+    Dataset.from_source("tars", shards)
+    .map(expensive_preprocess)   # cached
+    .cache()
+    .map(random_augment)         # not cached
+    .shuffle(buffer_size=2048)   # not cached
+)
+```
+
+### Cache Storage
+
+- storage format: Lance
+- default cache root: `.cache` under the current working directory
+- output path is derived from a plan fingerprint
+
+### Cache Invalidation
+
+The cache plan fingerprint is built from:
+
+- source listing / fragment identity
+- every pre-cache stage marked as traceable
+
+Current behavior:
+
+- `.map()` participates in invalidation
+- `.select()` participates in invalidation
+- `.assemble()` participates in invalidation, including `drop_last`
+- `.shuffle()` is intentionally allowed before `.cache()`, but does not participate in invalidation
+
+If `.shuffle()` appears before `.cache()`, a warning is logged to make that tradeoff explicit.
+
+Lambdas and local closures are rejected before `.cache()` because their identity is not stable across process restarts.
+
+### Supported Pre-Cache Stages
+
+Supported:
+
+- `map`
+- `select`
+- `shuffle`
+- `assemble`
+
+Rejected:
+
+- `batch`
+- `unbatch`
+
+### Pre-Cache Execution Model
+
+The current implementation preserves full-stream semantics:
+
+- only the leading contiguous `map(...)` prefix is parallelized with `cache_num_workers`
+- once a non-`map` stage is reached, all remaining pre-cache stages run on the merged stream in declaration order
+
+This is why `shuffle` and `assemble` behave the same with and without cache.
+
+## Distributed and Tensor-Parallel Behavior
+
+Without a mesh, sharding is based on global `rank` and `world_size`.
+
+With a `DataLoadMesh`, sharding is based on data-parallel dimensions:
+
+- `RuntimeContext.slot` uses `dp_rank`
+- `RuntimeContext.total_slots` uses `dp_size`
+- TP co-members receive identical data
+- DP ranks receive distinct data
+
+Example:
+
+```python
+from mvp_dataset import Dataset, RuntimeContext
+
+ctx = RuntimeContext.from_runtime(
+    device_mesh=mesh,
+    dp_dims=("replicate", "shard"),
+)
+
+dataset = Dataset.from_source("tars", shards, context=ctx)
+```
+
+### Cache Under TP
+
+The cache layer is mesh-aware:
+
+- per-slot cache shards are keyed by `dp_rank`, not global `rank`
+- only one DP leader writes each per-slot cache shard
+- merge consumes one shard per DP slot
+
+This prevents TP co-members from duplicating cached samples.
+
+## TorchLoader
+
+`TorchLoader` wraps PyTorch `DataLoader` and applies additional post-merge stages in the main process.
+
+Recommended high-throughput pattern:
+
+1. use worker micro-batches with `batch_size` and `collate_fn=lambda x: x`
+2. call `.unbatch()`
+3. call loader-side `.shuffle(...)`
+4. call loader-side `.batch(...)`
+
+Example:
+
+```python
+from mvp_dataset import Dataset, TorchLoader
+
+dataset = Dataset.from_source("tars", shards).map(preprocess)
+
+loader = (
+    TorchLoader(dataset, num_workers=8, batch_size=32, collate_fn=lambda x: x)
+    .unbatch()
+    .shuffle(buffer_size=4096)
+    .batch(batch_size=128)
+)
+```
+
+Loader-side shuffle uses the upstream dataset context when available, so TP co-members stay aligned by default.
+
+## Data Conventions
+
+### TAR Member Naming
+
+Tar members are parsed as `<key>.<field>`.
 
 Examples:
+
 - `abc.jpg` -> key=`abc`, field=`jpg`
 - `abc.extra.jpg` with `key_dot_level=2` -> key=`abc.extra`, field=`jpg`
 
-### JSONL TAR reference URI
+Related environment variable:
+
+- `LOADER_TAR_KEY_DOT_LEVEL` default `1`
+
+### JSONL TAR References
 
 Supported URI grammar:
 
@@ -230,33 +466,39 @@ Example:
 tar://examples/data/tars/shard_000000.tar#image_001.jpg
 ```
 
-Reference fields can be either a single string URI or a list of string URIs. For example:
+Reference fields may be either:
 
-```json
-{"images": ["images/train-00000.tar#image_00.jpg", "images/train-00000.tar#image_01.jpg"]}
+- one URI string
+- a list of URI strings
+
+### Parquet Samples
+
+Each parquet row is exposed as a sample dict containing:
+
+- `__file__`
+- `__index_in_file__`
+- `__key__`
+
+Parquet scheduling uses row groups as units of work.
+
+## Runtime and Environment Variables
+
+Distributed / runtime context:
+
+- `RANK`
+- `WORLD_SIZE`
+- `WORKER`
+- `NUM_WORKERS`
+
+Source behavior:
+
+- `LOADER_TAR_KEY_DOT_LEVEL`
+- `LOADER_JSONL_TAR_CACHE_SIZE`
+
+## Demo Commands
+
+```bash
+python3 examples/tar.py examples/demo_data/image/shard_{000000..000003}.tar --max-batches 2
+python3 examples/jsonl.py examples/demo_data/samples.jsonl --max-batches 2
+python3 examples/parquet.py "examples/demo_data/*.parquet" --max-batches 2
 ```
-
-## Runtime and environment variables
-
-- Distributed/runtime context:
-  - `RANK`
-  - `WORLD_SIZE`
-  - `WORKER`
-  - `NUM_WORKERS`
-- Source behavior:
-  - `LOADER_TAR_KEY_DOT_LEVEL` (default: `1`)
-  - `LOADER_JSONL_TAR_CACHE_SIZE` (default: `8`)
-- JSONL preprocessing:
-  - `from_jsonl(..., group_key=..., num_shards=..., spill_buckets=..., output_dir=...)`
-
-## Performance notes
-
-- Iterator pipeline is lazy; data transforms are applied on demand.
-- Shuffle uses bounded buffer memory (`buffer_size`, optional `initial`).
-- JSONL reference resolution uses LRU tar-handle caching.
-- `from_jsonl(...)` can pre-materialize balanced local JSONL shards so workers shard by file instead of holding the full JSONL in memory.
-- Recommended high-throughput pattern with PyTorch:
-  1. worker micro-batch (`batch_size` on `TorchLoader` + identity collate)
-  2. `.unbatch()`
-  3. loader-side `.shuffle(...)`
-  4. loader-side `.batch(...)`

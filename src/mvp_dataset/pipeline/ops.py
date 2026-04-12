@@ -15,6 +15,24 @@ def map_samples[T, U](data: Iterable[T], fn: Callable[[T], U]) -> Iterator[U]:
         yield fn(sample)
 
 
+def select_samples(
+    data: Iterable[object],
+    fields: tuple[str, ...],
+) -> Iterator[dict[str, object]]:
+    """Project dict samples to the requested fields plus metadata keys."""
+
+    selected = set(fields)
+    for sample in data:
+        if not isinstance(sample, dict):
+            msg = f"select() expects dict samples, got {type(sample)!r}"
+            raise TypeError(msg)
+        yield {
+            key: value
+            for key, value in sample.items()
+            if key in selected or (key.startswith("__") and key.endswith("__"))
+        }
+
+
 def _pop_random[T](buffer: list[T], rng: random.Random) -> T:
     # O(1) removal: swap picked slot with the last slot, then pop tail.
     # This keeps shuffle semantics while avoiding O(n) middle-pop cost.

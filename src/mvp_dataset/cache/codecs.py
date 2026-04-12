@@ -68,18 +68,17 @@ def encode_value(value: Any) -> tuple[bytes, str]:
             buf = io.BytesIO()
             np.save(buf, value, allow_pickle=False)
             return buf.getvalue(), CODEC_NPY
-    except ImportError:
-        pass
 
-    try:
-        import numpy as np
-        import torch
+        try:
+            import torch
 
-        if isinstance(value, torch.Tensor):
-            arr = value.cpu().numpy()
-            buf = io.BytesIO()
-            np.save(buf, arr, allow_pickle=False)
-            return buf.getvalue(), CODEC_NPY_TENSOR
+            if isinstance(value, torch.Tensor):
+                arr = value.cpu().numpy()
+                buf = io.BytesIO()
+                np.save(buf, arr, allow_pickle=False)
+                return buf.getvalue(), CODEC_NPY_TENSOR
+        except ImportError:
+            pass
     except ImportError:
         pass
 

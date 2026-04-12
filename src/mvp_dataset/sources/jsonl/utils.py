@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
 import tarfile
 from collections import OrderedDict
 from collections.abc import Iterator, Sequence
@@ -11,9 +13,67 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 
-from ..core.types import PathLikeStr, RefFieldSpec, Sample
+from ...core.types import PathLikeStr, RefFieldSpec, Sample
 
 _TAR_URI_PREFIX = "tar://"
+
+
+def _wc_lines(path: str) -> int:
+    """Count lines using wc -l."""
+    result = subprocess.run(
+        ["wc", "-l", path],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={**os.environ, "LC_ALL": "C"},
+    )
+    return int(result.stdout.strip().split()[0])
+
+
+def split_jsonl_files(paths: list[str], min_chunks: int) -> list[str]:
+    """Split JSONL files into at least *min_chunks* pieces using ``split``.
+
+    If there are already enough files, returns them as-is.
+    Split files are written next to the originals with a ``._chunk_`` suffix.
+    """
+    if len(paths) >= min_chunks:
+        return paths
+
+    total_lines = sum(_wc_lines(p) for p in paths)
+    if total_lines == 0 or min_chunks <= 0:
+        return paths
+
+    chunk_dir = os.path.join(os.path.dirname(paths[0]) or ".", ".chunks")
+    os.makedirs(chunk_dir, exist_ok=True)
+
+    result_paths: list[str] = []
+    for path in paths:
+        n_lines = _wc_lines(path)
+        n_splits = max(1, round(n_lines / total_lines * min_chunks))
+        if n_splits <= 1:
+            result_paths.append(path)
+            continue
+
+        stem = os.path.basename(path)
+        existing_chunks = sorted(
+            os.path.join(chunk_dir, f) for f in os.listdir(chunk_dir) if f.startswith(stem + "._chunk_")
+        )
+        if existing_chunks:
+            result_paths.extend(existing_chunks)
+            continue
+
+        lines_per_chunk = max(1, (n_lines + n_splits - 1) // n_splits)
+        prefix = os.path.join(chunk_dir, stem + "._chunk_")
+        subprocess.run(
+            ["split", "-l", str(lines_per_chunk), "-d", "-a", "5", path, prefix],
+            check=True,
+        )
+        chunk_files = sorted(
+            os.path.join(chunk_dir, f) for f in os.listdir(chunk_dir) if f.startswith(stem + "._chunk_")
+        )
+        result_paths.extend(chunk_files)
+
+    return result_paths
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,7 +328,7 @@ def materialize_jsonl_shards(
     try:
         current_shard = 0
         rows_in_current_shard = 0
-        for bucket_id in sorted(_non_empty_bucket_ids(bucket_counts)):
+        for bucket_id in sorted(i for i, c in enumerate(bucket_counts) if c > 0):
             bucket_path = bucket_dir / f"bucket_{bucket_id:05d}.jsonl"
             with bucket_path.open(encoding="utf-8") as handle:
                 for line in handle:
@@ -297,10 +357,10 @@ def materialize_jsonl_shards(
 def iter_jsonls(
     shard_paths: Iterator[PathLikeStr],
     ref_fields: tuple[RefFieldSpec, ...],
-    key_dot_level: int = 1,
-    tar_cache_size: int = 8,
 ) -> Iterator[Sample]:
     """Resolve tar data references while streaming JSONL shard files."""
+    key_dot_level = int(os.environ.get("MVP_DATASET_TAR_KEY_DOT_LEVEL", "1"))
+    tar_cache_size = int(os.environ.get("MVP_DATASET_TAR_CACHE_SIZE", "8"))
 
     def _resolve_one(sample: Sample, manager: TarManager) -> Sample:
         resolved = dict(sample)
@@ -355,7 +415,7 @@ def _jsonl_shard_plan_fingerprint(
     spill_buckets: int,
 ) -> str:
     payload = {
-        "files": [(file, Path(file).stat().st_mtime_ns, Path(file).stat().st_size) for file in files],
+        "files": [(file, s.st_mtime_ns, s.st_size) for file in files for s in (Path(file).stat(),)],
         "group_key": group_key,
         "num_shards": num_shards,
         "target_samples_per_shard": target_samples_per_shard,
@@ -363,12 +423,6 @@ def _jsonl_shard_plan_fingerprint(
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
-
-
-def _non_empty_bucket_ids(bucket_counts: Sequence[int]) -> Iterator[int]:
-    for bucket_id, count in enumerate(bucket_counts):
-        if count > 0:
-            yield bucket_id
 
 
 def _parse_jsonl_line(
