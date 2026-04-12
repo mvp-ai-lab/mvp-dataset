@@ -306,10 +306,9 @@ class Dataset(torch_iterabledataset_class()):
                         if now - last_log >= 10.0:
                             elapsed = now - t0
                             logger.info(
-                                "<MVP Dataset - rank %d> cache: %d/%d samples written (%.1f samples/s)",
+                                "<MVP Dataset - rank %d> cache: %d samples written (%.1f samples/s)",
                                 rank,
                                 count,
-                                n_source,
                                 count / elapsed,
                             )
                             last_log = now

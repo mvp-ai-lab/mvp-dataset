@@ -25,6 +25,7 @@ def _wc_lines(path: str) -> int:
         capture_output=True,
         text=True,
         check=True,
+        env={**os.environ, "LC_ALL": "C"},
     )
     return int(result.stdout.strip().split()[0])
 
