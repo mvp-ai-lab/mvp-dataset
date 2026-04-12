@@ -61,6 +61,23 @@ class DataLoadMesh:
             size *= self.device_mesh.size(dim)
         return size
 
+    @property
+    def is_dp_leader(self) -> bool:
+        """Return whether the local rank is the designated writer for its DP slot.
+
+        The leader is defined as the rank whose non-data-parallel mesh
+        coordinates are all zero. This selects exactly one representative from
+        each model-parallel replica group so TP co-members do not duplicate
+        cache writes.
+        """
+
+        dim_names = getattr(self.device_mesh, "mesh_dim_names", None)
+        if dim_names is None:
+            return True
+
+        non_dp_dims = [dim for dim in dim_names if dim not in self.dp_dims]
+        return all(self.device_mesh.get_local_rank(dim) == 0 for dim in non_dp_dims)
+
 
 def _normalize_dp_dims(dp_dims: str | Sequence[str]) -> tuple[str, ...]:
     """Normalize one-or-many DP mesh dimension names into a tuple."""

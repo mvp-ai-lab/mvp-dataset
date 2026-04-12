@@ -208,6 +208,37 @@ def _tp_group_shuffle_reader_worker(
         dist.destroy_process_group()
 
 
+def _tp_group_cache_reader_worker(
+    rank: int,
+    world_size: int,
+    shards: list[str],
+    init_file: str,
+    cache_dir: str,
+    output_dir: str,
+) -> None:
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["LOCAL_WORLD_SIZE"] = str(world_size)
+
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        mesh = FakeDeviceMesh(dp_size=2, tp_size=2, rank=rank)
+        context = RuntimeContext.from_runtime(device_mesh=mesh, dp_dims=("dp",), seed=29)
+        dataset = Dataset.from_source("tars", shards=shards, context=context).cache(cache_dir=cache_dir)
+        ids = [sample["id"].decode("utf-8") for sample in dataset]
+        output_path = Path(output_dir) / f"rank_{rank}.json"
+        output_path.write_text(json.dumps(ids), encoding="utf-8")
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
 def test_torch_distributed_reading_shards_samples_by_rank(tmp_path) -> None:
     records = build_records(count=4)
     shards = write_tar_shards(tmp_path, records, num_shards=2)
@@ -318,3 +349,27 @@ def test_tp_group_members_receive_identical_data_with_multiple_workers(tmp_path)
     assert outputs[0] != outputs[2]
     assert set(outputs[0]).isdisjoint(outputs[2])
     assert set(outputs[0]) | set(outputs[2]) == {str(record["id"]) for record in records}
+
+
+def test_cache_does_not_duplicate_tp_group_outputs(tmp_path) -> None:
+    records = build_records(count=8)
+    shards = write_tar_shards(tmp_path, records, num_shards=4)
+    init_file = tmp_path / "tp_cache_dist_init"
+    cache_dir = tmp_path / "cache"
+    output_dir = tmp_path / "tp_cache_outputs"
+    output_dir.mkdir()
+
+    mp.spawn(
+        _tp_group_cache_reader_worker,
+        args=(4, shards, str(init_file), str(cache_dir), str(output_dir)),
+        nprocs=4,
+        join=True,
+    )
+
+    outputs = {rank: json.loads((output_dir / f"rank_{rank}.json").read_text(encoding="utf-8")) for rank in range(4)}
+    combined_dp_outputs = outputs[0] + outputs[2]
+
+    assert outputs[0] == outputs[1]
+    assert outputs[2] == outputs[3]
+    assert outputs[0] != outputs[2]
+    assert sorted(combined_dp_outputs) == sorted(str(record["id"]) for record in records)

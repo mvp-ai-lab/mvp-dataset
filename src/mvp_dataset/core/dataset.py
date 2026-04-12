@@ -241,9 +241,11 @@ class Dataset(torch_iterabledataset_class()):
 
         logger = get_logger()
         rank = self.context.rank
+        dp_rank = self.context.mesh.dp_rank if self.context.mesh is not None else rank
+        is_dp_leader = self.context.mesh.is_dp_leader if self.context.mesh is not None else True
         cache_root = Path(cache_dir).absolute()
         final_cache_uri = cache_root / f"{plan_fp}.lance"
-        rank_cache_uri = cache_root / f"{plan_fp}-{rank}.lance"
+        rank_cache_uri = cache_root / f"{plan_fp}-dp{dp_rank}.lance"
         unsupported_pre_cache_stage_kinds = sorted(
             {
                 spec.kind
@@ -263,65 +265,75 @@ class Dataset(torch_iterabledataset_class()):
 
         if not final_cache_uri.exists():
             # Remove any stale per-rank cache from a previous incomplete run.
-            if rank_cache_uri.exists():
+            if is_dp_leader and rank_cache_uri.exists():
                 shutil.rmtree(rank_cache_uri, ignore_errors=True)
 
-            n_source = len(self._source)
-            logger.info(
-                "<MVP Dataset - rank %d> cache: building %s (%d source items, %d workers)",
-                rank,
-                rank_cache_uri.name,
-                n_source,
-                cache_num_workers,
-            )
+            if is_dp_leader:
+                n_source = len(self._source)
+                logger.info(
+                    "<MVP Dataset - rank %d> cache: building %s (%d source items, %d workers)",
+                    rank,
+                    rank_cache_uri.name,
+                    n_source,
+                    cache_num_workers,
+                )
 
-            # Split stages: parallelizable prefix runs in a thread pool; the rest run serially.
-            split = next(
-                (i for i, s in enumerate(self._stages) if s.kind not in PARALLELIZABLE_STAGE_KINDS),
-                len(self._stages),
-            )
-            parallel_specs = self._stages[:split]
-            serial_specs = self._stages[split:]
+                # Split stages: parallelizable prefix runs in a thread pool; the rest run serially.
+                split = next(
+                    (i for i, s in enumerate(self._stages) if s.kind not in PARALLELIZABLE_STAGE_KINDS),
+                    len(self._stages),
+                )
+                parallel_specs = self._stages[:split]
+                serial_specs = self._stages[split:]
 
-            source_shard_stream = iter_items(self._source, context=self.context, resample=False)
-            stream: Iterable[object] = iter_stage_group(
-                self._iter_source_stream(source_shard_stream), parallel_specs, cache_num_workers
-            )
-            for spec in serial_specs:
-                stream = spec.apply(stream)
+                source_shard_stream = iter_items(self._source, context=self.context, resample=False)
+                stream: Iterable[object] = iter_stage_group(
+                    self._iter_source_stream(source_shard_stream), parallel_specs, cache_num_workers
+                )
+                for spec in serial_specs:
+                    stream = spec.apply(stream)
 
-            # Wrap with a progress-logging passthrough before handing off to the lance writer.
-            t0 = time.monotonic()
-            count = 0
-            last_log = t0
+                # Wrap with a progress-logging passthrough before handing off to the lance writer.
+                t0 = time.monotonic()
+                count = 0
+                last_log = t0
 
-            def _log_progress(data: Iterable[object]) -> Iterator[object]:
-                nonlocal count, last_log
-                for item in data:
-                    count += 1
-                    now = time.monotonic()
-                    if now - last_log >= 10.0:
-                        elapsed = now - t0
-                        logger.info(
-                            "<MVP Dataset - rank %d> cache: %d/%d samples written (%.1f samples/s)",
-                            rank,
-                            count,
-                            n_source,
-                            count / elapsed,
-                        )
-                        last_log = now
-                    yield item
+                def _log_progress(data: Iterable[object]) -> Iterator[object]:
+                    nonlocal count, last_log
+                    for item in data:
+                        count += 1
+                        now = time.monotonic()
+                        if now - last_log >= 10.0:
+                            elapsed = now - t0
+                            logger.info(
+                                "<MVP Dataset - rank %d> cache: %d/%d samples written (%.1f samples/s)",
+                                rank,
+                                count,
+                                n_source,
+                                count / elapsed,
+                            )
+                            last_log = now
+                        yield item
 
-            _write_lance_dataset(_log_progress(stream), str(rank_cache_uri), max_rows_per_group=max_rows_per_fragment)
+                _write_lance_dataset(
+                    _log_progress(stream),
+                    str(rank_cache_uri),
+                    max_rows_per_group=max_rows_per_fragment,
+                )
 
-            elapsed = time.monotonic() - t0
-            logger.info(
-                "<MVP Dataset - rank %d> cache: done — %d samples in %.1fs (%.1f samples/s)",
-                rank,
-                count,
-                elapsed,
-                count / elapsed if elapsed > 0 else 0,
-            )
+                elapsed = time.monotonic() - t0
+                logger.info(
+                    "<MVP Dataset - rank %d> cache: done — %d samples in %.1fs (%.1f samples/s)",
+                    rank,
+                    count,
+                    elapsed,
+                    count / elapsed if elapsed > 0 else 0,
+                )
+            else:
+                logger.info(
+                    "<MVP Dataset - rank %d> cache: skipping local build because this rank is not the DP leader",
+                    rank,
+                )
 
             # Barrier 1: wait for all ranks to finish writing their per-rank lance.
             FileBarrier(
@@ -334,7 +346,7 @@ class Dataset(torch_iterabledataset_class()):
             if rank == 0:
                 logger.info("<MVP Dataset - rank %d> cache: merging per-rank datasets", rank)
                 merge_lance(
-                    uris=[str(p) for p in sorted(cache_root.glob(f"{plan_fp}-*.lance"))],
+                    uris=[str(p) for p in sorted(cache_root.glob(f"{plan_fp}-dp*.lance"))],
                     out_uri=str(final_cache_uri),
                 )
                 logger.info("<MVP Dataset - rank %d> cache: merge done", rank)
