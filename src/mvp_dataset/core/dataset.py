@@ -2,126 +2,31 @@
 
 from __future__ import annotations
 
-import importlib
-import queue
-import random
 import shutil
-from collections import deque
+import time
 from collections.abc import Callable, Iterable, Iterator
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 from pathlib import Path
-from types import ModuleType
 
 from mvp_dataset.cache.store import merge_lance
 from mvp_dataset.utils.barrier import FileBarrier
 
 from ..log import get_logger
-from ..pipeline.ops import (
-    assemble_samples,
-    batch_samples,
-    map_samples,
-    select_samples,
-    shuffle_samples,
-    unbatch_samples,
-)
 from ..utils.sharding import iter_items
 from .context import RuntimeContext
+from .stages import (
+    PARALLELIZABLE_STAGE_KINDS,
+    _AssembleStage,
+    _BatchStage,
+    _MapStage,
+    _SelectStage,
+    _ShuffleStage,
+    _UnbatchStage,
+    iter_stage_group,
+    torch_iterabledataset_class,
+)
 from .types import Assembler, CacheSpec, SourceKind, SourceStore, StageSpec
-
-
-def torch_iterabledataset_class(
-    import_module: Callable[[str], ModuleType] = importlib.import_module,
-) -> type:
-    """Resolve ``torch.utils.data.IterableDataset`` with a no-torch fallback."""
-
-    try:
-        torch_utils_data = import_module("torch.utils.data")
-    except ModuleNotFoundError:
-
-        class _IterableDatasetFallback:
-            """Fallback IterableDataset shim when torch is unavailable."""
-
-        return _IterableDatasetFallback
-
-    return torch_utils_data.IterableDataset
-
-
-@dataclass(frozen=True, slots=True)
-class _MapStage:
-    fn: Callable[[object], object]
-
-    def __call__(self, data: Iterable[object]) -> Iterable[object]:
-        return map_samples(data, self.fn)
-
-
-@dataclass(frozen=True, slots=True)
-class _ShuffleStage:
-    context: RuntimeContext
-    buffer_size: int
-    initial: int | None = None
-
-    def __call__(self, data: Iterable[object]) -> Iterable[object]:
-        runtime_context = RuntimeContext.from_runtime(base=self.context)
-        seed = runtime_context.sample_shuffle_seed
-        rng = random.Random(seed)
-        return shuffle_samples(data, buffer_size=self.buffer_size, initial=self.initial, rng=rng)
-
-
-@dataclass(frozen=True, slots=True)
-class _SelectStage:
-    fields: tuple[str, ...]
-
-    def __call__(self, data: Iterable[object]) -> Iterable[object]:
-        return select_samples(data, self.fields)
-
-
-@dataclass(frozen=True, slots=True)
-class _BatchStage:
-    batch_size: int
-    drop_last: bool = False
-    collate_fn: Callable[[list[object]], object] | None = None
-
-    def __call__(self, data: Iterable[object]) -> Iterable[object]:
-        return batch_samples(
-            data,
-            batch_size=self.batch_size,
-            drop_last=self.drop_last,
-            collate_fn=self.collate_fn,
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class _AssemblerFactoryAdapter:
-    factory: Callable[[RuntimeContext], Assembler[object, object]]
-    context: RuntimeContext
-
-    def __call__(self) -> Assembler[object, object]:
-        return self.factory(self.context)
-
-
-@dataclass(frozen=True, slots=True)
-class _AssembleStage:
-    factory: Callable[[RuntimeContext], Assembler[object, object]]
-    context: RuntimeContext
-    drop_last: bool = False
-
-    def __call__(self, data: Iterable[object]) -> Iterable[object]:
-        return assemble_samples(
-            data,
-            factory=_AssemblerFactoryAdapter(self.factory, self.context),
-            drop_last=self.drop_last,
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class _UnbatchStage:
-    def __call__(self, data: Iterable[object]) -> Iterable[object]:
-        return unbatch_samples(data)
-
-
-_CACHE_PARALLELIZABLE_STAGE_KINDS = frozenset({"map"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,15 +49,6 @@ class Dataset(torch_iterabledataset_class()):
     _cache_spec: CacheSpec | None = None
 
     def _append_stage(self, spec: StageSpec) -> Dataset:
-        """Return a new dataset with one extra lazy stage.
-
-        Args:
-            spec: Stage spec to append to the pipeline.
-
-        Returns:
-            A new :class:`Dataset` sharing the same source and context.
-        """
-
         return dataclass_replace(self, _stages=self._stages + (spec,))
 
     def map(self, fn: Callable[[object], object]) -> Dataset:
@@ -302,13 +198,15 @@ class Dataset(torch_iterabledataset_class()):
 
         Raises:
             ValueError: On double cache, unsupported stages before cache,
-                lambda/closure usage, or incremental mode with non-Lance source.
+                or lambda/closure usage.
         """
         from ..cache.fingerprint import (
             hash_bytes,
             is_stable_function,
             source_fingerprint,
         )
+        from ..cache.store import _write_lance_dataset
+        from ..sources.lance.dataset import LanceDataset
 
         if self._cache_spec is not None:
             msg = "[CacheError] only one .cache() boundary allowed"
@@ -332,9 +230,7 @@ class Dataset(torch_iterabledataset_class()):
                 raise ValueError(msg)
 
         stage_fps = [s.fn_fingerprint for s in self._stages if s.fn_fingerprint and s.trace_policy == "traceable"]
-        source_id = source_fingerprint(self._source)
-
-        plan_fp = hash_bytes(source_id, *stage_fps)
+        plan_fp = hash_bytes(source_fingerprint(self._source), *stage_fps)
 
         cache_spec = CacheSpec(
             boundary_index=len(self._stages),
@@ -343,207 +239,117 @@ class Dataset(torch_iterabledataset_class()):
             plan_fingerprint=plan_fp,
         )
 
-        # Build cache in this stage
-        import threading
-        import time as _time
-
-        from ..cache.store import _write_lance_dataset
-        from ..sources.lance.dataset import LanceDataset
-
         logger = get_logger()
         rank = self.context.rank
-
-        cache_root = Path(cache_spec.cache_dir).absolute()
-        final_cache_uri = cache_root / f"{cache_spec.plan_fingerprint}.lance"
-        local_final_cache_uri = cache_root / f"{cache_spec.plan_fingerprint}-{rank}.lance"
+        cache_root = Path(cache_dir).absolute()
+        final_cache_uri = cache_root / f"{plan_fp}.lance"
+        rank_cache_uri = cache_root / f"{plan_fp}-{rank}.lance"
 
         if not final_cache_uri.exists():
-            # remove any stale local cache from previous runs that didn't complete
-            if local_final_cache_uri.exists():
-                if local_final_cache_uri.is_file():
-                    local_final_cache_uri.unlink()
-                else:
-                    shutil.rmtree(local_final_cache_uri, ignore_errors=True)
+            # Remove any stale per-rank cache from a previous incomplete run.
+            if rank_cache_uri.exists():
+                shutil.rmtree(rank_cache_uri, ignore_errors=True)
 
-            pre_specs = self._stages
             n_source = len(self._source)
-
             logger.info(
                 "<MVP Dataset - rank %d> cache: building %s (%d source items, %d workers)",
                 rank,
-                local_final_cache_uri.name,
+                rank_cache_uri.name,
                 n_source,
-                cache_spec.cache_num_workers,
+                cache_num_workers,
             )
 
-            source_shard_stream = iter_items(
-                self._source,
-                context=self.context,
-                resample=False,
+            # Split stages: parallelizable prefix runs in a thread pool; the rest run serially.
+            split = next(
+                (i for i, s in enumerate(self._stages) if s.kind not in PARALLELIZABLE_STAGE_KINDS),
+                len(self._stages),
             )
-            source_stream = self._iter_source_stream(source_shard_stream)
-            parallel_prefix_len = 0
-            for spec in pre_specs:
-                if spec.kind not in _CACHE_PARALLELIZABLE_STAGE_KINDS:
-                    break
-                parallel_prefix_len += 1
+            parallel_specs = self._stages[:split]
+            serial_specs = self._stages[split:]
 
-            parallel_specs = pre_specs[:parallel_prefix_len]
-            serial_specs = pre_specs[parallel_prefix_len:]
-
-            def _apply_parallel_group(item: object, specs: tuple[StageSpec, ...]) -> object:
-                stream = iter((item,))
-                for spec in specs:
-                    stream = spec.apply(stream)
-                outputs = list(stream)
-                if len(outputs) != 1:
-                    msg = "[CacheError] pre-cache map stages must preserve one input sample -> one output sample"
-                    raise ValueError(msg)
-                return outputs[0]
-
-            def _iter_parallel_group(data: Iterable[object], specs: tuple[StageSpec, ...]) -> Iterator[object]:
-                if not specs:
-                    yield from data
-                    return
-
-                if cache_spec.cache_num_workers == 1:
-                    for item in data:
-                        yield _apply_parallel_group(item, specs)
-                    return
-
-                max_inflight = max(1, cache_spec.cache_num_workers * 2)
-                with ThreadPoolExecutor(max_workers=cache_spec.cache_num_workers) as executor:
-                    pending = deque()
-                    for item in data:
-                        pending.append(executor.submit(_apply_parallel_group, item, specs))
-                        if len(pending) >= max_inflight:
-                            yield pending.popleft().result()
-                    while pending:
-                        yield pending.popleft().result()
-
-            processed_stream: Iterable[object] = _iter_parallel_group(source_stream, parallel_specs)
+            source_shard_stream = iter_items(self._source, context=self.context, resample=False)
+            stream: Iterable[object] = iter_stage_group(
+                self._iter_source_stream(source_shard_stream), parallel_specs, cache_num_workers
+            )
             for spec in serial_specs:
-                processed_stream = spec.apply(processed_stream)
-            _t0 = _time.monotonic()
-            max_inflight = max(1, cache_spec.cache_num_workers * 2)
-            result_queue: queue.Queue[object] = queue.Queue(maxsize=max_inflight)
-            sentinel = object()
-            producer_error: list[BaseException] = []
+                stream = spec.apply(stream)
 
-            _consumed = 0
-            _last_log_time = _t0
+            # Wrap with a progress-logging passthrough before handing off to the lance writer.
+            t0 = time.monotonic()
+            count = 0
+            last_log = t0
 
-            def _producer() -> None:
-                try:
-                    for item in processed_stream:
-                        result_queue.put(item)
-                except BaseException as exc:  # noqa: BLE001
-                    producer_error.append(exc)
-                finally:
-                    result_queue.put(sentinel)
-
-            producer_thread = threading.Thread(target=_producer, daemon=True)
-            producer_thread.start()
-
-            def _streaming_results() -> Iterator[object]:
-                nonlocal _consumed, _last_log_time
-                while True:
-                    item = result_queue.get()
-                    if item is sentinel:
-                        break
-                    _consumed += 1
-                    now = _time.monotonic()
-                    if now - _last_log_time >= 10.0:
-                        elapsed = now - _t0
-                        rate = _consumed / elapsed if elapsed > 0 else 0
+            def _log_progress(data: Iterable[object]) -> Iterator[object]:
+                nonlocal count, last_log
+                for item in data:
+                    count += 1
+                    now = time.monotonic()
+                    if now - last_log >= 10.0:
+                        elapsed = now - t0
                         logger.info(
                             "<MVP Dataset - rank %d> cache: %d/%d samples written (%.1f samples/s)",
                             rank,
-                            _consumed,
+                            count,
                             n_source,
-                            rate,
+                            count / elapsed,
                         )
-                        _last_log_time = now
+                        last_log = now
                     yield item
-                if producer_error:
-                    raise producer_error[0]
 
-            _write_lance_dataset(
-                _streaming_results(),
-                str(local_final_cache_uri),
-                max_rows_per_group=max_rows_per_fragment,
-            )
-            producer_thread.join()
+            _write_lance_dataset(_log_progress(stream), str(rank_cache_uri), max_rows_per_group=max_rows_per_fragment)
 
-            elapsed = _time.monotonic() - _t0
-            rate = _consumed / elapsed if elapsed > 0 else 0
+            elapsed = time.monotonic() - t0
             logger.info(
-                "<MVP Dataset - rank %d> cache: done — %d samples written in %.1fs (%.1f samples/s)",
+                "<MVP Dataset - rank %d> cache: done — %d samples in %.1fs (%.1f samples/s)",
                 rank,
-                _consumed,
+                count,
                 elapsed,
-                rate,
+                count / elapsed if elapsed > 0 else 0,
             )
 
-            # barrier 1: wait for all ranks to finish writing per-rank lance
+            # Barrier 1: wait for all ranks to finish writing their per-rank lance.
             FileBarrier(
-                shared_path=str(cache_root / f"{cache_spec.plan_fingerprint}-write-barrier"),
+                shared_path=str(cache_root / f"{plan_fp}-write-barrier"),
                 world_size=self.context.world_size,
-                rank=self.context.rank,
+                rank=rank,
             ).wait()
 
-            # merge from rank 0 only
+            # Rank 0 merges all per-rank lance datasets into the final shared one.
             if rank == 0:
                 logger.info("<MVP Dataset - rank %d> cache: merging per-rank datasets", rank)
                 merge_lance(
-                    uris=[str(p) for p in sorted(cache_root.glob(f"{cache_spec.plan_fingerprint}-*.lance"))],
+                    uris=[str(p) for p in sorted(cache_root.glob(f"{plan_fp}-*.lance"))],
                     out_uri=str(final_cache_uri),
                 )
                 logger.info("<MVP Dataset - rank %d> cache: merge done", rank)
 
-            # barrier 2: wait for merge to complete before any rank reads
+            # Barrier 2: all ranks wait for merge to complete before reading.
             FileBarrier(
-                shared_path=str(cache_root / f"{cache_spec.plan_fingerprint}-merge-barrier"),
+                shared_path=str(cache_root / f"{plan_fp}-merge-barrier"),
                 world_size=self.context.world_size,
-                rank=self.context.rank,
+                rank=rank,
             ).wait()
 
         else:
             logger.info("<MVP Dataset - rank %d> cache: loading existing %s", rank, final_cache_uri.name)
 
-        # Replace source with cache dataset
-        cache_database_draft = LanceDataset.from_source(final_cache_uri, context=self.context, resample=self._resample)
-
+        cache_dataset = LanceDataset.from_source(final_cache_uri, context=self.context, resample=self._resample)
         return dataclass_replace(
             self,
             _source_kind="lance",
-            _source=cache_database_draft._source,
-            _iter_source_stream=cache_database_draft._iter_source_stream,
+            _source=cache_dataset._source,
+            _iter_source_stream=cache_dataset._iter_source_stream,
             _stages=(),
             _cache_spec=cache_spec,
         )
 
     def __iter__(self) -> Iterator[object]:
-        """Materialize and run the full lazy pipeline.
-
-        Returns:
-            An iterator over samples or batch objects produced by the dataset's
-            source backend followed by all appended pipeline stages.
-        """
+        """Materialize and run the full lazy pipeline."""
         context = RuntimeContext.from_runtime(base=self.context)
-        stream: Iterable[object]
-
-        source_shard_stream = iter_items(
-            self._source,
-            context=context,
-            resample=self._resample,
-        )
-
-        stream = self._iter_source_stream(source_shard_stream)
-
+        source_shard_stream = iter_items(self._source, context=context, resample=self._resample)
+        stream: Iterable[object] = self._iter_source_stream(source_shard_stream)
         for spec in self._stages:
             stream = spec.apply(stream)
-
         yield from stream
 
     @classmethod
