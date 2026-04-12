@@ -15,6 +15,9 @@ class LoggerLike(Protocol):
     def info(self, msg: object, *args: object, **kwargs: object) -> object:
         """Log an info-level message."""
 
+    def warning(self, msg: object, *args: object, **kwargs: object) -> object:
+        """Log a warning-level message."""
+
     def error(self, msg: object, *args: object, **kwargs: object) -> object:
         """Log an error-level message."""
 

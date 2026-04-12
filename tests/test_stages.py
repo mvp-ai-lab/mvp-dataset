@@ -8,7 +8,9 @@ from dataclasses import dataclass, field
 import pytest
 
 import mvp_dataset.core.dataset as dataset_module
+import mvp_dataset.core.stages as stages_module
 from mvp_dataset import Dataset, RuntimeContext, TorchLoader
+from mvp_dataset.log import reset_logger, set_logger
 
 from .helpers import build_records, write_parquet_file
 
@@ -107,7 +109,7 @@ def test_shuffle_stage_uses_runtime_worker_specific_seed(tmp_path, monkeypatch) 
         recorded_rng_outputs.append(rng.random())
         yield from data
 
-    monkeypatch.setattr(dataset_module, "shuffle_samples", fake_shuffle_samples)
+    monkeypatch.setattr(stages_module, "shuffle_samples", fake_shuffle_samples)
 
     def worker_zero_runtime(*, base=None, **_kwargs):
         assert base is not None
@@ -149,6 +151,59 @@ def test_shuffle_stage_uses_runtime_worker_specific_seed(tmp_path, monkeypatch) 
 
     assert len(recorded_rng_outputs) == 2
     assert recorded_rng_outputs[0] != recorded_rng_outputs[1]
+
+
+def test_assemble_stage_uses_runtime_worker_specific_context(tmp_path, monkeypatch) -> None:
+    records = build_records(count=4)
+    dataset = _build_parquet_dataset(tmp_path, records, seed=11).assemble(build_pair_sum_assembler)
+
+    recorded_worker_ids: list[int] = []
+
+    def recording_factory(context: RuntimeContext) -> PairSumAssembler:
+        recorded_worker_ids.append(context.worker_id)
+        return PairSumAssembler()
+
+    dataset = _build_parquet_dataset(tmp_path, records, seed=11).assemble(recording_factory)
+
+    def worker_zero_runtime(*, base=None, **_kwargs):
+        assert base is not None
+        return RuntimeContext(
+            rank=base.rank,
+            world_size=base.world_size,
+            local_rank=base.local_rank,
+            local_world_size=base.local_world_size,
+            node_rank=base.node_rank,
+            num_nodes=base.num_nodes,
+            worker_id=0,
+            num_workers=2,
+            epoch=base.epoch,
+            seed=base.seed,
+            mesh=base.mesh,
+        )
+
+    def worker_one_runtime(*, base=None, **_kwargs):
+        assert base is not None
+        return RuntimeContext(
+            rank=base.rank,
+            world_size=base.world_size,
+            local_rank=base.local_rank,
+            local_world_size=base.local_world_size,
+            node_rank=base.node_rank,
+            num_nodes=base.num_nodes,
+            worker_id=1,
+            num_workers=2,
+            epoch=base.epoch,
+            seed=base.seed,
+            mesh=base.mesh,
+        )
+
+    monkeypatch.setattr(dataset_module.RuntimeContext, "from_runtime", worker_zero_runtime)
+    list(dataset)
+
+    monkeypatch.setattr(dataset_module.RuntimeContext, "from_runtime", worker_one_runtime)
+    list(dataset)
+
+    assert recorded_worker_ids == [0, 1]
 
 
 def test_batch_stage_groups_samples(tmp_path) -> None:
@@ -278,6 +333,37 @@ def test_cache_preserves_shuffle_stream_semantics(tmp_path) -> None:
     assert cached_samples == uncached_samples
 
 
+def test_cache_warns_when_shuffle_is_not_fingerprinted(tmp_path) -> None:
+    records = build_records()
+    warnings: list[str] = []
+
+    class _CapturingLogger:
+        def debug(self, _msg, *args, **kwargs):
+            return None
+
+        def info(self, _msg, *args, **kwargs):
+            return None
+
+        def warning(self, msg, *args, **kwargs):
+            warnings.append(str(msg % args if args else msg))
+            return None
+
+        def error(self, _msg, *args, **kwargs):
+            return None
+
+    set_logger(_CapturingLogger())
+    try:
+        _build_parquet_dataset(tmp_path, records, seed=13).shuffle(buffer_size=3).cache(
+            cache_dir=str(tmp_path / "cache")
+        )
+    finally:
+        reset_logger()
+
+    assert len(warnings) == 1
+    assert "not included in cache fingerprinting" in warnings[0]
+    assert "shuffle" in warnings[0]
+
+
 def test_cache_preserves_assemble_stream_semantics(tmp_path) -> None:
     records = build_records(count=5)
     uncached = _build_parquet_dataset(tmp_path, records).assemble(build_pair_sum_assembler)
@@ -291,6 +377,26 @@ def test_cache_preserves_assemble_stream_semantics(tmp_path) -> None:
     cached_samples = [_select_user_fields(sample, ("left_id", "right_id", "sum_value")) for sample in cached]
 
     assert cached_samples == uncached_samples
+
+
+def test_assemble_drop_last_changes_cache_fingerprint(tmp_path) -> None:
+    records = build_records(count=5)
+    cache_dir = tmp_path / "cache"
+
+    cached_keep_tail = (
+        _build_parquet_dataset(tmp_path, records)
+        .assemble(build_pair_sum_assembler, drop_last=False)
+        .cache(cache_dir=str(cache_dir))
+    )
+    cached_drop_tail = (
+        _build_parquet_dataset(tmp_path, records)
+        .assemble(build_pair_sum_assembler, drop_last=True)
+        .cache(cache_dir=str(cache_dir))
+    )
+
+    assert cached_keep_tail._cache_spec is not None
+    assert cached_drop_tail._cache_spec is not None
+    assert cached_keep_tail._cache_spec.plan_fingerprint != cached_drop_tail._cache_spec.plan_fingerprint
 
 
 def test_cache_preserves_assemble_stream_semantics_with_parallel_prefix(tmp_path) -> None:

@@ -99,9 +99,10 @@ class _AssembleStage:
     drop_last: bool = False
 
     def __call__(self, data: Iterable[object]) -> Iterable[object]:
+        runtime_context = RuntimeContext.from_runtime(base=self.context)
         return assemble_samples(
             data,
-            factory=_AssemblerFactoryAdapter(self.factory, self.context),
+            factory=_AssemblerFactoryAdapter(self.factory, runtime_context),
             drop_last=self.drop_last,
         )
 

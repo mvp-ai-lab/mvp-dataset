@@ -152,9 +152,9 @@ class Dataset(torch_iterabledataset_class()):
         Returns:
             A new dataset that assembles the upstream sample stream lazily.
         """
-        from ..cache.fingerprint import callable_fingerprint
+        from ..cache.fingerprint import callable_fingerprint, hash_bytes
 
-        fn_fp = callable_fingerprint(factory)
+        fn_fp = hash_bytes("<assemble>", callable_fingerprint(factory), drop_last)
         spec = StageSpec(
             kind="assemble",
             apply=_AssembleStage(factory=factory, context=self.context, drop_last=drop_last),
@@ -244,6 +244,22 @@ class Dataset(torch_iterabledataset_class()):
         cache_root = Path(cache_dir).absolute()
         final_cache_uri = cache_root / f"{plan_fp}.lance"
         rank_cache_uri = cache_root / f"{plan_fp}-{rank}.lance"
+        unsupported_pre_cache_stage_kinds = sorted(
+            {
+                spec.kind
+                for spec in self._stages
+                if spec.trace_policy == "unsupported" and spec.kind not in {"batch", "unbatch"}
+            }
+        )
+
+        if unsupported_pre_cache_stage_kinds:
+            logger.warning(
+                "<MVP Dataset - rank %d> cache: stages %s appear before .cache() but are not "
+                "included in cache fingerprinting; changing their parameters will not invalidate "
+                "the existing cache automatically",
+                rank,
+                unsupported_pre_cache_stage_kinds,
+            )
 
         if not final_cache_uri.exists():
             # Remove any stale per-rank cache from a previous incomplete run.
