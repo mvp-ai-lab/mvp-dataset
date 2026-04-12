@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import pickle
 
 import pytest
 
@@ -48,3 +49,24 @@ def test_single_process_reading_across_sources(tmp_path, source_kind: str, requi
     observed = [normalize_sample(sample) for sample in dataset]
 
     assert observed == records
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "requires_lance"),
+    [
+        ("tars", False),
+        ("jsonl", False),
+        ("parquet", False),
+        ("lance", True),
+    ],
+)
+def test_source_datasets_are_picklable(tmp_path, source_kind: str, requires_lance: bool) -> None:
+    if requires_lance and importlib.util.find_spec("lance") is None:
+        pytest.skip("lance is not installed")
+
+    records = build_records()
+    source = _build_source(tmp_path, source_kind, records)
+
+    dataset = Dataset.from_source(source_kind, shards=source)
+
+    pickle.dumps(dataset)

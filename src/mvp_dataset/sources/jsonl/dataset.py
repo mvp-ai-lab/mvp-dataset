@@ -10,6 +10,17 @@ from .utils import iter_jsonls, split_jsonl_files
 
 
 @dataclass(frozen=True, slots=True)
+class _JsonlSourceIter:
+    ref_fields: tuple[RefFieldSpec, ...] = ()
+
+    def __call__(self, shard_stream):
+        return iter_jsonls(
+            shard_stream,
+            ref_fields=self.ref_fields,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class JsonlDataset(Dataset):
     _ref_fields: tuple[RefFieldSpec, ...] = ()
 
@@ -46,18 +57,12 @@ class JsonlDataset(Dataset):
 
         ref_fields_tuple = tuple(ref_fields) if ref_fields else ()
 
-        def _iter_source(shard_stream):
-            return iter_jsonls(
-                shard_stream,
-                ref_fields=ref_fields_tuple,
-            )
-
         return cls(
             context=runtime_context,
             _source=source_items,
             _resample=resample,
             _source_kind="jsonl",
             _stages=(),
-            _iter_source_stream=_iter_source,
+            _iter_source_stream=_JsonlSourceIter(ref_fields_tuple),
             _ref_fields=ref_fields_tuple,
         )

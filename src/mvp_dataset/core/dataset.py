@@ -49,6 +49,79 @@ def torch_iterabledataset_class(
 
 
 @dataclass(frozen=True, slots=True)
+class _MapStage:
+    fn: Callable[[object], object]
+
+    def __call__(self, data: Iterable[object]) -> Iterable[object]:
+        return map_samples(data, self.fn)
+
+
+@dataclass(frozen=True, slots=True)
+class _ShuffleStage:
+    context: RuntimeContext
+    buffer_size: int
+    initial: int | None = None
+
+    def __call__(self, data: Iterable[object]) -> Iterable[object]:
+        runtime_context = RuntimeContext.from_runtime(base=self.context)
+        seed = runtime_context.sample_shuffle_seed
+        rng = random.Random(seed)
+        return shuffle_samples(data, buffer_size=self.buffer_size, initial=self.initial, rng=rng)
+
+
+@dataclass(frozen=True, slots=True)
+class _SelectStage:
+    fields: tuple[str, ...]
+
+    def __call__(self, data: Iterable[object]) -> Iterable[object]:
+        return select_samples(data, self.fields)
+
+
+@dataclass(frozen=True, slots=True)
+class _BatchStage:
+    batch_size: int
+    drop_last: bool = False
+    collate_fn: Callable[[list[object]], object] | None = None
+
+    def __call__(self, data: Iterable[object]) -> Iterable[object]:
+        return batch_samples(
+            data,
+            batch_size=self.batch_size,
+            drop_last=self.drop_last,
+            collate_fn=self.collate_fn,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _AssemblerFactoryAdapter:
+    factory: Callable[[RuntimeContext], Assembler[object, object]]
+    context: RuntimeContext
+
+    def __call__(self) -> Assembler[object, object]:
+        return self.factory(self.context)
+
+
+@dataclass(frozen=True, slots=True)
+class _AssembleStage:
+    factory: Callable[[RuntimeContext], Assembler[object, object]]
+    context: RuntimeContext
+    drop_last: bool = False
+
+    def __call__(self, data: Iterable[object]) -> Iterable[object]:
+        return assemble_samples(
+            data,
+            factory=_AssemblerFactoryAdapter(self.factory, self.context),
+            drop_last=self.drop_last,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _UnbatchStage:
+    def __call__(self, data: Iterable[object]) -> Iterable[object]:
+        return unbatch_samples(data)
+
+
+@dataclass(frozen=True, slots=True)
 class Dataset(torch_iterabledataset_class()):
     """Chainable iterable dataset built from local shard sources.
 
@@ -91,11 +164,7 @@ class Dataset(torch_iterabledataset_class()):
         from ..cache.fingerprint import callable_fingerprint
 
         fn_fp = callable_fingerprint(fn)
-
-        def _apply(data: Iterable[object]) -> Iterable[object]:
-            return map_samples(data, fn)
-
-        spec = StageSpec(kind="map", apply=_apply, fn_fingerprint=fn_fp, fn_ref=fn, trace_policy="traceable")
+        spec = StageSpec(kind="map", apply=_MapStage(fn), fn_fingerprint=fn_fp, fn_ref=fn, trace_policy="traceable")
         return self._append_stage(spec)
 
     def shuffle(self, buffer_size: int, initial: int | None = None) -> Dataset:
@@ -111,14 +180,9 @@ class Dataset(torch_iterabledataset_class()):
             A new dataset with bounded-memory shuffling applied lazily.
         """
 
-        def _apply(data: Iterable[object]) -> Iterable[object]:
-            seed = self.context.sample_shuffle_seed
-            rng = random.Random(seed)
-            return shuffle_samples(data, buffer_size=buffer_size, initial=initial, rng=rng)
-
         spec = StageSpec(
             kind="shuffle",
-            apply=_apply,
+            apply=_ShuffleStage(context=self.context, buffer_size=buffer_size, initial=initial),
             trace_policy="unsupported",
         )
         return self._append_stage(spec)
@@ -134,12 +198,9 @@ class Dataset(torch_iterabledataset_class()):
         selected_fields = tuple(fields)
         select_fp = hash_bytes("<select>", *selected_fields)
 
-        def _apply(data: Iterable[object]) -> Iterable[object]:
-            return select_samples(data, selected_fields)
-
         spec = StageSpec(
             kind="select",
-            apply=_apply,
+            apply=_SelectStage(selected_fields),
             fn_fingerprint=select_fp,
             trace_policy="traceable",
         )
@@ -163,17 +224,13 @@ class Dataset(torch_iterabledataset_class()):
             A new dataset that yields batches instead of individual samples.
         """
 
-        def _apply(data: Iterable[object]) -> Iterable[object]:
-            return batch_samples(
-                data,
+        spec = StageSpec(
+            kind="batch",
+            apply=_BatchStage(
                 batch_size=batch_size,
                 drop_last=drop_last,
                 collate_fn=collate_fn,
-            )
-
-        spec = StageSpec(
-            kind="batch",
-            apply=_apply,
+            ),
             trace_policy="unsupported",
         )
         return self._append_stage(spec)
@@ -198,17 +255,14 @@ class Dataset(torch_iterabledataset_class()):
         """
         from ..cache.fingerprint import callable_fingerprint
 
-        ctx = self.context
         fn_fp = callable_fingerprint(factory)
-
-        def _apply(data: Iterable[object]) -> Iterable[object]:
-            return assemble_samples(
-                data,
-                factory=lambda: factory(ctx),
-                drop_last=drop_last,
-            )
-
-        spec = StageSpec(kind="assemble", apply=_apply, fn_fingerprint=fn_fp, fn_ref=factory, trace_policy="traceable")
+        spec = StageSpec(
+            kind="assemble",
+            apply=_AssembleStage(factory=factory, context=self.context, drop_last=drop_last),
+            fn_fingerprint=fn_fp,
+            fn_ref=factory,
+            trace_policy="traceable",
+        )
         return self._append_stage(spec)
 
     def unbatch(self) -> Dataset:
@@ -219,12 +273,9 @@ class Dataset(torch_iterabledataset_class()):
             into individual samples during iteration.
         """
 
-        def _apply(data: Iterable[object]) -> Iterable[object]:
-            return unbatch_samples(data)
-
         spec = StageSpec(
             kind="unbatch",
-            apply=_apply,
+            apply=_UnbatchStage(),
             trace_policy="unsupported",
         )
         return self._append_stage(spec)

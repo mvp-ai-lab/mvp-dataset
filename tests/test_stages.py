@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import pickle
 from dataclasses import dataclass, field
 
-from mvp_dataset import Dataset, RuntimeContext
+import mvp_dataset.core.dataset as dataset_module
+from mvp_dataset import Dataset, RuntimeContext, TorchLoader
 
 from .helpers import build_records, write_parquet_file
 
@@ -17,18 +19,26 @@ def _sample_ids(stream) -> list[str]:
     return [str(sample["id"]) for sample in stream]
 
 
+def add_mapped_flag(sample: object) -> object:
+    if not isinstance(sample, dict):
+        return sample
+    return {
+        **sample,
+        "mapped": True,
+    }
+
+
+def identity_collate(batch: list[object]) -> list[object]:
+    return batch
+
+
 def test_map_stage_transforms_each_sample(tmp_path) -> None:
     records = build_records()
-    dataset = _build_parquet_dataset(tmp_path, records).map(
-        lambda sample: {
-            **sample,
-            "double_value": int(sample["value"]) * 2,
-        }
-    )
+    dataset = _build_parquet_dataset(tmp_path, records).map(add_mapped_flag)
 
-    observed = [int(sample["double_value"]) for sample in dataset]
+    observed = [bool(sample["mapped"]) for sample in dataset]
 
-    assert observed == [int(record["value"]) * 2 for record in records]
+    assert observed == [True for _ in records]
 
 
 def test_select_stage_keeps_requested_fields_and_metadata(tmp_path) -> None:
@@ -49,6 +59,60 @@ def test_shuffle_stage_is_deterministic_for_fixed_seed(tmp_path) -> None:
 
     assert shuffled_once == shuffled_twice
     assert set(shuffled_once) == {str(record["id"]) for record in records}
+
+
+def test_shuffle_stage_uses_runtime_worker_specific_seed(tmp_path, monkeypatch) -> None:
+    records = build_records()
+    dataset = _build_parquet_dataset(tmp_path, records, seed=11).shuffle(buffer_size=3)
+
+    recorded_rng_outputs: list[float] = []
+
+    def fake_shuffle_samples(data, *, buffer_size, initial, rng):
+        recorded_rng_outputs.append(rng.random())
+        yield from data
+
+    monkeypatch.setattr(dataset_module, "shuffle_samples", fake_shuffle_samples)
+
+    def worker_zero_runtime(*, base=None, **_kwargs):
+        assert base is not None
+        return RuntimeContext(
+            rank=base.rank,
+            world_size=base.world_size,
+            local_rank=base.local_rank,
+            local_world_size=base.local_world_size,
+            node_rank=base.node_rank,
+            num_nodes=base.num_nodes,
+            worker_id=0,
+            num_workers=2,
+            epoch=base.epoch,
+            seed=base.seed,
+            mesh=base.mesh,
+        )
+
+    def worker_one_runtime(*, base=None, **_kwargs):
+        assert base is not None
+        return RuntimeContext(
+            rank=base.rank,
+            world_size=base.world_size,
+            local_rank=base.local_rank,
+            local_world_size=base.local_world_size,
+            node_rank=base.node_rank,
+            num_nodes=base.num_nodes,
+            worker_id=1,
+            num_workers=2,
+            epoch=base.epoch,
+            seed=base.seed,
+            mesh=base.mesh,
+        )
+
+    monkeypatch.setattr(dataset_module.RuntimeContext, "from_runtime", worker_zero_runtime)
+    list(dataset)
+
+    monkeypatch.setattr(dataset_module.RuntimeContext, "from_runtime", worker_one_runtime)
+    list(dataset)
+
+    assert len(recorded_rng_outputs) == 2
+    assert recorded_rng_outputs[0] != recorded_rng_outputs[1]
 
 
 def test_batch_stage_groups_samples(tmp_path) -> None:
@@ -104,6 +168,36 @@ class PairSumAssembler:
 
 def build_pair_sum_assembler(_context: RuntimeContext) -> PairSumAssembler:
     return PairSumAssembler()
+
+
+def test_dataset_stage_apply_objects_are_picklable(tmp_path) -> None:
+    records = build_records()
+
+    apply_objects = [
+        _build_parquet_dataset(tmp_path, records).map(add_mapped_flag)._stages[-1].apply,
+        _build_parquet_dataset(tmp_path, records).select(["id"])._stages[-1].apply,
+        _build_parquet_dataset(tmp_path, records, seed=5).shuffle(buffer_size=3)._stages[-1].apply,
+        _build_parquet_dataset(tmp_path, records).batch(2, collate_fn=identity_collate)._stages[-1].apply,
+        _build_parquet_dataset(tmp_path, records).assemble(build_pair_sum_assembler)._stages[-1].apply,
+        _build_parquet_dataset(tmp_path, records).unbatch()._stages[-1].apply,
+    ]
+
+    for apply in apply_objects:
+        pickle.dumps(apply)
+
+
+def test_loader_stage_objects_are_picklable(tmp_path) -> None:
+    records = build_records()
+    dataset = _build_parquet_dataset(tmp_path, records, seed=5)
+    loader = (
+        TorchLoader(dataset, num_workers=0, batch_size=2, collate_fn=identity_collate)
+        .unbatch()
+        .shuffle(buffer_size=3)
+        .batch(2, collate_fn=identity_collate)
+    )
+
+    for stage in loader._stages:
+        pickle.dumps(stage)
 
 
 def test_assemble_stage_flushes_tail_by_default(tmp_path) -> None:

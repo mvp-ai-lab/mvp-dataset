@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from mvp_dataset.core.context import RuntimeContext
 from mvp_dataset.core.dataset import Dataset
@@ -6,6 +7,21 @@ from mvp_dataset.core.types import ShardInput
 from mvp_dataset.utils.url import normalize_paths
 
 from .utils import iter_parquets, list_parquet_fragments
+
+
+@dataclass(frozen=True, slots=True)
+class _ParquetSourceIter:
+    columns: Sequence[str] | None = None
+    batch_size: int = 65536
+    use_threads: bool = True
+
+    def __call__(self, fragment_stream):
+        return iter_parquets(
+            fragment_stream,
+            columns=self.columns,
+            batch_size=self.batch_size,
+            use_threads=self.use_threads,
+        )
 
 
 class ParquetDataset(Dataset):
@@ -45,19 +61,15 @@ class ParquetDataset(Dataset):
             min_fragments=runtime_context.total_slots,
         )
 
-        def _iter_source(fragment_stream):
-            return iter_parquets(
-                fragment_stream,
-                columns=columns,
-                batch_size=batch_size,
-                use_threads=use_threads,
-            )
-
         return cls(
             context=runtime_context,
             _source=fragments,
             _resample=resample,
             _source_kind="parquet",
             _stages=(),
-            _iter_source_stream=_iter_source,
+            _iter_source_stream=_ParquetSourceIter(
+                columns=columns,
+                batch_size=batch_size,
+                use_threads=use_threads,
+            ),
         )

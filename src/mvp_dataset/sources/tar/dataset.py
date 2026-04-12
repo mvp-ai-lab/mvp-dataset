@@ -10,6 +10,17 @@ from .utils import iter_tars
 
 
 @dataclass(frozen=True, slots=True)
+class _TarSourceIter:
+    sidecars: tuple[SidecarSpec, ...] = ()
+
+    def __call__(self, shard_stream):
+        return iter_tars(
+            shard_stream,
+            sidecars=self.sidecars or None,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class TarDataset(Dataset):
     _sidecar_specs: tuple[SidecarSpec, ...] = ()
 
@@ -52,18 +63,12 @@ class TarDataset(Dataset):
 
         sidecar_specs = tuple(sidecars) if sidecars else ()
 
-        def _iter_source(shard_stream):
-            return iter_tars(
-                shard_stream,
-                sidecars=sidecar_specs or None,
-            )
-
         return cls(
             context=runtime_context,
             _source=normalized_shards,
             _resample=resample,
             _source_kind="tars",
             _stages=(),
-            _iter_source_stream=_iter_source,
+            _iter_source_stream=_TarSourceIter(sidecar_specs),
             _sidecar_specs=sidecar_specs,
         )
