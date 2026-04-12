@@ -1,12 +1,23 @@
 from __future__ import annotations
 
 import pickle
+import threading
+import time
 from dataclasses import dataclass, field
+
+import pytest
 
 import mvp_dataset.core.dataset as dataset_module
 from mvp_dataset import Dataset, RuntimeContext, TorchLoader
 
 from .helpers import build_records, write_parquet_file
+
+_OBSERVED_CACHE_THREAD_IDS: set[int] = set()
+_OBSERVED_CACHE_THREAD_IDS_LOCK = threading.Lock()
+_OBSERVED_CACHE_STAGE_ONE_THREAD_IDS: set[int] = set()
+_OBSERVED_CACHE_STAGE_ONE_THREAD_IDS_LOCK = threading.Lock()
+_OBSERVED_CACHE_STAGE_TWO_THREAD_IDS: set[int] = set()
+_OBSERVED_CACHE_STAGE_TWO_THREAD_IDS_LOCK = threading.Lock()
 
 
 def _build_parquet_dataset(tmp_path, records: list[dict[str, object]], *, seed: int = 0) -> Dataset:
@@ -17,6 +28,10 @@ def _build_parquet_dataset(tmp_path, records: list[dict[str, object]], *, seed: 
 
 def _sample_ids(stream) -> list[str]:
     return [str(sample["id"]) for sample in stream]
+
+
+def _select_user_fields(sample: dict[str, object], fields: tuple[str, ...]) -> dict[str, object]:
+    return {field: sample[field] for field in fields}
 
 
 def add_mapped_flag(sample: object) -> object:
@@ -30,6 +45,27 @@ def add_mapped_flag(sample: object) -> object:
 
 def identity_collate(batch: list[object]) -> list[object]:
     return batch
+
+
+def record_cache_thread(sample: object) -> object:
+    time.sleep(0.01)
+    with _OBSERVED_CACHE_THREAD_IDS_LOCK:
+        _OBSERVED_CACHE_THREAD_IDS.add(threading.get_ident())
+    return sample
+
+
+def record_cache_thread_stage_one(sample: object) -> object:
+    time.sleep(0.01)
+    with _OBSERVED_CACHE_STAGE_ONE_THREAD_IDS_LOCK:
+        _OBSERVED_CACHE_STAGE_ONE_THREAD_IDS.add(threading.get_ident())
+    return sample
+
+
+def record_cache_thread_stage_two(sample: object) -> object:
+    time.sleep(0.01)
+    with _OBSERVED_CACHE_STAGE_TWO_THREAD_IDS_LOCK:
+        _OBSERVED_CACHE_STAGE_TWO_THREAD_IDS.add(threading.get_ident())
+    return sample
 
 
 def test_map_stage_transforms_each_sample(tmp_path) -> None:
@@ -198,6 +234,154 @@ def test_loader_stage_objects_are_picklable(tmp_path) -> None:
 
     for stage in loader._stages:
         pickle.dumps(stage)
+
+
+@pytest.mark.parametrize(
+    ("expected_stage_kind", "builder"),
+    [
+        ("batch", lambda dataset: dataset.batch(2)),
+        ("batch", lambda dataset: dataset.batch(2).unbatch()),
+    ],
+)
+def test_cache_rejects_non_one_to_one_pre_cache_stages(tmp_path, expected_stage_kind: str, builder) -> None:
+    records = build_records()
+    dataset = _build_parquet_dataset(tmp_path, records)
+
+    with pytest.raises(ValueError, match=rf"\[CacheError\] '{expected_stage_kind}' cannot appear before \.cache\(\)"):
+        builder(dataset).cache(cache_dir=str(tmp_path / "cache"))
+
+
+def test_cache_accepts_one_to_one_pre_cache_stages(tmp_path) -> None:
+    records = build_records()
+    dataset = _build_parquet_dataset(tmp_path, records).map(add_mapped_flag).select(["id", "mapped"])
+
+    cached = dataset.cache(cache_dir=str(tmp_path / "cache"))
+
+    observed = [sample for sample in cached]
+
+    assert len(observed) == len(records)
+    assert all(sample["mapped"] is True for sample in observed)
+
+
+def test_cache_preserves_shuffle_stream_semantics(tmp_path) -> None:
+    records = build_records()
+    uncached = _build_parquet_dataset(tmp_path, records, seed=13).shuffle(buffer_size=3)
+    cached = (
+        _build_parquet_dataset(tmp_path, records, seed=13)
+        .shuffle(buffer_size=3)
+        .cache(cache_dir=str(tmp_path / "cache"))
+    )
+
+    uncached_samples = [_select_user_fields(sample, ("id", "text", "value")) for sample in uncached]
+    cached_samples = [_select_user_fields(sample, ("id", "text", "value")) for sample in cached]
+
+    assert cached_samples == uncached_samples
+
+
+def test_cache_preserves_assemble_stream_semantics(tmp_path) -> None:
+    records = build_records(count=5)
+    uncached = _build_parquet_dataset(tmp_path, records).assemble(build_pair_sum_assembler)
+    cached = (
+        _build_parquet_dataset(tmp_path, records)
+        .assemble(build_pair_sum_assembler)
+        .cache(cache_dir=str(tmp_path / "cache"))
+    )
+
+    uncached_samples = [_select_user_fields(sample, ("left_id", "right_id", "sum_value")) for sample in uncached]
+    cached_samples = [_select_user_fields(sample, ("left_id", "right_id", "sum_value")) for sample in cached]
+
+    assert cached_samples == uncached_samples
+
+
+def test_cache_preserves_assemble_stream_semantics_with_parallel_prefix(tmp_path) -> None:
+    records = build_records(count=8)
+    uncached = _build_parquet_dataset(tmp_path, records).map(add_mapped_flag).assemble(build_pair_sum_assembler)
+    cached = (
+        _build_parquet_dataset(tmp_path, records)
+        .map(add_mapped_flag)
+        .assemble(build_pair_sum_assembler)
+        .cache(cache_dir=str(tmp_path / "cache"), cache_num_workers=4)
+    )
+
+    uncached_samples = [_select_user_fields(sample, ("left_id", "right_id", "sum_value")) for sample in uncached]
+    cached_samples = [_select_user_fields(sample, ("left_id", "right_id", "sum_value")) for sample in cached]
+
+    assert cached_samples == uncached_samples
+
+
+def test_cache_parallelizes_map_prefix_with_multiple_threads(tmp_path) -> None:
+    _OBSERVED_CACHE_THREAD_IDS.clear()
+
+    records = build_records(count=24)
+    cached = (
+        _build_parquet_dataset(tmp_path, records)
+        .map(record_cache_thread)
+        .cache(cache_dir=str(tmp_path / "cache"), cache_num_workers=4)
+    )
+
+    observed = [_select_user_fields(sample, ("id", "text", "value")) for sample in cached]
+
+    assert observed == [
+        {
+            "id": record["id"],
+            "text": record["text"],
+            "value": record["value"],
+        }
+        for record in records
+    ]
+    assert len(_OBSERVED_CACHE_THREAD_IDS) >= 2
+
+
+def test_cache_preserves_stream_semantics_when_only_map_prefix_parallelizes(tmp_path) -> None:
+    records = build_records(count=8)
+    uncached = (
+        _build_parquet_dataset(tmp_path, records, seed=17)
+        .map(add_mapped_flag)
+        .select(["id", "value", "mapped"])
+        .shuffle(buffer_size=3)
+        .map(add_mapped_flag)
+        .assemble(build_pair_sum_assembler)
+        .map(add_mapped_flag)
+    )
+    cached = (
+        _build_parquet_dataset(tmp_path, records, seed=17)
+        .map(add_mapped_flag)
+        .select(["id", "value", "mapped"])
+        .shuffle(buffer_size=3)
+        .map(add_mapped_flag)
+        .assemble(build_pair_sum_assembler)
+        .map(add_mapped_flag)
+        .cache(cache_dir=str(tmp_path / "cache"), cache_num_workers=4)
+    )
+
+    uncached_samples = [
+        _select_user_fields(sample, ("left_id", "right_id", "sum_value", "mapped")) for sample in uncached
+    ]
+    cached_samples = [_select_user_fields(sample, ("left_id", "right_id", "sum_value", "mapped")) for sample in cached]
+
+    assert cached_samples == uncached_samples
+
+
+def test_cache_runs_only_map_prefix_in_parallel(tmp_path) -> None:
+    _OBSERVED_CACHE_STAGE_ONE_THREAD_IDS.clear()
+    _OBSERVED_CACHE_STAGE_TWO_THREAD_IDS.clear()
+
+    records = build_records(count=24)
+    uncached = _build_parquet_dataset(tmp_path, records, seed=19).shuffle(buffer_size=3)
+    cached = (
+        _build_parquet_dataset(tmp_path, records, seed=19)
+        .map(record_cache_thread_stage_one)
+        .shuffle(buffer_size=3)
+        .map(record_cache_thread_stage_two)
+        .cache(cache_dir=str(tmp_path / "cache"), cache_num_workers=4)
+    )
+
+    expected = [_select_user_fields(sample, ("id", "text", "value")) for sample in uncached]
+    observed = [_select_user_fields(sample, ("id", "text", "value")) for sample in cached]
+
+    assert observed == expected
+    assert len(_OBSERVED_CACHE_STAGE_ONE_THREAD_IDS) >= 2
+    assert len(_OBSERVED_CACHE_STAGE_TWO_THREAD_IDS) == 1
 
 
 def test_assemble_stage_flushes_tail_by_default(tmp_path) -> None:

@@ -121,6 +121,9 @@ class _UnbatchStage:
         return unbatch_samples(data)
 
 
+_CACHE_PARALLELIZABLE_STAGE_KINDS = frozenset({"map"})
+
+
 @dataclass(frozen=True, slots=True)
 class Dataset(torch_iterabledataset_class()):
     """Chainable iterable dataset built from local shard sources.
@@ -373,54 +376,80 @@ class Dataset(torch_iterabledataset_class()):
                 cache_spec.cache_num_workers,
             )
 
-            def _preprocess_func(item: object) -> object:
-                stream = iter([item])
-                for spec in pre_specs:
-                    stream = spec.apply(stream)
-                return list(stream).pop()
-
             source_shard_stream = iter_items(
                 self._source,
                 context=self.context,
                 resample=False,
             )
             source_stream = self._iter_source_stream(source_shard_stream)
+            parallel_prefix_len = 0
+            for spec in pre_specs:
+                if spec.kind not in _CACHE_PARALLELIZABLE_STAGE_KINDS:
+                    break
+                parallel_prefix_len += 1
 
-            max_inflight = cache_spec.cache_num_workers * 2
+            parallel_specs = pre_specs[:parallel_prefix_len]
+            serial_specs = pre_specs[parallel_prefix_len:]
 
-            result_queue: queue.Queue[object] = queue.Queue(maxsize=max_inflight)
-            _SENTINEL = object()
-            _produced = 0
+            def _apply_parallel_group(item: object, specs: tuple[StageSpec, ...]) -> object:
+                stream = iter((item,))
+                for spec in specs:
+                    stream = spec.apply(stream)
+                outputs = list(stream)
+                if len(outputs) != 1:
+                    msg = "[CacheError] pre-cache map stages must preserve one input sample -> one output sample"
+                    raise ValueError(msg)
+                return outputs[0]
+
+            def _iter_parallel_group(data: Iterable[object], specs: tuple[StageSpec, ...]) -> Iterator[object]:
+                if not specs:
+                    yield from data
+                    return
+
+                if cache_spec.cache_num_workers == 1:
+                    for item in data:
+                        yield _apply_parallel_group(item, specs)
+                    return
+
+                max_inflight = max(1, cache_spec.cache_num_workers * 2)
+                with ThreadPoolExecutor(max_workers=cache_spec.cache_num_workers) as executor:
+                    pending = deque()
+                    for item in data:
+                        pending.append(executor.submit(_apply_parallel_group, item, specs))
+                        if len(pending) >= max_inflight:
+                            yield pending.popleft().result()
+                    while pending:
+                        yield pending.popleft().result()
+
+            processed_stream: Iterable[object] = _iter_parallel_group(source_stream, parallel_specs)
+            for spec in serial_specs:
+                processed_stream = spec.apply(processed_stream)
             _t0 = _time.monotonic()
-
-            def _producer() -> None:
-                """Fan-out source items to the pool, push results into the queue."""
-                nonlocal _produced
-                try:
-                    with ThreadPoolExecutor(max_workers=cache_spec.cache_num_workers) as pool:
-                        futures: deque = deque()
-                        for item in source_stream:
-                            futures.append(pool.submit(_preprocess_func, item))
-                            while len(futures) >= max_inflight:
-                                result_queue.put(futures.popleft().result())
-                                _produced += 1
-                        while futures:
-                            result_queue.put(futures.popleft().result())
-                            _produced += 1
-                finally:
-                    result_queue.put(_SENTINEL)
-
-            producer_thread = threading.Thread(target=_producer, daemon=True)
-            producer_thread.start()
+            max_inflight = max(1, cache_spec.cache_num_workers * 2)
+            result_queue: queue.Queue[object] = queue.Queue(maxsize=max_inflight)
+            sentinel = object()
+            producer_error: list[BaseException] = []
 
             _consumed = 0
             _last_log_time = _t0
+
+            def _producer() -> None:
+                try:
+                    for item in processed_stream:
+                        result_queue.put(item)
+                except BaseException as exc:  # noqa: BLE001
+                    producer_error.append(exc)
+                finally:
+                    result_queue.put(sentinel)
+
+            producer_thread = threading.Thread(target=_producer, daemon=True)
+            producer_thread.start()
 
             def _streaming_results() -> Iterator[object]:
                 nonlocal _consumed, _last_log_time
                 while True:
                     item = result_queue.get()
-                    if item is _SENTINEL:
+                    if item is sentinel:
                         break
                     _consumed += 1
                     now = _time.monotonic()
@@ -436,6 +465,8 @@ class Dataset(torch_iterabledataset_class()):
                         )
                         _last_log_time = now
                     yield item
+                if producer_error:
+                    raise producer_error[0]
 
             _write_lance_dataset(
                 _streaming_results(),
