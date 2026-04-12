@@ -32,7 +32,10 @@ class LanceDataset(Dataset):
         """
         runtime_context = RuntimeContext.from_runtime() if context is None else context
         normalized_shards = normalize_paths(shards)
-        fragments = list_lance_fragments(normalized_shards)
+        fragments = list_lance_fragments(
+            normalized_shards,
+            min_fragments=runtime_context.total_slots,
+        )
 
         def _iter_source(fragment_stream):
             return iter_lances(

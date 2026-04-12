@@ -1,10 +1,9 @@
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from mvp_dataset.core.context import RuntimeContext
 from mvp_dataset.core.dataset import Dataset
 from mvp_dataset.core.types import ShardInput, SidecarSpec
-from mvp_dataset.utils.sharding import iter_items
 from mvp_dataset.utils.url import normalize_paths
 
 from .utils import iter_tars
@@ -12,7 +11,7 @@ from .utils import iter_tars
 
 @dataclass(frozen=True, slots=True)
 class TarDataset(Dataset):
-    _sidecar_specs: tuple[SidecarSpec, ...]
+    _sidecar_specs: tuple[SidecarSpec, ...] = ()
 
     @classmethod
     def from_source(
@@ -43,28 +42,28 @@ class TarDataset(Dataset):
         if not all(path.endswith(".tar") for path in normalized_shards):
             msg = f"[InvalidSourceType] expected .tar inputs, got={normalized_shards!r}"
             raise ValueError(msg)
+        if len(normalized_shards) < runtime_context.total_slots:
+            msg = (
+                f"[InsufficientTarShards] got {len(normalized_shards)} tar file(s) "
+                f"but {runtime_context.total_slots} slot(s) — split your tar archives "
+                f"into at least {runtime_context.total_slots} shards before loading"
+            )
+            raise ValueError(msg)
+
+        sidecar_specs = tuple(sidecars) if sidecars else ()
+
+        def _iter_source(shard_stream):
+            return iter_tars(
+                shard_stream,
+                sidecars=sidecar_specs or None,
+            )
+
         return cls(
             context=runtime_context,
             _source=normalized_shards,
             _resample=resample,
             _source_kind="tars",
             _stages=(),
-            _iter_source_stream=iter_tars,
-            _sidecar_specs=tuple(sidecars) if sidecars else (),
+            _iter_source_stream=_iter_source,
+            _sidecar_specs=sidecar_specs,
         )
-
-    def __iter__(self) -> Iterator[object]:
-        context = RuntimeContext.from_runtime(base=self.context)
-        source_shard_stream = iter_items(
-            self._source,
-            context=context,
-            resample=self._resample,
-        )
-
-        stream: Iterable[object] = iter_tars(
-            source_shard_stream,
-            sidecars=self._sidecar_specs or None,
-        )
-        for spec in self._stages:
-            stream = spec.apply(stream)
-        yield from stream

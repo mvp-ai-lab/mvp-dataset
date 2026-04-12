@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Protocol
+from typing import Final, Protocol
 
 
 class LoggerLike(Protocol):
@@ -20,19 +20,66 @@ class LoggerLike(Protocol):
 
 
 _LOGGER_NAME = "mvp_dataset"
+_DEFAULT_LOG_LEVEL: Final[int] = logging.INFO
 _injected_logger: LoggerLike | None = None
+_default_log_level = _DEFAULT_LOG_LEVEL
+
+
+def _resolve_log_level(level: int | str) -> int:
+    """Normalize a user-provided log level name or numeric value."""
+    if isinstance(level, int):
+        return level
+
+    normalized = level.strip().upper()
+    if not normalized:
+        msg = "[InvalidLogLevel] log level must be a non-empty string or integer"
+        raise ValueError(msg)
+
+    if normalized.lstrip("-").isdigit():
+        return int(normalized)
+
+    level_value = logging.getLevelNamesMapping().get(normalized)
+    if level_value is None:
+        msg = f"[InvalidLogLevel] unsupported log level {level!r}"
+        raise ValueError(msg)
+    return level_value
 
 
 def _default_logger() -> logging.Logger:
     """Return the package default logger, configuring it lazily once."""
     logger = logging.getLogger(_LOGGER_NAME)
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
+    if not getattr(logger, "_mvp_dataset_configured", False):
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            logger.addHandler(handler)
+        logger.setLevel(_default_log_level)
+        logger.propagate = False
+        logger._mvp_dataset_configured = True
     return logger
+
+
+def set_log_level(level: int | str) -> None:
+    """Set the log level used by the package default logger.
+
+    This only affects the built-in ``mvp_dataset`` logger returned by
+    :func:`get_logger` when no custom logger has been injected with
+    :func:`set_logger`.
+    """
+    global _default_log_level
+
+    _default_log_level = _resolve_log_level(level)
+    _default_logger().setLevel(_default_log_level)
+
+
+def get_log_level() -> int:
+    """Return the current log level of the package default logger."""
+    return _default_logger().getEffectiveLevel()
+
+
+def reset_log_level() -> None:
+    """Restore the package default logger level to ``INFO``."""
+    set_log_level(_DEFAULT_LOG_LEVEL)
 
 
 def set_logger(logger: LoggerLike) -> None:

@@ -1,18 +1,17 @@
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from mvp_dataset.core.context import RuntimeContext
 from mvp_dataset.core.dataset import Dataset
 from mvp_dataset.core.types import RefFieldSpec, ShardInput
-from mvp_dataset.utils.sharding import iter_items
 from mvp_dataset.utils.url import normalize_paths
 
-from .utils import iter_jsonls
+from .utils import iter_jsonls, split_jsonl_files
 
 
 @dataclass(frozen=True, slots=True)
 class JsonlDataset(Dataset):
-    _ref_fields: tuple[RefFieldSpec, ...]
+    _ref_fields: tuple[RefFieldSpec, ...] = ()
 
     @classmethod
     def from_source(
@@ -42,30 +41,23 @@ class JsonlDataset(Dataset):
         if not all(path.endswith(".jsonl") for path in normalized_shards):
             msg = f"[InvalidSourceType] expected .jsonl inputs, got={normalized_shards!r}"
             raise ValueError(msg)
+
+        source_items = split_jsonl_files(normalized_shards, runtime_context.total_slots)
+
         ref_fields_tuple = tuple(ref_fields) if ref_fields else ()
+
+        def _iter_source(shard_stream):
+            return iter_jsonls(
+                shard_stream,
+                ref_fields=ref_fields_tuple,
+            )
 
         return cls(
             context=runtime_context,
-            _source=normalized_shards,
+            _source=source_items,
             _resample=resample,
             _source_kind="jsonl",
             _stages=(),
-            _iter_source_stream=iter_jsonls,
+            _iter_source_stream=_iter_source,
             _ref_fields=ref_fields_tuple,
         )
-
-    def __iter__(self) -> Iterator[object]:
-        context = RuntimeContext.from_runtime(base=self.context)
-        source_shard_stream = iter_items(
-            self._source,
-            context=context,
-            resample=self._resample,
-        )
-
-        stream: Iterable[object] = iter_jsonls(
-            source_shard_stream,
-            ref_fields=self._ref_fields,
-        )
-        for spec in self._stages:
-            stream = spec.apply(stream)
-        yield from stream

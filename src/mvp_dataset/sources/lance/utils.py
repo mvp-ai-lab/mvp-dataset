@@ -32,15 +32,27 @@ class LanceFragment:
 
 def list_lance_fragments(
     dataset_uris: Sequence[PathLikeStr],
+    *,
+    min_fragments: int = 0,
 ) -> list[LanceFragment]:
     """Expand lance datasets into schedulable fragments.
 
     Fragments with fewer than ``MVP_DATASET_LANCE_MIN_ROWS_PER_FRAGMENT``
     rows (default 5000) are merged with subsequent fragments until the
-    threshold is reached.
+    threshold is reached.  When the resulting count is below *min_fragments*,
+    the threshold is lowered to 0 so every physical fragment stands alone.
     """
     min_rows = int(os.environ.get("MVP_DATASET_LANCE_MIN_ROWS_PER_FRAGMENT", "5000"))
+    result = _collect_lance_fragments(dataset_uris, min_rows)
+    if len(result) < min_fragments:
+        result = _collect_lance_fragments(dataset_uris, 0)
+    return result
 
+
+def _collect_lance_fragments(
+    dataset_uris: Sequence[PathLikeStr],
+    min_rows: int,
+) -> list[LanceFragment]:
     result: list[LanceFragment] = []
     for uri in dataset_uris:
         ds = _lance.dataset(str(uri))

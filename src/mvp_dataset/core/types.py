@@ -35,10 +35,13 @@ RefFieldSpec = tuple[str, PathLikeStr]
 Stage = Callable[[Iterable[object]], Iterable[object]]
 """One lazy transformation stage in the iterator pipeline."""
 
+CacheLayout = Literal["single_dataset", "global_merge"]
+"""Cache materialization layout for full-cache mode."""
+
 CacheTracePolicy = Literal["traceable", "unsupported"]
 """Whether a stage participates in cache invalidation."""
 
-StageKind = Literal["map", "shuffle", "batch", "assemble", "unbatch"]
+StageKind = Literal["map", "select", "shuffle", "batch", "assemble", "unbatch"]
 """Recognized pipeline stage kinds."""
 
 
@@ -63,8 +66,8 @@ class StageSpec:
     kind: StageKind
     apply: Stage
     fn_fingerprint: str | None = None
-    cache_trace_policy: CacheTracePolicy | None = None
-    cache_stage: Stage | None = None
+    fn_ref: Callable | None = None
+    trace_policy: CacheTracePolicy | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,18 +76,16 @@ class CacheSpec:
 
     Attributes:
         boundary_index: Number of pre-cache :class:`StageSpec` entries.
-        groups: Field grouping for cache tars.  ``None`` means all non-meta
-            fields go into a single tar.  Each inner tuple is one group; keys
-            not covered by any group are stored as singleton groups.
-        show_progress: Whether to print progress to stderr during warm-up.
-        plan_fingerprint: Stable hash of all traceable pre-cache stage
-            fingerprints combined with the groups spec.  Changes when any
-            traceable stage changes.
+        cache_dir: Root directory for standalone cache datasets.
+        cache_num_workers: Number of worker threads used to build the full
+            cache from independent source shards or fragments.
+        plan_fingerprint: Stable hash of all pre-cache stage fingerprints
+            combined with the source identity.
     """
 
     boundary_index: int
-    groups: tuple[tuple[str, ...], ...] | None
-    show_progress: bool
+    cache_dir: str
+    cache_num_workers: int
     plan_fingerprint: str
 
 

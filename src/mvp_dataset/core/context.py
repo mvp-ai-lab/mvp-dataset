@@ -56,6 +56,10 @@ class RuntimeContext:
 
     rank: int = 0
     world_size: int = 1
+    local_rank: int = 0
+    local_world_size: int = 1
+    node_rank: int = 0
+    num_nodes: int = 1
     worker_id: int = 0
     num_workers: int = 1
     epoch: int = 0
@@ -72,6 +76,18 @@ class RuntimeContext:
         if self.rank < 0 or self.rank >= self.world_size:
             msg = f"rank must be in [0, {self.world_size}), got {self.rank}"
             raise ValueError(msg)
+        if self.local_world_size <= 0:
+            msg = f"local_world_size must be > 0, got {self.local_world_size}"
+            raise ValueError(msg)
+        if self.local_rank < 0 or self.local_rank >= self.local_world_size:
+            msg = f"local_rank must be in [0, {self.local_world_size}), got {self.local_rank}"
+            raise ValueError(msg)
+        if self.num_nodes <= 0:
+            msg = f"num_nodes must be > 0, got {self.num_nodes}"
+            raise ValueError(msg)
+        if self.node_rank < 0 or self.node_rank >= self.num_nodes:
+            msg = f"node_rank must be in [0, {self.num_nodes}), got {self.node_rank}"
+            raise ValueError(msg)
         if self.worker_id < 0 or self.worker_id >= self.num_workers:
             msg = f"worker_id must be in [0, {self.num_workers}), got {self.worker_id}"
             raise ValueError(msg)
@@ -79,7 +95,20 @@ class RuntimeContext:
     def __hash__(self) -> int:
         # Exclude mesh: DeviceMesh objects may not be hashable and the numeric
         # fields already uniquely identify the context for caching purposes.
-        return hash((self.rank, self.world_size, self.worker_id, self.num_workers, self.epoch, self.seed))
+        return hash(
+            (
+                self.rank,
+                self.world_size,
+                self.local_rank,
+                self.local_world_size,
+                self.node_rank,
+                self.num_nodes,
+                self.worker_id,
+                self.num_workers,
+                self.epoch,
+                self.seed,
+            )
+        )
 
     @property
     def slot(self) -> int:
@@ -118,6 +147,37 @@ class RuntimeContext:
         if self.mesh is None:
             return True
         return self.mesh.is_cache_leader
+
+    @property
+    def is_node_cache_leader(self) -> bool:
+        """Whether this process should lead cache building for its node."""
+        return self.is_cache_leader and self.local_rank == 0 and self.worker_id == 0
+
+    @property
+    def is_global_cache_merge_leader(self) -> bool:
+        """Whether this process should perform the final global cache merge."""
+        return self.is_node_cache_leader and self.node_rank == 0
+
+    @property
+    def node_slot_ids(self) -> tuple[int, ...]:
+        """Return the global slot ids owned by this node.
+
+        This helper assumes the default non-mesh rank->slot mapping where each
+        rank contributes ``num_workers`` adjacent slots. It is currently used by
+        the distributed cache builder to let a single node leader build cache on
+        behalf of every local slot.
+        """
+        return self.slot_ids_for_node(self.node_rank)
+
+    def slot_ids_for_node(self, node_rank: int) -> tuple[int, ...]:
+        """Return the global slot ids owned by *node_rank*."""
+        start_rank = node_rank * self.local_world_size
+        end_rank = min(start_rank + self.local_world_size, self.world_size)
+        slot_ids: list[int] = []
+        for rank in range(start_rank, end_rank):
+            for worker_id in range(self.num_workers):
+                slot_ids.append(rank * self.num_workers + worker_id)
+        return tuple(slot_ids)
 
     @property
     def sample_shuffle_seed(self) -> int:
@@ -169,6 +229,14 @@ class RuntimeContext:
         source = os.environ if env is None else env
         rank = int(source.get("RANK", "0"))
         world_size = int(source.get("WORLD_SIZE", "1"))
+        local_rank = int(source.get("LOCAL_RANK", str(rank)))
+        local_world_size = int(source.get("LOCAL_WORLD_SIZE", str(world_size)))
+        node_rank = int(
+            source.get(
+                "NODE_RANK",
+                str(rank // local_world_size if local_world_size > 0 else 0),
+            )
+        )
         worker_id = int(source.get("WORKER", "0"))
         num_workers = int(source.get("NUM_WORKERS", "1"))
 
@@ -186,6 +254,10 @@ class RuntimeContext:
         result = cls(
             rank=rank,
             world_size=world_size,
+            local_rank=local_rank,
+            local_world_size=local_world_size,
+            node_rank=node_rank,
+            num_nodes=max(1, (world_size + local_world_size - 1) // local_world_size),
             worker_id=worker_id,
             num_workers=num_workers,
             seed=seed,

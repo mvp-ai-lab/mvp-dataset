@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import tarfile
 from collections import OrderedDict
 from collections.abc import Iterator, Sequence
@@ -15,6 +16,63 @@ from types import TracebackType
 from ...core.types import PathLikeStr, RefFieldSpec, Sample
 
 _TAR_URI_PREFIX = "tar://"
+
+
+def _wc_lines(path: str) -> int:
+    """Count lines using wc -l."""
+    result = subprocess.run(
+        ["wc", "-l", path],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return int(result.stdout.strip().split()[0])
+
+
+def split_jsonl_files(paths: list[str], min_chunks: int) -> list[str]:
+    """Split JSONL files into at least *min_chunks* pieces using ``split``.
+
+    If there are already enough files, returns them as-is.
+    Split files are written next to the originals with a ``._chunk_`` suffix.
+    """
+    if len(paths) >= min_chunks:
+        return paths
+
+    total_lines = sum(_wc_lines(p) for p in paths)
+    if total_lines == 0 or min_chunks <= 0:
+        return paths
+
+    chunk_dir = os.path.join(os.path.dirname(paths[0]) or ".", ".chunks")
+    os.makedirs(chunk_dir, exist_ok=True)
+
+    result_paths: list[str] = []
+    for path in paths:
+        n_lines = _wc_lines(path)
+        n_splits = max(1, round(n_lines / total_lines * min_chunks))
+        if n_splits <= 1:
+            result_paths.append(path)
+            continue
+
+        stem = os.path.basename(path)
+        existing_chunks = sorted(
+            os.path.join(chunk_dir, f) for f in os.listdir(chunk_dir) if f.startswith(stem + "._chunk_")
+        )
+        if existing_chunks:
+            result_paths.extend(existing_chunks)
+            continue
+
+        lines_per_chunk = max(1, (n_lines + n_splits - 1) // n_splits)
+        prefix = os.path.join(chunk_dir, stem + "._chunk_")
+        subprocess.run(
+            ["split", "-l", str(lines_per_chunk), "-d", "-a", "5", path, prefix],
+            check=True,
+        )
+        chunk_files = sorted(
+            os.path.join(chunk_dir, f) for f in os.listdir(chunk_dir) if f.startswith(stem + "._chunk_")
+        )
+        result_paths.extend(chunk_files)
+
+    return result_paths
 
 
 @dataclass(frozen=True, slots=True)

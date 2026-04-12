@@ -40,7 +40,10 @@ class ParquetDataset(Dataset):
         if not all(path.endswith(".parquet") for path in normalized_shards):
             msg = f"[InvalidSourceType] expected .parquet inputs, got={normalized_shards!r}"
             raise ValueError(msg)
-        fragments = list_parquet_fragments(normalized_shards)
+        fragments = list_parquet_fragments(
+            normalized_shards,
+            min_fragments=runtime_context.total_slots,
+        )
 
         def _iter_source(fragment_stream):
             return iter_parquets(

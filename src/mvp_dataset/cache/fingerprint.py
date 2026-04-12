@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import os
 import struct
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 
@@ -69,6 +70,32 @@ def hash_bytes(*parts: Any) -> str:
     h = hashlib.sha256()
     _update_hash(h, *parts)
     return h.hexdigest()
+
+
+def source_fingerprint(source: Iterable[object]) -> str:
+    """Return a stable fingerprint for a dataset source listing.
+
+    Local file-backed sources are fingerprinted from their path, size, and
+    modification time. Fragment-like source objects additionally incorporate
+    their fragment identity so multiple fragments from the same backing file
+    remain distinct.
+    """
+
+    item_fps = sorted(_source_item_fingerprint(item) for item in source)
+    return hash_bytes(*item_fps)
+
+
+def is_stable_function(fn: Callable[..., Any]) -> bool:
+    """Return ``True`` if *fn* is safe to use with cache fingerprinting.
+
+    Lambdas and local closures are rejected because their bytecode identity
+    is not stable across process restarts.
+    """
+    if getattr(fn, "__name__", None) == "<lambda>":
+        return False
+    if "<locals>" in (getattr(fn, "__qualname__", "") or ""):
+        return False
+    return True
 
 
 def callable_fingerprint(fn: Callable[..., Any]) -> str:
@@ -140,6 +167,37 @@ def _collect_callable(fn: Any, parts: list[Any], seen: set[int]) -> None:
         except ValueError:
             continue  # empty cell
         _collect_value(val, parts)
+
+
+def _source_item_fingerprint(item: object) -> str:
+    if isinstance(item, (str, os.PathLike)):
+        return _path_fingerprint(os.fspath(item))
+
+    cache_key = getattr(item, "cache_key", None)
+    if cache_key is not None:
+        backing_path = getattr(item, "path", None)
+        if backing_path is None:
+            backing_path = getattr(item, "uri", None)
+        if isinstance(backing_path, (str, os.PathLike)):
+            return hash_bytes(
+                "<source-fragment>",
+                str(cache_key),
+                _path_fingerprint(os.fspath(backing_path)),
+            )
+
+    fp_method = getattr(item, "__fingerprint__", None)
+    if callable(fp_method):
+        fp = fp_method()
+        if not isinstance(fp, str):
+            raise TypeError(f"__fingerprint__ must return str, got {type(fp).__name__!r}")
+        return hash_bytes("<source-object>", fp)
+
+    return hash_bytes("<source-repr>", repr(item))
+
+
+def _path_fingerprint(path: str) -> str:
+    stat_result = os.stat(path)
+    return hash_bytes("<source-path>", path, stat_result.st_size, stat_result.st_mtime_ns)
 
 
 def _collect_value(val: Any, parts: list[Any]) -> None:

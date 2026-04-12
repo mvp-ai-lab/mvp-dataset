@@ -36,14 +36,27 @@ class ParquetFragment:
 
 def list_parquet_fragments(
     shard_paths: Sequence[PathLikeStr],
+    *,
+    min_fragments: int = 0,
 ) -> list[ParquetFragment]:
     """Expand parquet files into schedulable row-group fragments.
 
     Row groups with fewer than *min_rows_per_fragment* rows are merged with
-    subsequent row groups until the threshold is reached.
+    subsequent row groups until the threshold is reached.  When the resulting
+    fragment count is below *min_fragments*, the threshold is lowered to 0 and
+    fragments are re-split so that every row group becomes its own fragment.
     """
     min_rows_per_fragment = int(os.environ.get("MVP_DATASET_PARQUET_MIN_ROWS_PER_FRAGMENT", "5000"))
+    fragments = _collect_parquet_fragments(shard_paths, min_rows_per_fragment)
+    if len(fragments) < min_fragments:
+        fragments = _collect_parquet_fragments(shard_paths, 0)
+    return fragments
 
+
+def _collect_parquet_fragments(
+    shard_paths: Sequence[PathLikeStr],
+    min_rows_per_fragment: int,
+) -> list[ParquetFragment]:
     fragments: list[ParquetFragment] = []
     for shard_path in shard_paths:
         shard = str(shard_path)
