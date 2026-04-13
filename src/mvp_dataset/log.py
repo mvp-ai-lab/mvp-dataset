@@ -28,6 +28,51 @@ _injected_logger: LoggerLike | None = None
 _default_log_level = _DEFAULT_LOG_LEVEL
 
 
+def _format_message(msg: object, args: tuple[object, ...]) -> object:
+    """Render stdlib-style log arguments into a single message."""
+    if not args:
+        return msg
+
+    rendered = str(msg)
+    try:
+        return rendered % args
+    except Exception:
+        return " ".join((rendered, *(str(arg) for arg in args)))
+
+
+class _InjectedLoggerAdapter:
+    """Normalize injected loggers to the stdlib logging call shape."""
+
+    def __init__(self, logger: LoggerLike) -> None:
+        self._logger = logger
+
+    def _call(self, level: str, msg: object, *args: object, **kwargs: object) -> object:
+        method = getattr(self._logger, level)
+        rendered = _format_message(msg, args)
+        if kwargs:
+            try:
+                return method(rendered, **kwargs)
+            except TypeError:
+                pass
+        return method(rendered)
+
+    def debug(self, msg: object, *args: object, **kwargs: object) -> object:
+        """Log a debug-level message."""
+        return self._call("debug", msg, *args, **kwargs)
+
+    def info(self, msg: object, *args: object, **kwargs: object) -> object:
+        """Log an info-level message."""
+        return self._call("info", msg, *args, **kwargs)
+
+    def warning(self, msg: object, *args: object, **kwargs: object) -> object:
+        """Log a warning-level message."""
+        return self._call("warning", msg, *args, **kwargs)
+
+    def error(self, msg: object, *args: object, **kwargs: object) -> object:
+        """Log an error-level message."""
+        return self._call("error", msg, *args, **kwargs)
+
+
 def _resolve_log_level(level: int | str) -> int:
     """Normalize a user-provided log level name or numeric value."""
     if isinstance(level, int):
@@ -88,7 +133,10 @@ def reset_log_level() -> None:
 def set_logger(logger: LoggerLike) -> None:
     """Install a process-global logger used by package subsystems."""
     global _injected_logger
-    _injected_logger = logger
+    if isinstance(logger, _InjectedLoggerAdapter):
+        _injected_logger = logger
+    else:
+        _injected_logger = _InjectedLoggerAdapter(logger)
 
 
 def reset_logger() -> None:
