@@ -14,6 +14,7 @@ authors = [
 license = { file = "LICENSE" }
 dependencies = [
   "pyarrow>=18.0.0",
+  "pylance"
 ]
 
 [project.urls]

@@ -79,6 +79,8 @@ class CacheSpec:
         cache_dir: Root directory for standalone cache datasets.
         cache_num_workers: Number of worker threads used to build the full
             cache from independent source shards or fragments.
+        cache_write_batch_size: Number of samples buffered before each cache
+            write flush to Lance.
         plan_fingerprint: Stable hash of all pre-cache stage fingerprints
             combined with the source identity.
     """
@@ -86,6 +88,7 @@ class CacheSpec:
     boundary_index: int
     cache_dir: str
     cache_num_workers: int
+    cache_write_batch_size: int
     plan_fingerprint: str
 
 

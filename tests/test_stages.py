@@ -11,6 +11,7 @@ import pytest
 import mvp_dataset.cache.store as store_module
 import mvp_dataset.core.dataset as dataset_module
 import mvp_dataset.core.stages as stages_module
+import mvp_dataset.loader.torch_loader as loader_module
 import mvp_dataset.sources.parquet.utils as parquet_utils_module
 from mvp_dataset import Dataset, RuntimeContext, TorchLoader
 from mvp_dataset.log import reset_logger, set_logger
@@ -274,6 +275,66 @@ def build_pair_sum_assembler(_context: RuntimeContext) -> PairSumAssembler:
     return PairSumAssembler()
 
 
+def test_loader_assemble_stage_flushes_tail_by_default(tmp_path) -> None:
+    records = build_records(count=5)
+    dataset = _build_parquet_dataset(tmp_path, records)
+    loader = TorchLoader(dataset, num_workers=0).assemble(build_pair_sum_assembler)
+
+    observed = list(loader)
+
+    assert observed == [
+        {"left_id": "sample-0", "right_id": "sample-1", "sum_value": 1},
+        {"left_id": "sample-2", "right_id": "sample-3", "sum_value": 5},
+        {"left_id": "sample-4", "right_id": None, "sum_value": 4},
+    ]
+
+
+def test_loader_assemble_stage_drop_last_discards_tail(tmp_path) -> None:
+    records = build_records(count=5)
+    dataset = _build_parquet_dataset(tmp_path, records)
+    loader = TorchLoader(dataset, num_workers=0).assemble(build_pair_sum_assembler, drop_last=True)
+
+    observed = list(loader)
+
+    assert observed == [
+        {"left_id": "sample-0", "right_id": "sample-1", "sum_value": 1},
+        {"left_id": "sample-2", "right_id": "sample-3", "sum_value": 5},
+    ]
+
+
+def test_loader_assemble_stage_uses_runtime_context(tmp_path, monkeypatch) -> None:
+    records = build_records(count=4)
+    dataset = _build_parquet_dataset(tmp_path, records, seed=11)
+
+    recorded_worker_ids: list[int] = []
+
+    def recording_factory(context: RuntimeContext) -> PairSumAssembler:
+        recorded_worker_ids.append(context.worker_id)
+        return PairSumAssembler()
+
+    def resolved_runtime(*, base=None, **_kwargs):
+        assert base is not None
+        return RuntimeContext(
+            rank=base.rank,
+            world_size=base.world_size,
+            local_rank=base.local_rank,
+            local_world_size=base.local_world_size,
+            node_rank=base.node_rank,
+            num_nodes=base.num_nodes,
+            worker_id=3,
+            num_workers=4,
+            epoch=base.epoch,
+            seed=base.seed,
+            mesh=base.mesh,
+        )
+
+    monkeypatch.setattr(loader_module.RuntimeContext, "from_runtime", resolved_runtime)
+
+    list(TorchLoader(dataset, num_workers=0).assemble(recording_factory))
+
+    assert recorded_worker_ids == [3]
+
+
 def test_dataset_stage_apply_objects_are_picklable(tmp_path) -> None:
     records = build_records()
 
@@ -297,6 +358,7 @@ def test_loader_stage_objects_are_picklable(tmp_path) -> None:
         TorchLoader(dataset, num_workers=0, batch_size=2, collate_fn=identity_collate)
         .unbatch()
         .shuffle(buffer_size=3)
+        .assemble(build_pair_sum_assembler)
         .batch(2, collate_fn=identity_collate)
     )
 
@@ -329,6 +391,26 @@ def test_cache_accepts_one_to_one_pre_cache_stages(tmp_path) -> None:
 
     assert len(observed) == len(records)
     assert all(sample["mapped"] is True for sample in observed)
+
+
+def test_cache_accepts_small_write_batches(tmp_path) -> None:
+    records = build_records()
+    dataset = _build_parquet_dataset(tmp_path, records).map(add_mapped_flag)
+
+    cached = dataset.cache(
+        cache_dir=str(tmp_path / "cache"),
+        cache_write_batch_size=2,
+    )
+
+    observed = [_select_user_fields(sample, ("id", "mapped")) for sample in cached]
+
+    assert observed == [
+        {
+            "id": f"sample-{index}",
+            "mapped": True,
+        }
+        for index in range(len(records))
+    ]
 
 
 def test_cache_preserves_shuffle_stream_semantics(tmp_path) -> None:
@@ -418,6 +500,17 @@ def test_cache_schema_uses_large_offsets_for_nested_variable_width_fields() -> N
         )
     )
     assert img_size_type == pa.large_list(pa.large_list(pa.int64()))
+
+
+def test_cache_rejects_non_positive_write_batch_size(tmp_path) -> None:
+    records = build_records()
+    dataset = _build_parquet_dataset(tmp_path, records)
+
+    with pytest.raises(ValueError, match=r"\[CacheError\] cache_write_batch_size must be > 0, got 0"):
+        dataset.cache(
+            cache_dir=str(tmp_path / "cache"),
+            cache_write_batch_size=0,
+        )
 
 
 def test_cache_warns_when_shuffle_is_not_fingerprinted(tmp_path) -> None:

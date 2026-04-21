@@ -184,6 +184,7 @@ class Dataset(torch_iterabledataset_class()):
         *,
         cache_dir: str = ".cache",
         cache_num_workers: int = 1,
+        cache_write_batch_size: int = 1024,
         max_rows_per_fragment: int = 5000,
     ) -> Dataset:
         """Insert a cache boundary at the current position in the pipeline.
@@ -192,6 +193,9 @@ class Dataset(torch_iterabledataset_class()):
             cache_dir: Root directory for standalone cache datasets.
             cache_num_workers: Number of worker threads used to build a full
                 cache from independent source shards or fragments.
+            cache_write_batch_size: Number of samples buffered before each
+                flush to the cache writer. Lower this for large samples to
+                reduce peak memory during cache construction.
 
         Returns:
             A new dataset with the cache boundary recorded.
@@ -216,6 +220,10 @@ class Dataset(torch_iterabledataset_class()):
             msg = f"[CacheError] cache_num_workers must be > 0, got {cache_num_workers}"
             raise ValueError(msg)
 
+        if cache_write_batch_size <= 0:
+            msg = f"[CacheError] cache_write_batch_size must be > 0, got {cache_write_batch_size}"
+            raise ValueError(msg)
+
         for spec in self._stages:
             if spec.kind in ("batch", "unbatch"):
                 msg = f"[CacheError] '{spec.kind}' cannot appear before .cache()"
@@ -236,6 +244,7 @@ class Dataset(torch_iterabledataset_class()):
             boundary_index=len(self._stages),
             cache_dir=str(cache_dir),
             cache_num_workers=cache_num_workers,
+            cache_write_batch_size=cache_write_batch_size,
             plan_fingerprint=plan_fp,
         )
 
@@ -271,11 +280,12 @@ class Dataset(torch_iterabledataset_class()):
             if is_dp_leader:
                 n_source = len(self._source)
                 logger.info(
-                    "<MVP Dataset - rank %d> cache: building %s (%d source items, %d workers)",
+                    "<MVP Dataset - rank %d> cache: building %s (%d source items, %d workers, write batch=%d)",
                     rank,
                     rank_cache_uri.name,
                     n_source,
                     cache_num_workers,
+                    cache_write_batch_size,
                 )
 
                 # Split stages: parallelizable prefix runs in a thread pool; the rest run serially.
@@ -317,6 +327,7 @@ class Dataset(torch_iterabledataset_class()):
                 _write_lance_dataset(
                     _log_progress(stream),
                     str(rank_cache_uri),
+                    batch_size=cache_write_batch_size,
                     max_rows_per_group=max_rows_per_fragment,
                 )
 

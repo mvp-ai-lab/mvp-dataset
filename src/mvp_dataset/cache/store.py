@@ -297,7 +297,7 @@ def _samples_to_record_batch(samples: list[Sample], schema: pa.Schema) -> pa.Rec
 # Cold write
 # ---------------------------------------------------------------------------
 
-_DEFAULT_BATCH_SIZE = 8192
+_DEFAULT_BATCH_SIZE = 1024
 
 
 def _write_lance_dataset(
@@ -318,16 +318,19 @@ def _write_lance_dataset(
 
     schema = _schema_from_samples(first_chunk)
 
-    def _iter_batches() -> Iterator[pa.RecordBatch]:
-        chunk = first_chunk
+    def _iter_batches(initial_chunk: list[Sample]) -> Iterator[pa.RecordBatch]:
+        chunk = initial_chunk
+        initial_chunk = []
         while chunk:
-            yield _samples_to_record_batch(chunk, schema)
+            current_chunk = chunk
             chunk = [_escape_sample(s) for s in islice(stream, batch_size)]
+            yield _samples_to_record_batch(current_chunk, schema)
 
     if os.path.isdir(uri):
         shutil.rmtree(uri, ignore_errors=True)
 
-    reader = pa.RecordBatchReader.from_batches(schema, _iter_batches())
+    reader = pa.RecordBatchReader.from_batches(schema, _iter_batches(first_chunk))
+    del first_chunk
     _lance.write_dataset(
         reader,
         uri,

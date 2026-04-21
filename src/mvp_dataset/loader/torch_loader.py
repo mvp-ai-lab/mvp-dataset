@@ -8,7 +8,13 @@ from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
 from ..core import RuntimeContext
-from ..pipeline.ops import batch_samples, shuffle_samples, unbatch_samples
+from ..core.types import Assembler
+from ..pipeline.ops import (
+    assemble_samples,
+    batch_samples,
+    shuffle_samples,
+    unbatch_samples,
+)
 
 LoaderStage = Callable[[Iterable[object]], Iterable[object]]
 """One post-DataLoader transformation stage."""
@@ -48,6 +54,41 @@ class _LoaderShuffleStage:
         return shuffle_samples(data, buffer_size=self.buffer_size, initial=self.initial, rng=rng)
 
 
+class _LoaderAssemblerFactoryAdapter:
+    def __init__(
+        self,
+        *,
+        factory: Callable[[RuntimeContext], Assembler[object, object]],
+        context: RuntimeContext,
+    ) -> None:
+        self.factory = factory
+        self.context = context
+
+    def __call__(self) -> Assembler[object, object]:
+        return self.factory(self.context)
+
+
+class _LoaderAssembleStage:
+    def __init__(
+        self,
+        *,
+        factory: Callable[[RuntimeContext], Assembler[object, object]],
+        base_context: RuntimeContext | None,
+        drop_last: bool,
+    ) -> None:
+        self.factory = factory
+        self.base_context = base_context
+        self.drop_last = drop_last
+
+    def __call__(self, data: Iterable[object]) -> Iterable[object]:
+        runtime_context = RuntimeContext.from_runtime(base=self.base_context)
+        return assemble_samples(
+            data,
+            factory=_LoaderAssemblerFactoryAdapter(factory=self.factory, context=runtime_context),
+            drop_last=self.drop_last,
+        )
+
+
 class _LoaderBatchStage:
     def __init__(
         self,
@@ -76,7 +117,8 @@ class TorchLoader:
     1. let workers emit micro-batches via ``batch_size`` + ``collate_fn=lambda x: x``;
     2. call ``.unbatch()`` to restore a sample stream in the main process;
     3. call ``.shuffle(...)`` for global sample-level shuffle;
-    4. call ``.batch(...)`` to build training batches.
+    4. optionally call ``.assemble(...)`` for post-merge packing or grouping;
+    5. call ``.batch(...)`` to build training batches.
     """
 
     def __init__(
@@ -240,6 +282,33 @@ class TorchLoader:
                 buffer_size=buffer_size,
                 initial=initial,
                 seed=resolved_seed,
+            )
+        )
+
+    def assemble(
+        self,
+        factory: Callable[[RuntimeContext], Assembler[object, object]],
+        *,
+        drop_last: bool = False,
+    ) -> TorchLoader:
+        """Append a global (post-merge) assembly stage.
+
+        Args:
+            factory: Callable that builds one fresh assembler for each loader
+                iteration using the runtime-resolved context.
+            drop_last: Whether to discard unfinished tail state instead of
+                delegating it to the assembler's final flush.
+
+        Returns:
+            A new loader that assembles the merged sample stream in the main
+            process.
+        """
+        base_context = getattr(self._dataset, "context", None)
+        return self._append_stage(
+            _LoaderAssembleStage(
+                factory=factory,
+                base_context=base_context if isinstance(base_context, RuntimeContext) else None,
+                drop_last=drop_last,
             )
         )
 

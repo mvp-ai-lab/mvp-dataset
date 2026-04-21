@@ -53,12 +53,13 @@ Chainable dataset stages:
 - `.assemble(factory, drop_last=False)`
 - `.batch(batch_size, drop_last=False, collate_fn=None)`
 - `.unbatch()`
-- `.cache(cache_dir=".cache", cache_num_workers=1, max_rows_per_fragment=5000)`
+- `.cache(cache_dir=".cache", cache_num_workers=1, cache_write_batch_size=1024, max_rows_per_fragment=5000)`
 
 `TorchLoader` supports post-merge stages:
 
 - `.unbatch()`
 - `.shuffle(buffer_size, initial=None, seed=None)`
+- `.assemble(factory, drop_last=False)`
 - `.batch(batch_size, drop_last=False, collate_fn=None)`
 
 ## Core Concepts
@@ -115,6 +116,7 @@ loader = (
     TorchLoader(dataset, num_workers=8, batch_size=32, collate_fn=lambda x: x)
     .unbatch()
     .shuffle(buffer_size=4096)
+    .assemble(pack_samples)
     .batch(batch_size=64)
 )
 
@@ -417,7 +419,8 @@ Recommended high-throughput pattern:
 1. use worker micro-batches with `batch_size` and `collate_fn=lambda x: x`
 2. call `.unbatch()`
 3. call loader-side `.shuffle(...)`
-4. call loader-side `.batch(...)`
+4. optionally call loader-side `.assemble(...)`
+5. call loader-side `.batch(...)`
 
 Example:
 
@@ -430,11 +433,13 @@ loader = (
     TorchLoader(dataset, num_workers=8, batch_size=32, collate_fn=lambda x: x)
     .unbatch()
     .shuffle(buffer_size=4096)
+    .assemble(pack_samples)
     .batch(batch_size=128)
 )
 ```
 
 Loader-side shuffle uses the upstream dataset context when available, so TP co-members stay aligned by default.
+Loader-side assemble also resolves runtime context from the upstream dataset when available.
 
 ## Data Conventions
 
