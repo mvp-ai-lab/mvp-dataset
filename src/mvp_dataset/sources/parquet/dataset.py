@@ -46,6 +46,9 @@ class ParquetDataset(Dataset):
             columns: Optional list of column names to read.
             use_threads: Whether to use multi-threaded Arrow reads.
 
+        Arrow record batch size is controlled via the
+        ``MVP_DATASET_PARQUET_BATCH_SIZE`` environment variable.
+
         Returns:
             A dataset whose source is the list of parquet fragments.
 

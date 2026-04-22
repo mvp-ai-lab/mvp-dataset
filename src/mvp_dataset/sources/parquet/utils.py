@@ -67,7 +67,15 @@ def _validate_min_row_groups_per_fragment(value: int) -> int:
 
 def resolve_parquet_batch_size(batch_size: int | None = None) -> int:
     if batch_size is None:
-        batch_size = int(os.environ.get(_BATCH_SIZE_ENV_VAR, str(_DEFAULT_BATCH_SIZE)))
+        raw_value = os.environ.get(_BATCH_SIZE_ENV_VAR)
+        if raw_value is None:
+            batch_size = _DEFAULT_BATCH_SIZE
+        else:
+            try:
+                batch_size = int(raw_value)
+            except ValueError as exc:
+                msg = f"[InvalidParquetBatchSize] {_BATCH_SIZE_ENV_VAR} must be an integer, got {raw_value!r}"
+                raise ValueError(msg) from exc
     if batch_size <= 0:
         msg = f"[InvalidParquetBatchSize] {_BATCH_SIZE_ENV_VAR} must be >= 1, got {batch_size}"
         raise ValueError(msg)
