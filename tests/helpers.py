@@ -45,7 +45,7 @@ def write_jsonl_file(root: Path, records: list[dict[str, object]]) -> str:
     return str(path)
 
 
-def write_parquet_file(root: Path, records: list[dict[str, object]]) -> str:
+def write_parquet_file(root: Path, records: list[dict[str, object]], *, row_group_size: int | None = None) -> str:
     path = root / "samples.parquet"
     table = pa.table(
         {
@@ -54,7 +54,7 @@ def write_parquet_file(root: Path, records: list[dict[str, object]]) -> str:
             "value": [int(record["value"]) for record in records],
         }
     )
-    pq.write_table(table, path)
+    pq.write_table(table, path, row_group_size=row_group_size)
     return str(path)
 
 

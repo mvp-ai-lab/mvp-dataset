@@ -4,19 +4,19 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from itertools import repeat
 from typing import Final
 
-import pyarrow as pa
-import pyarrow.dataset as ds
-import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 
 from ...core.types import PathLikeStr, Sample
 
 _DEFAULT_BATCH_SIZE: Final[int] = 65536
 _FRAGMENT_SUFFIX: Final[str] = "@@rg="
-_LOCAL_FILESYSTEM = pafs.LocalFileSystem()
+_MAX_METADATA_WORKERS: Final[int] = 16
+_BATCH_SIZE_ENV_VAR: Final[str] = "MVP_DATASET_PARQUET_BATCH_SIZE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,50 +41,83 @@ class ParquetFragment:
 def list_parquet_fragments(
     shard_paths: Sequence[PathLikeStr],
     *,
+    min_row_groups_per_fragment: int = 1,
     min_fragments: int = 0,
 ) -> list[ParquetFragment]:
     """Expand parquet files into schedulable row-group fragments.
 
-    Row groups with fewer than *min_rows_per_fragment* rows are merged with
-    subsequent row groups until the threshold is reached.  When the resulting
-    fragment count is below *min_fragments*, the threshold is lowered to 0 and
-    fragments are re-split so that every row group becomes its own fragment.
+    Consecutive row groups are merged until each fragment contains at least
+    *min_row_groups_per_fragment* row groups. When the resulting fragment count
+    is below *min_fragments*, the threshold is lowered to 1 so that every row
+    group becomes its own fragment.
     """
-    min_rows_per_fragment = int(os.environ.get("MVP_DATASET_PARQUET_MIN_ROWS_PER_FRAGMENT", "5000"))
-    fragments = _collect_parquet_fragments(shard_paths, min_rows_per_fragment)
+    min_row_groups_per_fragment = _validate_min_row_groups_per_fragment(min_row_groups_per_fragment)
+    fragments = _collect_parquet_fragments(shard_paths, min_row_groups_per_fragment)
     if len(fragments) < min_fragments:
-        fragments = _collect_parquet_fragments(shard_paths, 0)
+        fragments = _collect_parquet_fragments(shard_paths, 1)
     return fragments
+
+
+def _validate_min_row_groups_per_fragment(value: int) -> int:
+    if value <= 0:
+        msg = f"[InvalidParquetFragmentConfig] min_row_groups_per_fragment must be >= 1, got {value}"
+        raise ValueError(msg)
+    return value
+
+
+def resolve_parquet_batch_size(batch_size: int | None = None) -> int:
+    if batch_size is None:
+        batch_size = int(os.environ.get(_BATCH_SIZE_ENV_VAR, str(_DEFAULT_BATCH_SIZE)))
+    if batch_size <= 0:
+        msg = f"[InvalidParquetBatchSize] {_BATCH_SIZE_ENV_VAR} must be >= 1, got {batch_size}"
+        raise ValueError(msg)
+    return batch_size
 
 
 def _collect_parquet_fragments(
     shard_paths: Sequence[PathLikeStr],
-    min_rows_per_fragment: int,
+    min_row_groups_per_fragment: int,
 ) -> list[ParquetFragment]:
+    shards = [str(shard_path) for shard_path in shard_paths]
+    if not shards:
+        return []
+
     fragments: list[ParquetFragment] = []
-    for shard_path in shard_paths:
-        shard = str(shard_path)
-        parquet_file = pq.ParquetFile(shard)
-        row_offset = 0
-        pending_groups: list[int] = []
-        pending_rows = 0
-        for row_group in range(parquet_file.num_row_groups):
-            num_rows = parquet_file.metadata.row_group(row_group).num_rows
-            pending_groups.append(row_group)
-            pending_rows += num_rows
-            if pending_rows >= min_rows_per_fragment:
-                fragments.append(
-                    ParquetFragment(
-                        path=shard,
-                        row_groups=tuple(pending_groups),
-                        row_offset=row_offset,
-                        num_rows=pending_rows,
-                    )
-                )
-                row_offset += pending_rows
-                pending_groups = []
-                pending_rows = 0
-        if pending_groups:
+    num_workers = _metadata_num_workers(len(shards))
+    if num_workers == 1:
+        for shard in shards:
+            fragments.extend(_collect_parquet_fragments_for_shard(shard, min_row_groups_per_fragment))
+        return fragments
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        for shard_fragments in executor.map(
+            _collect_parquet_fragments_for_shard,
+            shards,
+            repeat(min_row_groups_per_fragment),
+        ):
+            fragments.extend(shard_fragments)
+    return fragments
+
+
+def _metadata_num_workers(num_shards: int) -> int:
+    return min(num_shards, max(1, min(_MAX_METADATA_WORKERS, os.cpu_count() or 1)))
+
+
+def _collect_parquet_fragments_for_shard(
+    shard: str,
+    min_row_groups_per_fragment: int,
+) -> list[ParquetFragment]:
+    metadata = pq.read_metadata(shard)
+    fragments: list[ParquetFragment] = []
+    row_offset = 0
+    pending_groups: list[int] = []
+    pending_rows = 0
+
+    for row_group in range(metadata.num_row_groups):
+        num_rows = metadata.row_group(row_group).num_rows
+        pending_groups.append(row_group)
+        pending_rows += num_rows
+        if len(pending_groups) >= min_row_groups_per_fragment:
             fragments.append(
                 ParquetFragment(
                     path=shard,
@@ -93,6 +126,20 @@ def _collect_parquet_fragments(
                     num_rows=pending_rows,
                 )
             )
+            row_offset += pending_rows
+            pending_groups = []
+            pending_rows = 0
+
+    if pending_groups:
+        fragments.append(
+            ParquetFragment(
+                path=shard,
+                row_groups=tuple(pending_groups),
+                row_offset=row_offset,
+                num_rows=pending_rows,
+            )
+        )
+
     return fragments
 
 
@@ -100,19 +147,19 @@ def iter_parquet(
     fragment: ParquetFragment,
     *,
     columns: Sequence[str] | None = None,
-    batch_size: int = _DEFAULT_BATCH_SIZE,
+    batch_size: int | None = None,
     use_threads: bool = True,
 ) -> Iterator[Sample]:
     """Iterate one parquet row-group fragment and yield one sample dict per row."""
 
+    resolved_batch_size = resolve_parquet_batch_size(batch_size)
     parquet_file = pq.ParquetFile(fragment.path)
     index_in_file = fragment.row_offset
 
-    for record_batch in _iter_record_batches(
-        parquet_file,
-        fragment,
+    for record_batch in parquet_file.iter_batches(
+        batch_size=resolved_batch_size,
+        row_groups=list(fragment.row_groups),
         columns=columns,
-        batch_size=batch_size,
         use_threads=use_threads,
     ):
         column_names = record_batch.schema.names
@@ -129,76 +176,11 @@ def iter_parquet(
             index_in_file += 1
 
 
-def _iter_record_batches(
-    parquet_file: pq.ParquetFile,
-    fragment: ParquetFragment,
-    *,
-    columns: Sequence[str] | None,
-    batch_size: int,
-    use_threads: bool,
-) -> Iterator[pa.RecordBatch]:
-    """Stream record batches for one fragment without materializing whole row groups."""
-
-    if _requires_dataset_scanner(parquet_file.schema_arrow, columns):
-        yield from _iter_record_batches_via_scanner(
-            fragment,
-            columns=columns,
-            batch_size=batch_size,
-            use_threads=use_threads,
-        )
-        return
-
-    yield from parquet_file.iter_batches(
-        batch_size=batch_size,
-        row_groups=list(fragment.row_groups),
-        columns=columns,
-        use_threads=use_threads,
-    )
-
-
-def _requires_dataset_scanner(schema: pa.Schema, columns: Sequence[str] | None) -> bool:
-    """Use Scanner for nested columns to avoid ParquetFile.iter_batches conversion limits."""
-
-    selected_columns = schema.names if columns is None else columns
-    for column_name in selected_columns:
-        field_index = schema.get_field_index(column_name)
-        if field_index < 0:
-            return True
-        if pa.types.is_nested(schema.field(field_index).type):
-            return True
-    return False
-
-
-def _iter_record_batches_via_scanner(
-    fragment: ParquetFragment,
-    *,
-    columns: Sequence[str] | None,
-    batch_size: int,
-    use_threads: bool,
-) -> Iterator[pa.RecordBatch]:
-    """Stream one parquet fragment through Scanner with bounded readahead."""
-
-    parquet_fragment = ds.ParquetFileFormat().make_fragment(
-        fragment.path,
-        filesystem=_LOCAL_FILESYSTEM,
-        row_groups=list(fragment.row_groups),
-    )
-    scanner = ds.Scanner.from_fragment(
-        parquet_fragment,
-        columns=columns,
-        batch_size=batch_size,
-        batch_readahead=1,
-        fragment_readahead=1,
-        use_threads=use_threads,
-    )
-    yield from scanner.to_batches()
-
-
 def iter_parquets(
     fragments: Iterator[ParquetFragment],
     *,
     columns: Sequence[str] | None = None,
-    batch_size: int = _DEFAULT_BATCH_SIZE,
+    batch_size: int | None = None,
     use_threads: bool = True,
 ) -> Iterator[Sample]:
     """Iterate parquet row-group fragments in order and yield row samples."""

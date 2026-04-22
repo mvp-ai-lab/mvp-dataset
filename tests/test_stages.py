@@ -12,7 +12,6 @@ import mvp_dataset.cache.store as store_module
 import mvp_dataset.core.dataset as dataset_module
 import mvp_dataset.core.stages as stages_module
 import mvp_dataset.loader.torch_loader as loader_module
-import mvp_dataset.sources.parquet.utils as parquet_utils_module
 from mvp_dataset import Dataset, RuntimeContext, TorchLoader
 from mvp_dataset.log import reset_logger, set_logger
 
@@ -428,7 +427,7 @@ def test_cache_preserves_shuffle_stream_semantics(tmp_path) -> None:
     assert cached_samples == uncached_samples
 
 
-def test_cache_handles_nested_parquet_columns_with_scanner_fallback(tmp_path, monkeypatch) -> None:
+def test_cache_handles_nested_parquet_columns(tmp_path) -> None:
     records = [
         {
             "id": f"sample-{index}",
@@ -439,15 +438,6 @@ def test_cache_handles_nested_parquet_columns_with_scanner_fallback(tmp_path, mo
     ]
     path = write_nested_parquet_file(tmp_path, records, row_group_size=2)
     context = RuntimeContext(seed=13)
-    scanner_used = False
-    original = parquet_utils_module._iter_record_batches_via_scanner
-
-    def _recording_scanner(*args, **kwargs):
-        nonlocal scanner_used
-        scanner_used = True
-        yield from original(*args, **kwargs)
-
-    monkeypatch.setattr(parquet_utils_module, "_iter_record_batches_via_scanner", _recording_scanner)
 
     uncached = Dataset.from_source("parquet", shards=path, context=context)
     cached = Dataset.from_source("parquet", shards=path, context=context).cache(cache_dir=str(tmp_path / "cache"))
@@ -455,7 +445,6 @@ def test_cache_handles_nested_parquet_columns_with_scanner_fallback(tmp_path, mo
     uncached_samples = [_select_user_fields(sample, ("id", "meta", "tags")) for sample in uncached]
     cached_samples = [_select_user_fields(sample, ("id", "meta", "tags")) for sample in cached]
 
-    assert scanner_used is True
     assert cached_samples == uncached_samples
 
 

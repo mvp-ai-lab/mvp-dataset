@@ -40,6 +40,23 @@ def _maybe_init_torch_distributed(backend: str | None) -> tuple[bool, object | N
     return True, dist
 
 
+def _build_progress_bar(*, rank: int, total: int | None):
+    try:
+        from tqdm.auto import tqdm
+    except ModuleNotFoundError as exc:
+        msg = "[TqdmUnavailable] examples/load.py requires tqdm. Install it with `uv add tqdm` or `pip install tqdm`."
+        raise RuntimeError(msg) from exc
+
+    return tqdm(
+        total=total,
+        desc=f"rank {rank}",
+        unit="sample",
+        dynamic_ncols=True,
+        mininterval=0.25,
+        disable=rank != 0,
+    )
+
+
 def main(
     source: str,
     source_kind: str,
@@ -65,14 +82,17 @@ def main(
     if cache:
         ds = ds.cache(cache_num_workers=8)
 
-    exit()
-
     t0 = time.monotonic()
     count = 0
-    for i, _sample in enumerate(ds):
-        count += 1
-        if max_samples is not None and i + 1 >= max_samples:
-            break
+    progress = _build_progress_bar(rank=rank, total=max_samples)
+    try:
+        for i, _sample in enumerate(ds):
+            count += 1
+            progress.update(1)
+            if max_samples is not None and i + 1 >= max_samples:
+                break
+    finally:
+        progress.close()
     elapsed = time.monotonic() - t0
     rate = count / elapsed if elapsed > 0 else float("inf")
     print(
