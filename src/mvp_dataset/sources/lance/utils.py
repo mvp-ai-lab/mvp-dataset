@@ -1,143 +1,204 @@
-"""Lance source implementation for fragment-parallel sample iteration."""
+"""Lance source implementation for slot-aware shuffled sample iteration."""
 
 from __future__ import annotations
 
-import os
-from collections.abc import Iterator, Sequence
+import bisect
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Final
 
-import lance as _lance
+import lance
+import numpy as np
+import pyarrow as pa
+import pyarrow.dataset as pads
 
+from ...core.context import RuntimeContext
 from ...core.types import PathLikeStr, Sample
-
-_DEFAULT_BATCH_SIZE: Final[int] = 65536
-_FRAGMENT_SUFFIX: Final[str] = "@@frag="
 
 
 @dataclass(frozen=True, slots=True)
-class LanceFragment:
-    """One schedulable lance fragment."""
+class LanceDatasetSpec:
+    """Resolved metadata for one Lance dataset URI."""
 
     uri: str
-    fragment_id: int
     num_rows: int
     row_offset: int
+    fragment_ids: tuple[int, ...]
+    handle: object | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LanceSourceSpec:
+    """One schedulable Lance source configuration."""
+
+    datasets: list[LanceDatasetSpec]
 
     @property
-    def cache_key(self) -> str:
-        """Stable shard identifier used by cache manifests and routing."""
-        return f"{self.uri}{_FRAGMENT_SUFFIX}{self.fragment_id}"
+    def total_rows(self) -> int:
+        return sum(dataset.num_rows for dataset in self.datasets)
+
+    @property
+    def total_fragments(self) -> int:
+        return sum(len(dataset.fragment_ids) for dataset in self.datasets)
 
 
-def list_lance_fragments(
-    dataset_uris: Sequence[PathLikeStr],
-    *,
-    min_fragments: int = 0,
-) -> list[LanceFragment]:
-    """Expand lance datasets into schedulable fragments.
-
-    Fragments with fewer than ``MVP_DATASET_LANCE_MIN_ROWS_PER_FRAGMENT``
-    rows (default 5000) are merged with subsequent fragments until the
-    threshold is reached.  When the resulting count is below *min_fragments*,
-    the threshold is lowered to 0 so every physical fragment stands alone.
-    """
-    min_rows = int(os.environ.get("MVP_DATASET_LANCE_MIN_ROWS_PER_FRAGMENT", "5000"))
-    result = _collect_lance_fragments(dataset_uris, min_rows)
-    if len(result) < min_fragments:
-        result = _collect_lance_fragments(dataset_uris, 0)
-    return result
+@dataclass(frozen=True, slots=True)
+class LanceIndexItem:
+    dataset_i: int
+    local_index: int
+    global_index: int
 
 
-def _collect_lance_fragments(
-    dataset_uris: Sequence[PathLikeStr],
-    min_rows: int,
-) -> list[LanceFragment]:
-    result: list[LanceFragment] = []
+def list_lance_sources(dataset_uris: Sequence[PathLikeStr]) -> list[LanceSourceSpec]:
+    """Resolve Lance dataset URIs into one slot-aware source configuration."""
+
+    # 1. Resolve URIs into metadata specs, accumulating row offsets for global indexing.
+    datasets: list[LanceDatasetSpec] = []
+    row_offset = 0
     for uri in dataset_uris:
-        ds = _lance.dataset(str(uri))
-        fragments = ds.get_fragments()
+        ds = lance.dataset(str(uri))
+        fragment_ids = tuple(fragment.fragment_id for fragment in ds.get_fragments())
+        num_rows = ds.count_rows()
+        datasets.append(
+            LanceDatasetSpec(
+                uri=str(uri),
+                num_rows=num_rows,
+                row_offset=row_offset,
+                fragment_ids=fragment_ids,
+            )
+        )
+        row_offset += num_rows
 
-        row_offset = 0
-        pending_ids: list[int] = []
-        pending_rows = 0
+    if not datasets:
+        msg = "[EmptyLanceSource] at least one Lance dataset URI is required"
+        raise ValueError(msg)
 
-        for frag in fragments:
-            frag_rows = frag.count_rows()
-            pending_ids.append(frag.fragment_id)
-            pending_rows += frag_rows
+    return [LanceSourceSpec(datasets=list(datasets))]
 
-            if pending_rows >= min_rows:
-                result.append(
-                    LanceFragment(
-                        uri=str(uri),
-                        fragment_id=pending_ids[0],
-                        num_rows=pending_rows,
-                        row_offset=row_offset,
-                    )
+
+def assign_items(
+    source: Sequence[LanceSourceSpec],
+    *,
+    context: RuntimeContext,
+    resample: bool,
+    shuffle: bool = False,
+) -> Iterable[tuple[LanceSourceSpec, int, int]]:
+    assert len(source) == 1, "Multiple Lance sources are not supported in this implementation"
+    source: LanceSourceSpec = source[0]
+
+    # 1. Yield globally slot-assigned indexes for all rows across all datasets.
+    round_index = 0
+    global_index_list = np.arange(source.total_rows)
+    shuffle_rng = np.random.default_rng(context.seed + round_index)
+
+    slot = context.slot
+    total_slots = context.total_slots
+
+    while True:
+        if shuffle:
+            shuffle_rng.shuffle(global_index_list)
+
+        for i, global_index in enumerate(global_index_list):
+            if i % total_slots != slot:
+                continue
+
+            dataset_i = (
+                bisect.bisect_right(
+                    [dataset.row_offset for dataset in source.datasets],
+                    global_index,
                 )
-                row_offset += pending_rows
-                pending_ids = []
-                pending_rows = 0
-
-        if pending_ids:
-            result.append(
-                LanceFragment(
-                    uri=str(uri),
-                    fragment_id=pending_ids[0],
-                    num_rows=pending_rows,
-                    row_offset=row_offset,
-                )
+                - 1
+            )
+            dataset = source.datasets[dataset_i]
+            local_index = global_index - dataset.row_offset
+            yield LanceIndexItem(
+                dataset_i=dataset_i,
+                local_index=local_index,
+                global_index=global_index,
             )
 
-    return result
+        if not resample:
+            break
+        round_index += 1
+
+
+def _read_batch(
+    source: LanceSourceSpec,
+    batch_indexes: Sequence[LanceIndexItem],
+    *,
+    columns: Sequence[str] | None = None,
+):
+    # 1. group batch indexes by dataset
+    if not batch_indexes:
+        return []
+
+    per_dataset_indices: dict[int, list[int]] = {}
+    for index_item in batch_indexes:
+        per_dataset_indices.setdefault(index_item.dataset_i, []).append(index_item.local_index)
+
+    # 2. read each dataset batch
+    per_dataset_rows: dict[int, list[Sample]] = {}
+    take_indices_type = pa.int64()
+    for dataset_i, local_indices in per_dataset_indices.items():
+        dataset = source.datasets[dataset_i]
+        dataset_handle = dataset.handle if dataset.handle is not None else lance.dataset(dataset.uri)
+
+        if isinstance(dataset_handle, pa.Table):
+            table = dataset_handle
+            if columns is not None:
+                table = table.select(columns)
+            table = table.take(pa.array(local_indices, type=take_indices_type))
+        elif isinstance(dataset_handle, pads.Dataset):
+            table = dataset_handle.to_table(columns=columns)
+            table = table.take(pa.array(local_indices, type=take_indices_type))
+        else:
+            table = dataset_handle.take(local_indices, columns=columns)
+
+        per_dataset_rows[dataset_i] = table.to_pylist()
+
+    # 3. restore global order within batch
+    per_dataset_offsets = {dataset_i: 0 for dataset_i in per_dataset_indices}
+
+    # 4. concatenate into one batch and return
+    batch: list[Sample] = []
+    for index_item in batch_indexes:
+        dataset = source.datasets[index_item.dataset_i]
+        dataset_offset = per_dataset_offsets[index_item.dataset_i]
+        sample = dict(per_dataset_rows[index_item.dataset_i][dataset_offset])
+        sample["__file__"] = dataset.uri
+        sample["__index_in_file__"] = index_item.local_index
+        sample["__key__"] = f"{dataset.uri}:{index_item.local_index}"
+        batch.append(sample)
+        per_dataset_offsets[index_item.dataset_i] += 1
+
+    return batch
 
 
 def iter_lance(
-    fragment: LanceFragment,
+    source: LanceSourceSpec,
+    index_stream: Iterable[LanceIndexItem],
     *,
     columns: Sequence[str] | None = None,
-    batch_size: int = _DEFAULT_BATCH_SIZE,
-) -> Iterator[Sample]:
-    """Iterate one lance fragment and yield one sample dict per row."""
-
-    ds = _lance.dataset(fragment.uri)
-    lance_fragments = ds.get_fragments()
-    target = [f for f in lance_fragments if f.fragment_id == fragment.fragment_id]
-    if not target:
-        msg = f"[LanceFragmentNotFound] fragment_id={fragment.fragment_id} uri={fragment.uri!r}"
-        raise KeyError(msg)
-
-    index_in_file = fragment.row_offset
-    for record_batch in target[0].to_batches(
-        columns=columns,
-        batch_size=batch_size,
-    ):
-        column_names = record_batch.schema.names
-        columns_data = [record_batch.column(i) for i in range(record_batch.num_columns)]
-        for batch_row_index in range(record_batch.num_rows):
-            sample: Sample = {
-                name: columns_data[column_index][batch_row_index].as_py()
-                for column_index, name in enumerate(column_names)
-            }
-            sample["__file__"] = fragment.uri
-            sample["__index_in_file__"] = index_in_file
-            sample["__key__"] = f"{fragment.uri}:{index_in_file}"
-            yield sample
-            index_in_file += 1
-
-
-def iter_lances(
-    fragments: Iterator[LanceFragment],
-    *,
-    columns: Sequence[str] | None = None,
-    batch_size: int = _DEFAULT_BATCH_SIZE,
-) -> Iterator[Sample]:
-    """Iterate lance fragments in order and yield row samples."""
-
-    for fragment in fragments:
-        yield from iter_lance(
-            fragment,
-            columns=columns,
-            batch_size=batch_size,
+    batch_size: int = 65536,
+    load_in_memory: bool = False,
+):
+    # 1. Load all dataset into memory if requested.
+    for dataset_i, dataset in enumerate(source.datasets):
+        ds_handle = lance.dataset(dataset.uri)
+        if load_in_memory:
+            ds_handle = pads.InMemoryDataset(ds_handle.to_table())
+        source.datasets[dataset_i] = LanceDatasetSpec(
+            uri=dataset.uri,
+            num_rows=dataset.num_rows,
+            row_offset=dataset.row_offset,
+            fragment_ids=dataset.fragment_ids,
+            handle=ds_handle,
         )
+
+    batch_indexes: list[LanceIndexItem] = []
+    for index_item in index_stream:
+        batch_indexes.append(index_item)
+        if len(batch_indexes) >= batch_size:
+            yield from _read_batch(source, batch_indexes, columns=columns)
+            batch_indexes.clear()
+    if batch_indexes:
+        yield from _read_batch(source, batch_indexes, columns=columns)

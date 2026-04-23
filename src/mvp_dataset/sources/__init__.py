@@ -1,7 +1,7 @@
 """Data source implementations."""
 
 from .jsonl import iter_jsonls
-from .lance import LanceFragment, iter_lance, iter_lances, list_lance_fragments
+from .lance import LanceDatasetSpec, LanceSourceSpec, iter_lance, list_lance_sources
 from .parquet import (
     ParquetFragment,
     iter_parquet,
@@ -11,15 +11,15 @@ from .parquet import (
 from .tar import iter_tar, iter_tars
 
 __all__ = [
-    "LanceFragment",
+    "LanceDatasetSpec",
+    "LanceSourceSpec",
     "ParquetFragment",
     "iter_lance",
-    "iter_lances",
     "iter_tar",
     "iter_tars",
     "iter_jsonls",
     "iter_parquet",
     "iter_parquets",
-    "list_lance_fragments",
+    "list_lance_sources",
     "list_parquet_fragments",
 ]

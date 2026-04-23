@@ -71,7 +71,12 @@ def write_nested_parquet_file(root: Path, records: list[dict[str, object]], *, r
     return str(path)
 
 
-def write_lance_dataset(root: Path, records: list[dict[str, object]]) -> str:
+def write_lance_dataset(
+    root: Path,
+    records: list[dict[str, object]],
+    *,
+    max_rows_per_file: int | None = None,
+) -> str:
     import lance
 
     path = root / "samples.lance"
@@ -82,7 +87,10 @@ def write_lance_dataset(root: Path, records: list[dict[str, object]]) -> str:
             "value": [int(record["value"]) for record in records],
         }
     )
-    lance.write_dataset(table, str(path))
+    kwargs: dict[str, int] = {}
+    if max_rows_per_file is not None:
+        kwargs["max_rows_per_file"] = max_rows_per_file
+    lance.write_dataset(table, str(path), **kwargs)
     return str(path)
 
 

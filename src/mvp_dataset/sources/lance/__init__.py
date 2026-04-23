@@ -1,8 +1,8 @@
-from .utils import LanceFragment, iter_lance, iter_lances, list_lance_fragments
+from .utils import LanceDatasetSpec, LanceSourceSpec, iter_lance, list_lance_sources
 
 __all__ = [
-    "LanceFragment",
+    "LanceDatasetSpec",
+    "LanceSourceSpec",
     "iter_lance",
-    "iter_lances",
-    "list_lance_fragments",
+    "list_lance_sources",
 ]

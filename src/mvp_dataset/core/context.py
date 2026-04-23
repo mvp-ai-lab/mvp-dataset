@@ -62,7 +62,7 @@ class RuntimeContext:
     num_nodes: int = 1
     worker_id: int = 0
     num_workers: int = 1
-    epoch: int = 0
+    epoch: int = 0  # TODO: check where we need this?
     seed: int = 0
     mesh: DataLoadMesh | None = None
 

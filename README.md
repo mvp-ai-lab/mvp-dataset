@@ -251,13 +251,17 @@ Dataset.from_source(
     resample=False,
     columns=None,
     batch_size=65536,
+    shuffle_mode="none",
 )
 ```
 
 Notes:
 
 - inputs are local Lance dataset paths or URIs
-- work is scheduled by Lance fragments
+- `shuffle_mode="none"` preserves ordered reads and is the default used by cached Lance datasets
+- `shuffle_mode="global"` performs an exact global permutation via `take(...)`
+- `shuffle_mode="random_scan"` uses `scanner(scan_in_order=False)` for higher-throughput approximate shuffle
+- `random_scan` falls back to `global` when fragment parallelism is lower than `context.total_slots`
 
 ## Pipeline Semantics
 

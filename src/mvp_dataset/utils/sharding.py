@@ -9,7 +9,7 @@ from ..core.context import RuntimeContext
 from ..log import get_logger
 
 
-def iter_items[T](items: Sequence[T], context: RuntimeContext, resample: bool = False) -> Iterator[T]:
+def assign_items[T](items: Sequence[T], context: RuntimeContext, resample: bool = False) -> Iterator[T]:
     """Yield slot-assigned items in deterministic rounds.
 
     Args:

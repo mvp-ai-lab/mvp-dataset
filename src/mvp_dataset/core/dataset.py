@@ -13,7 +13,7 @@ from mvp_dataset.cache.store import merge_lance
 from mvp_dataset.utils.barrier import FileBarrier
 
 from ..log import get_logger
-from ..utils.sharding import iter_items
+from ..utils.sharding import assign_items
 from .context import RuntimeContext
 from .stages import (
     PARALLELIZABLE_STAGE_KINDS,
@@ -47,6 +47,10 @@ class Dataset(torch_iterabledataset_class()):
     _resample: bool
     _iter_source_stream: Callable
     _cache_spec: CacheSpec | None = None
+
+    def _build_source_stream(self, *, context: RuntimeContext) -> Iterable[object]:
+        source_shard_stream = assign_items(self._source, context=context, resample=self._resample)
+        return self._iter_source_stream(source_shard_stream)
 
     def _append_stage(self, spec: StageSpec) -> Dataset:
         return dataclass_replace(self, _stages=self._stages + (spec,))
@@ -212,6 +216,12 @@ class Dataset(torch_iterabledataset_class()):
         from ..cache.store import _write_lance_dataset
         from ..sources.lance.dataset import LanceDataset
 
+        logger = get_logger()
+        logger.warning(
+            "[CacheWarning] .cache() is an experimental API subject to change; please report issues"
+            " and feedback to the mvp-dataset maintainers."
+        )
+
         if self._cache_spec is not None:
             msg = "[CacheError] only one .cache() boundary allowed"
             raise ValueError(msg)
@@ -296,9 +306,10 @@ class Dataset(torch_iterabledataset_class()):
                 parallel_specs = self._stages[:split]
                 serial_specs = self._stages[split:]
 
-                source_shard_stream = iter_items(self._source, context=self.context, resample=False)
                 stream: Iterable[object] = iter_stage_group(
-                    self._iter_source_stream(source_shard_stream), parallel_specs, cache_num_workers
+                    self._build_source_stream(context=self.context, resample=False),
+                    parallel_specs,
+                    cache_num_workers,
                 )
                 for spec in serial_specs:
                     stream = spec.apply(stream)
@@ -384,8 +395,7 @@ class Dataset(torch_iterabledataset_class()):
     def __iter__(self) -> Iterator[object]:
         """Materialize and run the full lazy pipeline."""
         context = RuntimeContext.from_runtime(base=self.context)
-        source_shard_stream = iter_items(self._source, context=context, resample=self._resample)
-        stream: Iterable[object] = self._iter_source_stream(source_shard_stream)
+        stream: Iterable[object] = self._build_source_stream(context=context)
         for spec in self._stages:
             stream = spec.apply(stream)
         yield from stream

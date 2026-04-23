@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 from mvp_dataset.core.context import RuntimeContext
@@ -6,23 +6,33 @@ from mvp_dataset.core.dataset import Dataset
 from mvp_dataset.core.types import ShardInput
 from mvp_dataset.utils.url import normalize_paths
 
-from .utils import iter_lances, list_lance_fragments
+from .utils import LanceSourceSpec, assign_items, iter_lance, list_lance_sources
 
 
 @dataclass(frozen=True, slots=True)
 class _LanceSourceIter:
+    source: LanceSourceSpec
     columns: Sequence[str] | None = None
     batch_size: int = 65536
+    load_in_memory: bool = False
 
-    def __call__(self, fragment_stream):
-        return iter_lances(
-            fragment_stream,
+    handles_sharding = True
+
+    def __call__(self, source_stream):
+        return iter_lance(
+            self.source,
+            source_stream,
             columns=self.columns,
             batch_size=self.batch_size,
+            load_in_memory=self.load_in_memory,
         )
 
 
+@dataclass(frozen=True, slots=True)
 class LanceDataset(Dataset):
+    _global_shuffle: bool = False
+    _load_in_memory: bool = False
+
     @classmethod
     def from_source(
         cls,
@@ -31,6 +41,9 @@ class LanceDataset(Dataset):
         resample: bool = False,
         columns: Sequence[str] | None = None,
         batch_size: int = 65536,
+        global_shuffle: bool = False,
+        load_in_memory: bool = False,
+        ref_columns: Sequence[str] | None = None,
     ):
         """Build a dataset from local Lance dataset paths.
 
@@ -40,25 +53,45 @@ class LanceDataset(Dataset):
             resample: Whether to loop shards indefinitely across rounds.
             columns: Optional list of column names to read.
             batch_size: Number of rows per Arrow batch during iteration.
-
+            global_shuffle: Whether to shuffle rows globally across all datasets.
+            load_in_memory: Whether to load entire datasets into memory (recommended
+                            if you provide a metadata lance dataset
+                            and link other data via reference columns).
+            ref_columns: Optional list of column names to use as references when loading
         Returns:
-            A dataset whose source is the list of lance fragments.
+            A lance dataset.
         """
         runtime_context = RuntimeContext.from_runtime() if context is None else context
         normalized_shards = normalize_paths(shards)
-        fragments = list_lance_fragments(
+        sources = list_lance_sources(
             normalized_shards,
-            min_fragments=runtime_context.total_slots,
         )
 
         return cls(
             context=runtime_context,
-            _source=fragments,
+            _source=sources,
             _resample=resample,
             _source_kind="lance",
             _stages=(),
             _iter_source_stream=_LanceSourceIter(
+                source=sources[0],
                 columns=columns,
                 batch_size=batch_size,
+                load_in_memory=load_in_memory,
             ),
+            _global_shuffle=global_shuffle,
+            _load_in_memory=load_in_memory,
         )
+
+    def _build_source_stream(self, *, context: RuntimeContext) -> Iterable[object]:
+        assert len(self._source) == 1, "Multiple Lance sources are not supported in this implementation"
+        source_shard_stream = assign_items(
+            self._source,
+            context=context,
+            resample=self._resample,
+            shuffle=self._global_shuffle,
+        )
+        return self._iter_source_stream(source_shard_stream)
+
+    def shuffle(self, *args, **kwargs) -> Dataset:
+        raise NotImplementedError("LanceDataset.shuffle() is not supported.")
