@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import os
 import time
 
 from mvp_dataset import Dataset, TorchLoader
@@ -21,18 +22,23 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Read parquet shards with mvp-dataset")
     parser.add_argument("shards", nargs="+", help="Local parquet shard paths or patterns")
     parser.add_argument("--columns", nargs="*", default=None, help="Optional subset of parquet columns to read")
-    parser.add_argument("--batch-size", type=int, default=8192, help="PyArrow record batch size")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8192,
+        help="PyArrow record batch size (exported as MVP_DATASET_PARQUET_BATCH_SIZE)",
+    )
     parser.add_argument("--max-batches", type=int, default=2, help="Maximum number of output batches")
     args = parser.parse_args()
 
     shards = [f for pattern in args.shards for f in (glob.glob(pattern, recursive=True) or [pattern])]
+    os.environ["MVP_DATASET_PARQUET_BATCH_SIZE"] = str(args.batch_size)
     print(len(shards), "shard(s) found.")
 
     dataset = Dataset.from_parquet(
         shards,
         resample=True,
         columns=args.columns,
-        batch_size=args.batch_size,
     ).map(annotate)
     loader = TorchLoader(dataset, num_workers=0, batch_size=4, collate_fn=lambda batch: batch)
 

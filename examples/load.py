@@ -65,6 +65,8 @@ def main(
     max_samples: int | None,
     log_level: str,
     cache: bool,
+    shuffle: bool,
+    resample: bool,
 ):
     set_log_level(log_level)
     dist_enabled, dist = _maybe_init_torch_distributed(dist_backend)
@@ -78,7 +80,20 @@ def main(
         flush=True,
     )
 
-    ds = Dataset.from_source(source_kind, shards=source).map(map_func).shuffle(1000)
+    if shuffle and source_kind == "lance":
+        ds = Dataset.from_source(
+            source_kind,
+            shards=source,
+            resample=resample,
+            global_shuffle=shuffle,
+            ref_columns={
+                "image": {"uri": "examples/demo_data/media.lance", "key_column": "media_id", "value_column": "payload"},
+                "depth": {"uri": "examples/demo_data/media.lance", "key_column": "media_id", "value_column": "payload"},
+            },
+        ).map(map_func)
+    else:
+        ds = Dataset.from_source(source_kind, shards=source, resample=resample).map(map_func)
+        ds = ds.shuffle(1000)
     if cache:
         ds = ds.cache(cache_num_workers=8)
 
@@ -142,6 +157,17 @@ if __name__ == "__main__":
         help="Whether to cache the dataset after loading. Caching is recommended for better "
         "performance when the dataset is large and/or expensive to load.",
     )
+    parser.add_argument(
+        "--shuffle",
+        action="store_true",
+        help="Whether to shuffle the dataset after loading.",
+    )
+    parser.add_argument(
+        "--resample",
+        action="store_true",
+        help="Whether to resample the dataset after loading.",
+    )
+
     args = parser.parse_args()
 
     main(
@@ -151,4 +177,6 @@ if __name__ == "__main__":
         max_samples=args.max_samples,
         log_level=args.log_level,
         cache=args.cache,
+        shuffle=args.shuffle,
+        resample=args.resample,
     )

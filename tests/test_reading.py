@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import pickle
 import random
 
@@ -19,6 +20,7 @@ from .helpers import (
     normalize_sample,
     write_jsonl_file,
     write_lance_dataset,
+    write_lance_table,
     write_parquet_file,
     write_tar_shards,
 )
@@ -227,3 +229,230 @@ def test_lance_random_scan_falls_back_to_global_when_fragments_are_insufficient(
 
     assert observed_rank0 == [records[index] for index in shuffled_indices[0::2]]
     assert observed_rank1 == [records[index] for index in shuffled_indices[1::2]]
+
+
+def test_lance_ref_columns_resolve_via_prebuilt_index(tmp_path, monkeypatch) -> None:
+    if importlib.util.find_spec("lance") is None:
+        pytest.skip("lance is not installed")
+
+    monkeypatch.chdir(tmp_path)
+    meta_path = write_lance_table(
+        tmp_path,
+        "meta.lance",
+        [
+            {"id": "sample-0", "image": "image-1", "value": 0},
+            {"id": "sample-1", "image": "image-0", "value": 1},
+            {"id": "sample-2", "image": None, "value": 2},
+        ],
+    )
+    image_path = write_lance_table(
+        tmp_path,
+        "image.lance",
+        [
+            {"image_id": "image-0", "image": b"zero"},
+            {"image_id": "image-1", "image": b"one"},
+        ],
+    )
+
+    dataset = Dataset.from_source(
+        "lance",
+        shards=meta_path,
+        batch_size=2,
+        ref_columns={"image": {"uri": image_path, "key_column": "image_id", "value_column": "image"}},
+    )
+
+    observed = list(dataset)
+    index_paths = list((tmp_path / "meta.lance" / "_mvp_ref_index").glob("ref-index-*"))
+    manifest_mtime_ns = (index_paths[0] / "metadata.json").stat().st_mtime_ns
+    second_observed = list(dataset)
+    second_index_paths = list((tmp_path / "meta.lance" / "_mvp_ref_index").glob("ref-index-*"))
+    manifest = json.loads((index_paths[0] / "metadata.json").read_text(encoding="utf-8"))
+
+    assert [sample["image"] for sample in observed] == [b"one", b"zero", None]
+    assert [sample["image"] for sample in second_observed] == [b"one", b"zero", None]
+    assert [sample["__index_in_file__"] for sample in observed] == [0, 1, 2]
+    assert len(index_paths) == 1
+    assert second_index_paths == index_paths
+    assert manifest["refs"]["image"]["kind"] == "csr_row_index"
+    assert (index_paths[0] / manifest["refs"]["image"]["offsets_file"]).exists()
+    assert (index_paths[0] / manifest["refs"]["image"]["entries_file"]).exists()
+    assert manifest["refs"]["image"]["ref_dataset"]["uri"] == image_path
+    assert (index_paths[0] / "metadata.json").exists()
+    assert (index_paths[0] / "metadata.json").stat().st_mtime_ns == manifest_mtime_ns
+
+
+def test_lance_ref_columns_reuse_ref_dataset_handle_during_apply(tmp_path, monkeypatch) -> None:
+    if importlib.util.find_spec("lance") is None:
+        pytest.skip("lance is not installed")
+
+    from mvp_dataset.sources.lance import utils as lance_utils
+
+    monkeypatch.chdir(tmp_path)
+    meta_path = write_lance_table(
+        tmp_path,
+        "meta.lance",
+        [
+            {"id": "sample-0", "image": "image-0"},
+            {"id": "sample-1", "image": "image-1"},
+            {"id": "sample-2", "image": "image-0"},
+        ],
+    )
+    image_path = write_lance_table(
+        tmp_path,
+        "image.lance",
+        [
+            {"image_id": "image-0", "image": b"zero"},
+            {"image_id": "image-1", "image": b"one"},
+        ],
+    )
+    source = lance_utils.attach_lance_ref_columns(
+        lance_utils.list_lance_sources([meta_path])[0],
+        {"image": {"uri": image_path, "key_column": "image_id", "value_column": "image"}},
+    )
+    prepared = lance_utils.prepare_ref_indexes(source)
+    index_handle = prepared.ref_columns[0].index_handle
+
+    assert isinstance(index_handle, dict)
+    assert "value_dataset" in index_handle
+
+    real_dataset = lance_utils.lance.dataset
+
+    def fail_if_ref_dataset_reopened(uri, *args, **kwargs):
+        if str(uri) == image_path:
+            raise AssertionError("ref dataset should be reused while applying ref columns")
+        return real_dataset(uri, *args, **kwargs)
+
+    monkeypatch.setattr(lance_utils.lance, "dataset", fail_if_ref_dataset_reopened)
+    batch_indexes = [
+        lance_utils.LanceIndexItem(dataset_i=0, local_index=index, global_index=index) for index in range(3)
+    ]
+    batch = lance_utils._read_batch(prepared, batch_indexes, columns=None)
+
+    lance_utils._apply_ref_columns(prepared, batch, batch_indexes, columns=None)
+
+    assert [sample["image"] for sample in batch] == [b"zero", b"one", b"zero"]
+
+
+def test_lance_ref_columns_share_unified_index(tmp_path, monkeypatch) -> None:
+    if importlib.util.find_spec("lance") is None:
+        pytest.skip("lance is not installed")
+
+    monkeypatch.chdir(tmp_path)
+    meta_path = write_lance_table(
+        tmp_path,
+        "meta.lance",
+        [
+            {"id": "sample-0", "image": "image-1", "label": "label-0"},
+            {"id": "sample-1", "image": "image-0", "label": "label-1"},
+        ],
+    )
+    image_path = write_lance_table(
+        tmp_path,
+        "image.lance",
+        [
+            {"image_id": "image-0", "image": b"zero"},
+            {"image_id": "image-1", "image": b"one"},
+        ],
+    )
+    label_path = write_lance_table(
+        tmp_path,
+        "label.lance",
+        [
+            {"label_id": "label-0", "label": "cat"},
+            {"label_id": "label-1", "label": "dog"},
+        ],
+    )
+
+    dataset = Dataset.from_source(
+        "lance",
+        shards=meta_path,
+        ref_columns={
+            "image": {"uri": image_path, "key_column": "image_id", "value_column": "image"},
+            "label": {"uri": label_path, "key_column": "label_id", "value_column": "label"},
+        },
+    )
+
+    observed = list(dataset)
+    index_paths = list((tmp_path / "meta.lance" / "_mvp_ref_index").glob("ref-index-*"))
+    manifest = json.loads((index_paths[0] / "metadata.json").read_text(encoding="utf-8"))
+
+    assert [(sample["image"], sample["label"]) for sample in observed] == [(b"one", "cat"), (b"zero", "dog")]
+    assert len(index_paths) == 1
+    assert set(manifest["refs"]) == {"image", "label"}
+    assert manifest["refs"]["image"]["kind"] == "csr_row_index"
+    assert manifest["refs"]["label"]["kind"] == "csr_row_index"
+    assert manifest["refs"]["image"]["ref_dataset"]["uri"] == image_path
+    assert manifest["refs"]["label"]["ref_dataset"]["uri"] == label_path
+
+
+def test_lance_ref_columns_resolve_multi_value_refs(tmp_path, monkeypatch) -> None:
+    if importlib.util.find_spec("lance") is None:
+        pytest.skip("lance is not installed")
+
+    monkeypatch.chdir(tmp_path)
+    meta_path = write_lance_table(
+        tmp_path,
+        "meta.lance",
+        [
+            {"id": "sample-0", "images": ["image-1", "image-0"]},
+            {"id": "sample-1", "images": []},
+            {"id": "sample-2", "images": ["image-0"]},
+        ],
+    )
+    image_path = write_lance_table(
+        tmp_path,
+        "image.lance",
+        [
+            {"image_id": "image-0", "image": b"zero"},
+            {"image_id": "image-1", "image": b"one"},
+        ],
+    )
+
+    dataset = Dataset.from_source(
+        "lance",
+        shards=meta_path,
+        ref_columns={"images": {"uri": image_path, "key_column": "image_id", "value_column": "image"}},
+    )
+
+    observed = list(dataset)
+
+    assert [sample["images"] for sample in observed] == [[b"one", b"zero"], [], [b"zero"]]
+
+
+def test_lance_ref_columns_respect_projection(tmp_path, monkeypatch) -> None:
+    if importlib.util.find_spec("lance") is None:
+        pytest.skip("lance is not installed")
+
+    monkeypatch.chdir(tmp_path)
+    meta_path = write_lance_table(tmp_path, "meta.lance", [{"id": "sample-0", "image": "image-0", "value": 0}])
+    image_path = write_lance_table(tmp_path, "image.lance", [{"image_id": "image-0", "image": b"zero"}])
+
+    dataset = Dataset.from_source(
+        "lance",
+        shards=meta_path,
+        columns=["id", "value"],
+        ref_columns={"image": {"uri": image_path, "key_column": "image_id", "value_column": "image"}},
+    )
+
+    observed = list(dataset)
+
+    assert observed[0]["id"] == "sample-0"
+    assert "image" not in observed[0]
+
+
+def test_lance_ref_columns_missing_key_raises(tmp_path, monkeypatch) -> None:
+    if importlib.util.find_spec("lance") is None:
+        pytest.skip("lance is not installed")
+
+    monkeypatch.chdir(tmp_path)
+    meta_path = write_lance_table(tmp_path, "meta.lance", [{"id": "sample-0", "image": "missing", "value": 0}])
+    image_path = write_lance_table(tmp_path, "image.lance", [{"image_id": "image-0", "image": b"zero"}])
+
+    dataset = Dataset.from_source(
+        "lance",
+        shards=meta_path,
+        ref_columns={"image": {"uri": image_path, "key_column": "image_id", "value_column": "image"}},
+    )
+
+    with pytest.raises(KeyError, match="MissingLanceRefKey"):
+        list(dataset)

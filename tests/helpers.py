@@ -94,6 +94,15 @@ def write_lance_dataset(
     return str(path)
 
 
+def write_lance_table(root: Path, name: str, records: list[dict[str, object]]) -> str:
+    import lance
+
+    path = root / name
+    table = pa.Table.from_pylist(records)
+    lance.write_dataset(table, str(path), mode="overwrite")
+    return str(path)
+
+
 def normalize_sample(sample: dict[str, object]) -> dict[str, object]:
     normalized: dict[str, object] = {}
     for field in ("id", "text", "value"):

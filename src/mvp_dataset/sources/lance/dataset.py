@@ -6,7 +6,13 @@ from mvp_dataset.core.dataset import Dataset
 from mvp_dataset.core.types import ShardInput
 from mvp_dataset.utils.url import normalize_paths
 
-from .utils import LanceSourceSpec, assign_items, iter_lance, list_lance_sources
+from .utils import (
+    LanceSourceSpec,
+    assign_items,
+    attach_lance_ref_columns,
+    iter_lance,
+    list_lance_sources,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,7 +49,7 @@ class LanceDataset(Dataset):
         batch_size: int = 65536,
         global_shuffle: bool = False,
         load_in_memory: bool = False,
-        ref_columns: Sequence[str] | None = None,
+        ref_columns: dict[str, dict[str, str]] | None = None,
     ):
         """Build a dataset from local Lance dataset paths.
 
@@ -57,7 +63,8 @@ class LanceDataset(Dataset):
             load_in_memory: Whether to load entire datasets into memory (recommended
                             if you provide a metadata lance dataset
                             and link other data via reference columns).
-            ref_columns: Optional list of column names to use as references when loading
+            ref_columns: Optional mapping of source column names to explicit Lance
+                         reference configs containing uri, key_column, and value_column.
         Returns:
             A lance dataset.
         """
@@ -66,6 +73,8 @@ class LanceDataset(Dataset):
         sources = list_lance_sources(
             normalized_shards,
         )
+        source = attach_lance_ref_columns(sources[0], ref_columns)
+        sources = [source]
 
         return cls(
             context=runtime_context,
@@ -74,7 +83,7 @@ class LanceDataset(Dataset):
             _source_kind="lance",
             _stages=(),
             _iter_source_stream=_LanceSourceIter(
-                source=sources[0],
+                source=source,
                 columns=columns,
                 batch_size=batch_size,
                 load_in_memory=load_in_memory,
