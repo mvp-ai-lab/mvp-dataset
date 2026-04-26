@@ -123,7 +123,12 @@ def main(
             resample=resample,
             global_shuffle=shuffle,
             ref_columns=resolved_ref_columns,
-        ).map(map_func)
+        )
+        if not no_ref:
+            ref_names = [ref.column for ref in ds._source[0].ref_columns]
+            if ref_names:
+                ds = ds.resolve_ref(ref_names)
+        ds = ds.map(map_func)
     else:
         ds = Dataset.from_source(source_kind, shards=source, resample=resample).map(map_func)
         ds = ds.shuffle(1000)

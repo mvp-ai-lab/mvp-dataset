@@ -148,7 +148,7 @@ def _build_dataset(spec: SourceSpec, args: argparse.Namespace) -> Dataset:
         )
 
     if spec.kind == "lance":
-        return Dataset.from_source(
+        dataset = Dataset.from_source(
             "lance",
             source_path,
             context=context,
@@ -158,6 +158,13 @@ def _build_dataset(spec: SourceSpec, args: argparse.Namespace) -> Dataset:
             global_shuffle=args.global_shuffle,
             load_in_memory=args.lance_load_in_memory,
         )
+        ref_names = [ref.column for ref in dataset._source[0].ref_columns]
+        if columns is not None:
+            selected_columns = set(columns)
+            ref_names = [ref_name for ref_name in ref_names if ref_name in selected_columns]
+        if ref_names:
+            dataset = dataset.resolve_ref(ref_names, batch_size=args.lance_batch_size)
+        return dataset
 
     if columns is not None:
         msg = f"[UnsupportedBenchmarkColumns] --columns is only supported for parquet/lance, got {spec.kind!r}"

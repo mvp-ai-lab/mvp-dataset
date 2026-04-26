@@ -1,0 +1,53 @@
+"""Shared Lance source data structures."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class LanceDatasetSpec:
+    """Resolved metadata for one Lance dataset URI."""
+
+    uri: str
+    num_rows: int
+    row_offset: int
+    fragment_ids: tuple[int, ...]
+    handle: object | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LanceRefSpec:
+    """Configuration for one Lance reference column."""
+
+    column: str
+    uri: str
+    key_column: str
+    value_column: str
+    index_uri: str | None = None
+    index_offsets_path: str | None = None
+    index_entries_path: str | None = None
+    index_handle: object | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LanceSourceSpec:
+    """One schedulable Lance source configuration."""
+
+    datasets: list[LanceDatasetSpec]
+    ref_columns: tuple[LanceRefSpec, ...] = ()
+
+    @property
+    def total_rows(self) -> int:
+        return sum(dataset.num_rows for dataset in self.datasets)
+
+    @property
+    def total_fragments(self) -> int:
+        return sum(len(dataset.fragment_ids) for dataset in self.datasets)
+
+
+@dataclass(frozen=True, slots=True)
+class LanceIndexItem:
+    dataset_i: int
+    local_index: int
+    global_index: int

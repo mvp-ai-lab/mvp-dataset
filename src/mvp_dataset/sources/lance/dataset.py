@@ -1,106 +1,22 @@
-import json
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 
+from mvp_dataset.cache.fingerprint import hash_bytes
 from mvp_dataset.core.context import RuntimeContext
 from mvp_dataset.core.dataset import Dataset
-from mvp_dataset.core.types import ShardInput
-from mvp_dataset.utils.url import normalize_paths
+from mvp_dataset.core.stages import _AssembleStage
+from mvp_dataset.core.types import ShardInput, StageSpec
 
 from .utils import (
+    LanceResolveRefFactory,
     LanceSourceSpec,
     assign_items,
     attach_lance_ref_columns,
     iter_lance,
     list_lance_sources,
+    resolve_lance_source_config,
+    validate_ref_names,
 )
-
-
-def _resolve_config_uri(uri: object, *, base_dir: Path) -> str:
-    if not isinstance(uri, str) or not uri:
-        msg = f"[InvalidLanceConfig] expected a non-empty URI string, got {uri!r}"
-        raise ValueError(msg)
-    if "://" in uri or Path(uri).is_absolute():
-        return uri
-    return str(base_dir / uri)
-
-
-def _load_lance_source_config(config_path: Path) -> tuple[list[str], dict[str, dict[str, str]] | None]:
-    if not config_path.exists():
-        msg = f"[MissingLanceConfig] Lance source config was not found: {config_path}"
-        raise FileNotFoundError(msg)
-    if not config_path.is_file():
-        msg = f"[InvalidLanceConfig] Lance source config must be a JSON file: {config_path}"
-        raise ValueError(msg)
-
-    try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        msg = f"[InvalidLanceConfig] failed to parse JSON config {config_path}: {exc}"
-        raise ValueError(msg) from exc
-    if not isinstance(config, dict):
-        msg = f"[InvalidLanceConfig] expected a JSON object in {config_path}"
-        raise ValueError(msg)
-
-    base_dir = config_path.resolve().parent
-    raw_shards = config.get("main_uri", config.get("shards", config.get("uri")))
-    if raw_shards is None:
-        msg = f"[InvalidLanceConfig] {config_path} must contain 'main_uri', 'shards', or 'uri'"
-        raise ValueError(msg)
-    if isinstance(raw_shards, str):
-        resolved_shards = [_resolve_config_uri(raw_shards, base_dir=base_dir)]
-    elif isinstance(raw_shards, list):
-        resolved_shards = [_resolve_config_uri(uri, base_dir=base_dir) for uri in raw_shards]
-    else:
-        msg = f"[InvalidLanceConfig] main_uri/shards/uri must be a string or list of strings in {config_path}"
-        raise ValueError(msg)
-
-    raw_ref_columns = config.get("ref_columns")
-    if raw_ref_columns is None:
-        return resolved_shards, None
-    if not isinstance(raw_ref_columns, dict):
-        msg = f"[InvalidLanceConfig] ref_columns must be a mapping in {config_path}"
-        raise ValueError(msg)
-
-    resolved_ref_columns: dict[str, dict[str, str]] = {}
-    for column, ref_config in raw_ref_columns.items():
-        if not isinstance(column, str) or not column:
-            msg = f"[InvalidLanceConfig] ref column names must be non-empty strings in {config_path}"
-            raise ValueError(msg)
-        if not isinstance(ref_config, dict):
-            msg = f"[InvalidLanceConfig] ref config for {column!r} must be a mapping in {config_path}"
-            raise ValueError(msg)
-        resolved_ref_config: dict[str, str] = {}
-        for key, value in ref_config.items():
-            if key == "uri":
-                resolved_ref_config[key] = _resolve_config_uri(value, base_dir=base_dir)
-            elif isinstance(value, str):
-                resolved_ref_config[key] = value
-            else:
-                msg = f"[InvalidLanceConfig] ref config value {column!r}.{key} must be a string in {config_path}"
-                raise ValueError(msg)
-        resolved_ref_columns[column] = resolved_ref_config
-
-    return resolved_shards, resolved_ref_columns
-
-
-def _resolve_lance_source_config(
-    shards: ShardInput | Sequence[ShardInput],
-    ref_columns: dict[str, dict[str, str]] | None,
-) -> tuple[list[str], dict[str, dict[str, str]] | None]:
-    normalized_shards = normalize_paths(shards)
-    json_config_paths = [Path(path) for path in normalized_shards if Path(path).suffix.lower() == ".json"]
-    if not json_config_paths:
-        return normalized_shards, ref_columns
-    if len(normalized_shards) != 1:
-        msg = "[InvalidLanceConfig] a Lance JSON source config must be provided as the only shard"
-        raise ValueError(msg)
-
-    resolved_shards, config_ref_columns = _load_lance_source_config(json_config_paths[0])
-    if ref_columns is not None:
-        return resolved_shards, ref_columns
-    return resolved_shards, config_ref_columns
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,19 +66,21 @@ class LanceDataset(Dataset):
             columns: Optional list of column names to read.
             batch_size: Number of rows per Arrow batch during iteration.
             global_shuffle: Whether to shuffle rows globally across all datasets.
-            load_in_memory: Whether to load entire datasets into memory (recommended
-                            if you provide a metadata lance dataset
-                            and link other data via reference columns).
+            load_in_memory: Whether to load entire datasets into memory.
             ref_columns: Optional mapping of source column names to explicit Lance
                          reference configs containing uri, key_column, and value_column.
+                         Use ``resolve_ref(...)`` later in the pipeline to read
+                         and replace these referenced values.
         Returns:
             A lance dataset.
         """
         runtime_context = RuntimeContext.from_runtime() if context is None else context
-        normalized_shards, resolved_ref_columns = _resolve_lance_source_config(shards, ref_columns)
+        normalized_shards, resolved_ref_columns = resolve_lance_source_config(shards, ref_columns)
+        # 1. Merge all shards into a single source spec, validating that they can be read together.
         sources = list_lance_sources(
             normalized_shards,
         )
+        # 2. Attach reference column configs to the source spec, if any.
         source = attach_lance_ref_columns(sources[0], resolved_ref_columns)
         sources = [source]
 
@@ -194,3 +112,36 @@ class LanceDataset(Dataset):
 
     def shuffle(self, *args, **kwargs) -> Dataset:
         raise NotImplementedError("LanceDataset.shuffle() is not supported.")
+
+    def resolve_ref(
+        self,
+        ref_names: Sequence[str],
+        *,
+        batch_size: int = 1024,
+        context: RuntimeContext | None = None,
+    ) -> Dataset:
+        """Append a lazy stage that resolves configured Lance reference columns."""
+        assert batch_size > 0, "batch_size must be a positive integer"
+
+        ref_names = validate_ref_names(self._source[0], ref_names)
+        source = self._source[0]
+
+        fingerprint_parts: list[object] = ["<lance-resolve-ref>"]
+        for ref in source.ref_columns:
+            if ref.name in ref_names:
+                fingerprint_parts.extend((ref.column, ref.uri, ref.key_column, ref.value_column))
+
+        factory = LanceResolveRefFactory(
+            source=source,
+            ref_names=ref_names,
+            batch_size=batch_size,
+            load_in_memory=self._load_in_memory,
+        )
+        stage_context = self.context if context is None else context
+        spec = StageSpec(
+            kind="assemble",
+            apply=_AssembleStage(factory=factory, context=stage_context),
+            fn_fingerprint=hash_bytes(*fingerprint_parts),
+            trace_policy="traceable",
+        )
+        return self._append_stage(spec)
