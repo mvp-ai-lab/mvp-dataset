@@ -1,13 +1,18 @@
 import argparse
 import os
 import time
+from pathlib import Path
 
-from mvp_dataset import Dataset, set_log_level
+from mvp_dataset import Dataset, TorchLoader, set_log_level
 
 
 def map_func(sample: dict) -> dict:
     sample["mapped"] = True
     return sample
+
+
+def identity_collate(batch: list[object]) -> list[object]:
+    return batch
 
 
 def _maybe_init_torch_distributed(backend: str | None) -> tuple[bool, object | None]:
@@ -67,8 +72,23 @@ def main(
     cache: bool,
     shuffle: bool,
     resample: bool,
+    num_workers: int,
+    worker_batch_size: int,
+    prefetch_factor: int,
+    pin_memory: bool,
+    persistent_workers: bool,
+    multiprocessing_context: str | None,
+    no_ref: bool,
+    ref_column: str,
+    ref_uri: str | None,
+    ref_key_column: str,
+    ref_value_column: str | None,
 ):
     set_log_level(log_level)
+    if worker_batch_size <= 0:
+        msg = f"--worker-batch-size must be > 0, got {worker_batch_size}"
+        raise ValueError(msg)
+
     dist_enabled, dist = _maybe_init_torch_distributed(dist_backend)
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -80,16 +100,29 @@ def main(
         flush=True,
     )
 
-    if shuffle and source_kind == "lance":
+    if source_kind == "lance":
+        resolved_ref_columns = None
+        source_is_config = Path(source).suffix.lower() == ".json"
+        uses_default_ref_args = (
+            ref_column == "images" and ref_uri is None and ref_key_column == "ref_id" and ref_value_column is None
+        )
+        if no_ref:
+            resolved_ref_columns = {}
+        elif not source_is_config or not uses_default_ref_args:
+            resolved_ref_uri = ref_uri or str(Path(source).expanduser().parent / f"{ref_column}.lance")
+            resolved_ref_columns = {
+                ref_column: {
+                    "uri": resolved_ref_uri,
+                    "key_column": ref_key_column,
+                    "value_column": ref_value_column or ref_column,
+                },
+            }
         ds = Dataset.from_source(
             source_kind,
             shards=source,
             resample=resample,
             global_shuffle=shuffle,
-            ref_columns={
-                "image": {"uri": "examples/demo_data/media.lance", "key_column": "media_id", "value_column": "payload"},
-                "depth": {"uri": "examples/demo_data/media.lance", "key_column": "media_id", "value_column": "payload"},
-            },
+            ref_columns=resolved_ref_columns,
         ).map(map_func)
     else:
         ds = Dataset.from_source(source_kind, shards=source, resample=resample).map(map_func)
@@ -97,14 +130,26 @@ def main(
     if cache:
         ds = ds.cache(cache_num_workers=8)
 
-    t0 = time.monotonic()
+    loader = TorchLoader(
+        ds,
+        num_workers=num_workers,
+        batch_size=worker_batch_size,
+        collate_fn=identity_collate,
+        prefetch_factor=prefetch_factor,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers and num_workers > 0,
+        multiprocessing_context=multiprocessing_context,
+    )
+
     count = 0
     progress = _build_progress_bar(rank=rank, total=max_samples)
     try:
-        for i, _sample in enumerate(ds):
-            count += 1
-            progress.update(1)
-            if max_samples is not None and i + 1 >= max_samples:
+        for i, _sample in enumerate(loader):
+            if i == 0:
+                t0 = time.monotonic()
+            count += worker_batch_size
+            progress.update(worker_batch_size)
+            if max_samples is not None and i * worker_batch_size + 1 >= max_samples:
                 break
     finally:
         progress.close()
@@ -167,6 +212,67 @@ if __name__ == "__main__":
         action="store_true",
         help="Whether to resample the dataset after loading.",
     )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="PyTorch DataLoader worker count.",
+    )
+    parser.add_argument(
+        "--worker-batch-size",
+        type=int,
+        default=16,
+        help="Worker-side micro-batch size before unbatching in the main process.",
+    )
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=2,
+        help="PyTorch DataLoader prefetch factor when num_workers > 0.",
+    )
+    parser.add_argument(
+        "--pin-memory",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable DataLoader pin_memory.",
+    )
+    parser.add_argument(
+        "--persistent-workers",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Keep DataLoader workers alive when num_workers > 0.",
+    )
+    parser.add_argument(
+        "--multiprocessing-context",
+        choices=["fork", "spawn", "forkserver"],
+        default=None,
+        help="Optional PyTorch DataLoader multiprocessing context, e.g. spawn for Lance.",
+    )
+    parser.add_argument(
+        "--no-ref",
+        action="store_true",
+        help="Disable Lance reference-column resolution.",
+    )
+    parser.add_argument(
+        "--ref-column",
+        default="images",
+        help="Lance source column to resolve through a reference dataset.",
+    )
+    parser.add_argument(
+        "--ref-uri",
+        default=None,
+        help="Reference Lance dataset URI. Defaults to <source parent>/<ref-column>.lance.",
+    )
+    parser.add_argument(
+        "--ref-key-column",
+        default="ref_id",
+        help="Reference dataset key column.",
+    )
+    parser.add_argument(
+        "--ref-value-column",
+        default=None,
+        help="Reference dataset value column. Defaults to --ref-column.",
+    )
 
     args = parser.parse_args()
 
@@ -179,4 +285,15 @@ if __name__ == "__main__":
         cache=args.cache,
         shuffle=args.shuffle,
         resample=args.resample,
+        num_workers=args.num_workers,
+        worker_batch_size=args.worker_batch_size,
+        prefetch_factor=args.prefetch_factor,
+        pin_memory=args.pin_memory,
+        persistent_workers=args.persistent_workers,
+        multiprocessing_context=args.multiprocessing_context,
+        no_ref=args.no_ref,
+        ref_column=args.ref_column,
+        ref_uri=args.ref_uri,
+        ref_key_column=args.ref_key_column,
+        ref_value_column=args.ref_value_column,
     )

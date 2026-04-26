@@ -5,7 +5,9 @@ from __future__ import annotations
 import bisect
 import hashlib
 import json
+import os
 import shutil
+import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +26,7 @@ REF_INDEX_MISSING_ROW = -1
 REF_INDEX_MANIFEST = "metadata.json"
 REF_INDEX_CACHE_DIR = "_mvp_ref_index"
 REF_INDEX_BUILD_BATCH_SIZE = 65536
+REF_INDEX_LOCK_POLL_SECONDS = 0.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,7 +153,7 @@ def _read_table_rows(
             table = table.select(columns)
         table = table.take(take_indices)
     elif isinstance(dataset_handle, pads.Dataset):
-        table = dataset_handle.to_table(columns=columns).take(take_indices)
+        table = dataset_handle.take(take_indices, columns=columns)
     else:
         table = dataset_handle.take(row_indices, columns=columns)
     return table.to_pylist()
@@ -217,6 +220,48 @@ def _dataset_manifest_fingerprint(uri: str) -> dict[str, Any]:
     return fingerprint
 
 
+def _ref_index_is_valid(
+    index_dir: Path,
+    manifest: dict[str, Any],
+    ref_files: dict[str, dict[str, Any]],
+    active_refs: Sequence[LanceRefSpec],
+) -> bool:
+    manifest_path = index_dir / REF_INDEX_MANIFEST
+    if not index_dir.exists() or not manifest_path.exists():
+        return False
+    try:
+        cached_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return cached_manifest == manifest and all(
+        (index_dir / ref_files[ref.column]["offsets_file"]).exists()
+        and (index_dir / ref_files[ref.column]["entries_file"]).exists()
+        for ref in active_refs
+    )
+
+
+def _acquire_ref_index_build_lock(
+    lock_dir: Path,
+    index_dir: Path,
+    manifest: dict[str, Any],
+    ref_files: dict[str, dict[str, Any]],
+    active_refs: Sequence[LanceRefSpec],
+) -> bool:
+    lock_dir.parent.mkdir(parents=True, exist_ok=True)
+    while True:
+        if _ref_index_is_valid(index_dir, manifest, ref_files, active_refs):
+            return False
+        try:
+            lock_dir.mkdir()
+            (lock_dir / "owner.json").write_text(
+                json.dumps({"pid": os.getpid(), "created_at": time.time()}, sort_keys=True),
+                encoding="utf-8",
+            )
+            return True
+        except FileExistsError:
+            time.sleep(REF_INDEX_LOCK_POLL_SECONDS)
+
+
 def prepare_ref_indexes(
     source: LanceSourceSpec,
     *,
@@ -263,111 +308,110 @@ def prepare_ref_indexes(
         },
     }
     digest = hashlib.sha256(json.dumps(manifest, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:32]
-    index_dir = Path(source.datasets[0].uri) / REF_INDEX_CACHE_DIR / f"ref-index-{digest}"
+    index_root = Path(source.datasets[0].uri) / REF_INDEX_CACHE_DIR
+    index_dir = index_root / f"ref-index-{digest}"
     manifest_path = index_dir / REF_INDEX_MANIFEST
+    lock_dir = index_root / f"ref-index-{digest}.lock"
 
-    # 4. Reuse a finished cache only when the stored manifest and every expected
-    #    index file match the current build plan. Any unreadable or partial cache
-    #    is treated as invalid and will be rebuilt below.
-    index_is_valid = False
-    if index_dir.exists() and manifest_path.exists():
-        try:
-            cached_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            index_is_valid = cached_manifest == manifest and all(
-                (index_dir / ref_files[ref.column]["offsets_file"]).exists()
-                and (index_dir / ref_files[ref.column]["entries_file"]).exists()
-                for ref in active_refs
-            )
-        except (OSError, json.JSONDecodeError):
-            index_is_valid = False
-
-    if not index_is_valid:
+    # 4. Only one process may rebuild this cache directory. DataLoader workers
+    #    commonly call prepare_ref_indexes() at the same time; without a lock one
+    #    worker can delete a partial cache while another is opening its memmaps.
+    should_build = _acquire_ref_index_build_lock(lock_dir, index_dir, manifest, ref_files, active_refs)
+    if should_build:
         # 5. Start a fresh cache directory and initialize per-column CSR state.
         #    offsets[row] stores the starting entry index for one main row, while
         #    requested_positions maps each ref key to the entry slots that need
         #    to be filled after the reference dataset is scanned.
-        if index_dir.exists():
-            shutil.rmtree(index_dir)
-        index_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            if not _ref_index_is_valid(index_dir, manifest, ref_files, active_refs):
+                if index_dir.exists():
+                    shutil.rmtree(index_dir, ignore_errors=True)
+                index_dir.mkdir(parents=True, exist_ok=True)
 
-        offsets_by_column: dict[str, np.memmap] = {}
-        requested_positions: dict[str, dict[Any, list[int]]] = {ref.column: {} for ref in active_refs}
-        entry_counts = {ref.column: 0 for ref in active_refs}
-        for ref in active_refs:
-            offsets_by_column[ref.column] = np.memmap(
-                index_dir / ref_files[ref.column]["offsets_file"],
-                dtype=np.uint64,
-                mode="w+",
-                shape=(source.total_rows + 1,),
-            )
-            offsets_by_column[ref.column][0] = 0
+                offsets_by_column: dict[str, np.memmap] = {}
+                requested_positions: dict[str, dict[Any, list[int]]] = {ref.column: {} for ref in active_refs}
+                entry_counts = {ref.column: 0 for ref in active_refs}
+                for ref in active_refs:
+                    offsets_by_column[ref.column] = np.memmap(
+                        index_dir / ref_files[ref.column]["offsets_file"],
+                        dtype=np.uint64,
+                        mode="w+",
+                        shape=(source.total_rows + 1,),
+                    )
+                    offsets_by_column[ref.column][0] = 0
 
-        # 6. Scan all main datasets in global row order. For each reference key
-        #    found in a main row, append one pending entry slot and advance that
-        #    column's CSR offsets so later reads can recover the row's key range
-        #    with offsets[global_index:global_index + 2].
-        global_row_index = 0
-        main_columns = [ref.column for ref in active_refs]
-        for dataset in source.datasets:
-            for batch in _iter_table_record_batches(lance.dataset(dataset.uri), columns=main_columns):
-                for row in batch.to_pylist():
-                    global_row_index += 1
-                    for ref in active_refs:
-                        for key in _iter_ref_keys(row[ref.column]):
-                            requested_positions[ref.column].setdefault(key, []).append(entry_counts[ref.column])
-                            entry_counts[ref.column] += 1
-                        offsets_by_column[ref.column][global_row_index] = entry_counts[ref.column]
+                # 6. Scan all main datasets in global row order. For each reference key
+                #    found in a main row, append one pending entry slot and advance that
+                #    column's CSR offsets so later reads can recover the row's key range
+                #    with offsets[global_index:global_index + 2].
+                global_row_index = 0
+                main_columns = [ref.column for ref in active_refs]
+                for dataset in source.datasets:
+                    for batch in _iter_table_record_batches(lance.dataset(dataset.uri), columns=main_columns):
+                        for row in batch.to_pylist():
+                            global_row_index += 1
+                            for ref in active_refs:
+                                for key in _iter_ref_keys(row[ref.column]):
+                                    requested_positions[ref.column].setdefault(key, []).append(entry_counts[ref.column])
+                                    entry_counts[ref.column] += 1
+                                offsets_by_column[ref.column][global_row_index] = entry_counts[ref.column]
 
-        if global_row_index != source.total_rows:
-            msg = f"[InvalidLanceRefIndex] expected {source.total_rows} main rows, scanned {global_row_index}"
-            raise RuntimeError(msg)
+                if global_row_index != source.total_rows:
+                    msg = f"[InvalidLanceRefIndex] expected {source.total_rows} main rows, scanned {global_row_index}"
+                    raise RuntimeError(msg)
 
-        # 7. Allocate the entries arrays. Empty reference columns get an empty
-        #    in-memory array and a touched file, while non-empty columns are
-        #    prefilled with the missing-row sentinel until their keys resolve.
-        entries_by_column: dict[str, np.memmap] = {}
-        for ref in active_refs:
-            offsets_by_column[ref.column].flush()
-            entries_path = index_dir / ref_files[ref.column]["entries_file"]
-            if entry_counts[ref.column] == 0:
-                entries_path.touch()
-                entries = np.empty(0, dtype=np.int64)
-            else:
-                entries = np.memmap(
-                    entries_path,
-                    dtype=np.int64,
-                    mode="w+",
-                    shape=(entry_counts[ref.column],),
-                )
-                entries[:] = REF_INDEX_MISSING_ROW
-            entries_by_column[ref.column] = entries
+                # 7. Allocate the entries arrays. Empty reference columns get an empty
+                #    in-memory array and a touched file, while non-empty columns are
+                #    prefilled with the missing-row sentinel until their keys resolve.
+                entries_by_column: dict[str, np.memmap] = {}
+                for ref in active_refs:
+                    offsets_by_column[ref.column].flush()
+                    entries_path = index_dir / ref_files[ref.column]["entries_file"]
+                    if entry_counts[ref.column] == 0:
+                        entries_path.touch()
+                        entries = np.empty(0, dtype=np.int64)
+                    else:
+                        entries = np.memmap(
+                            entries_path,
+                            dtype=np.int64,
+                            mode="w+",
+                            shape=(entry_counts[ref.column],),
+                        )
+                        entries[:] = REF_INDEX_MISSING_ROW
+                    entries_by_column[ref.column] = entries
 
-        # 8. Scan each reference dataset once. When a reference key is requested
-        #    by the main dataset, write the reference row index into every pending
-        #    entry slot for that key. Duplicate keys are rejected because they
-        #    would make a main key resolve to more than one reference row.
-        for ref in active_refs:
-            row_index = 0
-            resolved_keys: set[Any] = set()
-            for batch in _iter_table_record_batches(lance.dataset(ref.uri), columns=[ref.key_column]):
-                for row in batch.to_pylist():
-                    key = row[ref.key_column]
-                    positions = requested_positions[ref.column].get(key)
-                    if positions is not None:
-                        if key in resolved_keys:
-                            msg = f"[DuplicateLanceRefKey] duplicate key {key!r} in {ref.uri}:{ref.key_column}"
-                            raise ValueError(msg)
-                        resolved_keys.add(key)
-                        entries_by_column[ref.column][positions] = row_index
-                    row_index += 1
-            flush = getattr(entries_by_column[ref.column], "flush", None)
-            if callable(flush):
-                flush()
+                # 8. Scan each reference dataset once. When a reference key is requested
+                #    by the main dataset, write the reference row index into every pending
+                #    entry slot for that key. Duplicate keys are rejected because they
+                #    would make a main key resolve to more than one reference row.
+                for ref in active_refs:
+                    row_index = 0
+                    resolved_keys: set[Any] = set()
+                    for batch in _iter_table_record_batches(lance.dataset(ref.uri), columns=[ref.key_column]):
+                        for row in batch.to_pylist():
+                            key = row[ref.key_column]
+                            positions = requested_positions[ref.column].get(key)
+                            if positions is not None:
+                                if key in resolved_keys:
+                                    msg = f"[DuplicateLanceRefKey] duplicate key {key!r} in {ref.uri}:{ref.key_column}"
+                                    raise ValueError(msg)
+                                resolved_keys.add(key)
+                                entries_by_column[ref.column][positions] = row_index
+                            row_index += 1
+                    flush = getattr(entries_by_column[ref.column], "flush", None)
+                    if callable(flush):
+                        flush()
 
-        # 9. Write the manifest last. Its presence marks the cache as complete
-        #    for future calls because all index files have already been created
-        #    and flushed.
-        manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2, default=str), encoding="utf-8")
+                # 9. Write the manifest last. Its presence marks the cache as complete
+                #    for future calls because all index files have already been created
+                #    and flushed.
+                manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2, default=str), encoding="utf-8")
+        finally:
+            shutil.rmtree(lock_dir, ignore_errors=True)
+
+    if not _ref_index_is_valid(index_dir, manifest, ref_files, active_refs):
+        msg = f"[InvalidLanceRefIndex] ref index cache was not completed at {index_dir}"
+        raise RuntimeError(msg)
 
     # 10. Attach read-only index handles to the returned source. By default the
     #     arrays stay memory-mapped to avoid loading large indexes; callers that
@@ -477,8 +521,10 @@ def _read_batch(
                 table = table.select(columns)
             table = table.take(pa.array(local_indices, type=take_indices_type))
         elif isinstance(dataset_handle, pads.Dataset):
-            table = dataset_handle.to_table(columns=columns)
-            table = table.take(pa.array(local_indices, type=take_indices_type))
+            table = dataset_handle.take(
+                pa.array(local_indices, type=take_indices_type),
+                columns=columns,
+            )
         else:
             table = dataset_handle.take(local_indices, columns=columns)
 

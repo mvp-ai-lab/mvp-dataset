@@ -1,439 +1,349 @@
 #!/usr/bin/env python3
-"""Benchmark read throughput across source formats using the Dataset API.
+"""Benchmark read throughput for user-provided mvp-dataset sources.
 
-Generates 10 000 synthetic image+text samples, writes them into each
-supported format (tar, jsonl+tar-ref, jsonl-inline, parquet, lance),
-then times iteration through three pipeline configurations:
+Examples:
+    python examples/benchmark.py \
+      --source parquet=parquet:/data/openbee/**/*.parquet \
+      --source lance=lance:/data/openbee-lance/ref_columns.json \
+      --max-samples 10000 --repeats 3
 
-  1. source only   — raw Dataset read
-  2. + map         — Dataset.map(decode_fn)
-  3. + map+shuffle — Dataset.map(decode_fn).shuffle(buffer)
-
-Usage:
-    python bench_sources.py [--num-samples 10000] [--image-kb 50] [--num-shards 10]
+    python examples/benchmark.py \
+      --source parquet=parquet:/data/openbee/Caption \
+      --source lance=lance:/data/openbee-lance/stage3-dev/ref_columns.json \
+      --columns images,conversations \
+      --use-loader --num-workers 4 --worker-batch-size 8 \
+      --prefetch-factor 1 --multiprocessing-context spawn
 """
 
 from __future__ import annotations
 
 import argparse
-import base64
-import io
-import json
-import shutil
-import tarfile
-import tempfile
+import glob
 import time
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
-import pyarrow as pa
-import pyarrow.parquet as pq
-
+from mvp_dataset import Dataset, TorchLoader
 from mvp_dataset.core.context import RuntimeContext
-from mvp_dataset.core.dataset import Dataset
-from mvp_dataset.sources.jsonl.dataset import JsonlDataset
-from mvp_dataset.sources.lance.dataset import LanceDataset
-from mvp_dataset.sources.parquet.dataset import ParquetDataset
-from mvp_dataset.sources.tar.dataset import TarDataset
 
-# ---------------------------------------------------------------------------
-# Data generation
-# ---------------------------------------------------------------------------
+SOURCE_KINDS = {"jsonl", "tars", "parquet", "lance"}
 
 
-def generate_samples(num_samples: int, image_kb: int, seed: int = 42) -> list[dict]:
-    """Return deterministic synthetic samples with image bytes + caption."""
-    import random
+@dataclass(frozen=True, slots=True)
+class SourceSpec:
+    name: str
+    kind: str
+    path: str
 
-    rng = random.Random(seed)
-    image_size = image_kb * 1024
-    samples = []
-    for i in range(num_samples):
-        image = rng.randbytes(image_size)
-        caption = f"A synthetic caption for sample {i:06d}. " + rng.choice(
-            [
-                "The quick brown fox jumps over the lazy dog.",
-                "Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
-                "Pack my box with five dozen liquor jugs.",
-                "How vexingly quick daft zebras jump.",
-            ]
+
+@dataclass(frozen=True, slots=True)
+class TimingResult:
+    samples: int
+    seconds: float
+    payload_bytes: int | None = None
+
+    @property
+    def samples_per_second(self) -> float:
+        return self.samples / self.seconds if self.seconds > 0 else float("inf")
+
+    @property
+    def mb_per_second(self) -> float | None:
+        if self.payload_bytes is None:
+            return None
+        return (self.payload_bytes / 1024 / 1024) / self.seconds if self.seconds > 0 else float("inf")
+
+
+def identity_collate(batch: list[object]) -> list[object]:
+    return batch
+
+
+def _parse_source_spec(raw_spec: str) -> SourceSpec:
+    """Parse NAME=KIND:PATH or KIND:PATH into a SourceSpec."""
+
+    if "=" in raw_spec:
+        name, raw_kind_path = raw_spec.split("=", 1)
+        name = name.strip()
+        if not name:
+            msg = f"[InvalidBenchmarkSource] source name is empty in {raw_spec!r}"
+            raise ValueError(msg)
+    else:
+        name = ""
+        raw_kind_path = raw_spec
+
+    if ":" not in raw_kind_path:
+        msg = f"[InvalidBenchmarkSource] expected --source NAME=KIND:PATH or KIND:PATH, got {raw_spec!r}"
+        raise ValueError(msg)
+
+    kind, path = raw_kind_path.split(":", 1)
+    kind = kind.strip()
+    path = path.strip()
+    if kind not in SOURCE_KINDS:
+        msg = f"[InvalidBenchmarkSource] kind must be one of {sorted(SOURCE_KINDS)}, got {kind!r}"
+        raise ValueError(msg)
+    if not path:
+        msg = f"[InvalidBenchmarkSource] path is empty in {raw_spec!r}"
+        raise ValueError(msg)
+
+    if not name:
+        path_name = Path(path).name or Path(path).parent.name or kind
+        name = f"{kind}:{path_name}"
+
+    return SourceSpec(name=name, kind=kind, path=path)
+
+
+def _parse_columns(raw_columns: str | None) -> list[str] | None:
+    if raw_columns is None:
+        return None
+    columns = [column.strip() for column in raw_columns.split(",") if column.strip()]
+    return columns or None
+
+
+def _expand_directory_source(spec: SourceSpec, *, recursive: bool) -> str | list[str]:
+    """Expand glob and directory inputs where sensible."""
+
+    expanded_path = str(Path(spec.path).expanduser())
+    if any(char in expanded_path for char in "*?["):
+        matches = sorted(glob.glob(expanded_path, recursive=True))
+        if matches:
+            return matches
+        msg = f"[EmptyBenchmarkSource] glob did not match any paths: {expanded_path}"
+        raise ValueError(msg)
+
+    path = Path(expanded_path)
+    if not path.is_dir() or spec.kind == "lance":
+        return expanded_path
+
+    suffix_by_kind = {
+        "jsonl": ".jsonl",
+        "parquet": ".parquet",
+        "tars": ".tar",
+    }
+    suffix = suffix_by_kind.get(spec.kind)
+    if suffix is None:
+        return spec.path
+
+    iterator = path.rglob(f"*{suffix}") if recursive else path.glob(f"*{suffix}")
+    files = sorted(str(file_path) for file_path in iterator if file_path.is_file())
+    if not files:
+        msg = f"[EmptyBenchmarkSource] no {suffix} files found under {path}"
+        raise ValueError(msg)
+    return files
+
+
+def _build_dataset(spec: SourceSpec, args: argparse.Namespace) -> Dataset:
+    context = RuntimeContext(seed=args.seed)
+    source_path = _expand_directory_source(spec, recursive=args.recursive)
+    columns = _parse_columns(args.columns)
+
+    if spec.kind == "parquet":
+        return Dataset.from_source(
+            "parquet",
+            source_path,
+            context=context,
+            resample=args.resample,
+            columns=columns,
+            min_row_groups_per_fragment=args.parquet_min_row_groups_per_fragment,
+            use_threads=args.parquet_use_threads,
         )
-        samples.append({"image": image, "caption": caption})
-    return samples
 
-
-# ---------------------------------------------------------------------------
-# Writers — one per format
-# ---------------------------------------------------------------------------
-
-
-def write_tar_shards(samples: list[dict], out_dir: Path, num_shards: int) -> list[str]:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    shard_paths: list[str] = []
-    per_shard = (len(samples) + num_shards - 1) // num_shards
-
-    for shard_idx in range(num_shards):
-        shard_path = out_dir / f"shard_{shard_idx:05d}.tar"
-        shard_paths.append(str(shard_path))
-        start = shard_idx * per_shard
-        end = min(start + per_shard, len(samples))
-
-        with tarfile.open(shard_path, "w") as tf:
-            for i in range(start, end):
-                key = f"{i:06d}"
-                sample = samples[i]
-
-                img_info = tarfile.TarInfo(name=f"{key}.jpg")
-                img_info.size = len(sample["image"])
-                tf.addfile(img_info, io.BytesIO(sample["image"]))
-
-                cap_bytes = sample["caption"].encode("utf-8")
-                cap_info = tarfile.TarInfo(name=f"{key}.txt")
-                cap_info.size = len(cap_bytes)
-                tf.addfile(cap_info, io.BytesIO(cap_bytes))
-
-    return shard_paths
-
-
-def write_jsonl_with_tar_refs(samples: list[dict], out_dir: Path, num_shards: int) -> tuple[list[str], str]:
-    """Returns (jsonl_paths, tar_base_dir)."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    jsonl_paths: list[str] = []
-    per_shard = (len(samples) + num_shards - 1) // num_shards
-
-    for shard_idx in range(num_shards):
-        jsonl_path = out_dir / f"shard_{shard_idx:05d}.jsonl"
-        tar_path = out_dir / f"images_{shard_idx:05d}.tar"
-        jsonl_paths.append(str(jsonl_path))
-        start = shard_idx * per_shard
-        end = min(start + per_shard, len(samples))
-
-        with tarfile.open(tar_path, "w") as tf:
-            for i in range(start, end):
-                key = f"{i:06d}"
-                img_info = tarfile.TarInfo(name=f"{key}.jpg")
-                img_info.size = len(samples[i]["image"])
-                tf.addfile(img_info, io.BytesIO(samples[i]["image"]))
-
-        with open(jsonl_path, "w", encoding="utf-8") as f:
-            for i in range(start, end):
-                key = f"{i:06d}"
-                row = {
-                    "caption": samples[i]["caption"],
-                    "image": f"tar://{tar_path}#{key}.jpg",
-                }
-                f.write(json.dumps(row, ensure_ascii=True) + "\n")
-
-    return jsonl_paths, str(out_dir)
-
-
-def write_jsonl_inline(samples: list[dict], out_dir: Path, num_shards: int) -> list[str]:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    jsonl_paths: list[str] = []
-    per_shard = (len(samples) + num_shards - 1) // num_shards
-
-    for shard_idx in range(num_shards):
-        jsonl_path = out_dir / f"shard_{shard_idx:05d}.jsonl"
-        jsonl_paths.append(str(jsonl_path))
-        start = shard_idx * per_shard
-        end = min(start + per_shard, len(samples))
-
-        with open(jsonl_path, "w", encoding="utf-8") as f:
-            for i in range(start, end):
-                row = {
-                    "caption": samples[i]["caption"],
-                    "image_b64": base64.b64encode(samples[i]["image"]).decode("ascii"),
-                }
-                f.write(json.dumps(row, ensure_ascii=True) + "\n")
-
-    return jsonl_paths
-
-
-def write_parquet_files(samples: list[dict], out_dir: Path, num_shards: int) -> list[str]:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    paths: list[str] = []
-    per_shard = (len(samples) + num_shards - 1) // num_shards
-
-    for shard_idx in range(num_shards):
-        path = out_dir / f"shard_{shard_idx:05d}.parquet"
-        paths.append(str(path))
-        start = shard_idx * per_shard
-        end = min(start + per_shard, len(samples))
-
-        table = pa.table(
-            {
-                "image": pa.array(
-                    [samples[i]["image"] for i in range(start, end)],
-                    type=pa.binary(),
-                ),
-                "caption": pa.array(
-                    [samples[i]["caption"] for i in range(start, end)],
-                    type=pa.string(),
-                ),
-            }
+    if spec.kind == "lance":
+        return Dataset.from_source(
+            "lance",
+            source_path,
+            context=context,
+            resample=args.resample,
+            columns=columns,
+            batch_size=args.lance_batch_size,
+            global_shuffle=args.global_shuffle,
+            load_in_memory=args.lance_load_in_memory,
         )
-        pq.write_table(table, path, row_group_size=1000)
 
-    return paths
+    if columns is not None:
+        msg = f"[UnsupportedBenchmarkColumns] --columns is only supported for parquet/lance, got {spec.kind!r}"
+        raise ValueError(msg)
 
-
-def write_lance_datasets(samples: list[dict], out_dir: Path, num_shards: int) -> list[str]:
-    import lance
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    uris: list[str] = []
-    per_shard = (len(samples) + num_shards - 1) // num_shards
-
-    for shard_idx in range(num_shards):
-        uri = str(out_dir / f"shard_{shard_idx:05d}.lance")
-        uris.append(uri)
-        start = shard_idx * per_shard
-        end = min(start + per_shard, len(samples))
-
-        table = pa.table(
-            {
-                "image": pa.array(
-                    [samples[i]["image"] for i in range(start, end)],
-                    type=pa.binary(),
-                ),
-                "caption": pa.array(
-                    [samples[i]["caption"] for i in range(start, end)],
-                    type=pa.string(),
-                ),
-            }
-        )
-        lance.write_dataset(table, uri)
-
-    return uris
+    return Dataset.from_source(spec.kind, source_path, context=context, resample=args.resample)
 
 
-# ---------------------------------------------------------------------------
-# Dataset builders — return Dataset objects for each format
-# ---------------------------------------------------------------------------
+def _iter_dataset(ds: Dataset, args: argparse.Namespace) -> Iterable[object]:
+    if not args.use_loader:
+        return ds
+
+    return TorchLoader(
+        ds,
+        num_workers=args.num_workers,
+        batch_size=args.worker_batch_size,
+        collate_fn=identity_collate,
+        prefetch_factor=args.prefetch_factor,
+        pin_memory=args.pin_memory,
+        persistent_workers=args.persistent_workers and args.num_workers > 0,
+        multiprocessing_context=args.multiprocessing_context,
+    ).unbatch()
 
 
-def build_tar_dataset(shard_paths: list[str], ctx: RuntimeContext) -> Dataset:
-    return TarDataset.from_source(shard_paths, context=ctx)
+def _payload_size(value: object) -> int:
+    if isinstance(value, bytes | bytearray | memoryview):
+        return len(value)
+    if isinstance(value, dict):
+        return sum(_payload_size(item) for item in value.values())
+    if isinstance(value, list | tuple):
+        return sum(_payload_size(item) for item in value)
+    return 0
 
 
-def build_jsonl_ref_dataset(jsonl_paths: list[str], tar_dir: str, ctx: RuntimeContext) -> Dataset:
-    return JsonlDataset.from_source(jsonl_paths, context=ctx, ref_fields=[("image", tar_dir)])
+def _drain(ds: Dataset, args: argparse.Namespace, *, limit: int) -> TimingResult:
+    count = 0
+    payload_bytes = 0 if args.measure_bytes else None
+    started_at = time.perf_counter()
+
+    for sample in _iter_dataset(ds, args):
+        count += 1
+        if payload_bytes is not None:
+            payload_bytes += _payload_size(sample)
+        if limit > 0 and count >= limit:
+            break
+
+    return TimingResult(
+        samples=count,
+        seconds=time.perf_counter() - started_at,
+        payload_bytes=payload_bytes,
+    )
 
 
-def build_jsonl_inline_dataset(jsonl_paths: list[str], ctx: RuntimeContext) -> Dataset:
-    return JsonlDataset.from_source(jsonl_paths, context=ctx)
+def _time_source(spec: SourceSpec, args: argparse.Namespace) -> list[TimingResult]:
+    results: list[TimingResult] = []
+
+    if args.warmup_samples > 0:
+        print(f"  warmup {spec.name}: {args.warmup_samples} samples", flush=True)
+        ds = _build_dataset(spec, args)
+        _drain(ds, args, limit=args.warmup_samples)
+
+    for repeat_i in range(args.repeats):
+        print(f"  run {spec.name}: repeat {repeat_i + 1}/{args.repeats}", flush=True)
+        ds = _build_dataset(spec, args)
+        results.append(_drain(ds, args, limit=args.max_samples))
+
+    return results
 
 
-def build_parquet_dataset(shard_paths: list[str], ctx: RuntimeContext) -> Dataset:
-    return ParquetDataset.from_source(shard_paths, context=ctx)
+def _mean(values: Sequence[float]) -> float:
+    return sum(values) / len(values)
 
 
-def build_lance_dataset(uris: list[str], ctx: RuntimeContext) -> Dataset:
-    return LanceDataset.from_source(uris, context=ctx)
+def _format_result(name: str, kind: str, results: list[TimingResult]) -> str:
+    samples = [result.samples for result in results]
+    seconds = [result.seconds for result in results]
+    rates = [result.samples_per_second for result in results]
+    best_rate = max(rates)
+    avg_rate = _mean(rates)
+    avg_seconds = _mean(seconds)
+    sample_label = str(min(samples)) if min(samples) == max(samples) else f"{min(samples)}-{max(samples)}"
+
+    parts = [
+        f"{name:<24}",
+        f"{kind:<8}",
+        f"samples {sample_label:>9}",
+        f"avg {avg_seconds:8.3f}s",
+        f"avg {avg_rate:10.1f} samples/s",
+        f"best {best_rate:10.1f} samples/s",
+    ]
+
+    mbps_values = [result.mb_per_second for result in results if result.mb_per_second is not None]
+    if mbps_values:
+        parts.append(f"avg {_mean(mbps_values):9.1f} MB/s")
+
+    return "  ".join(parts)
 
 
-# ---------------------------------------------------------------------------
-# Map functions used as pipeline stages
-# ---------------------------------------------------------------------------
-
-
-def decode_tar_sample(sample: dict) -> dict:
-    """Simulate decoding: image bytes length + uppercase caption."""
-    return {
-        "image_size": len(sample["jpg"]),
-        "caption": sample["txt"].decode("utf-8").upper(),
-        "__key__": sample["__key__"],
-    }
-
-
-def decode_columnar_sample(sample: dict) -> dict:
-    """Simulate decoding: image bytes length + uppercase caption."""
-    image = sample.get("image", b"")
-    return {
-        "image_size": len(image) if isinstance(image, (bytes, memoryview)) else 0,
-        "caption": sample["caption"].upper() if isinstance(sample["caption"], str) else str(sample["caption"]).upper(),
-        "__key__": sample.get("__key__", ""),
-    }
-
-
-def decode_jsonl_inline_sample(sample: dict) -> dict:
-    """Simulate decoding: base64 decode + uppercase caption."""
-    raw = sample.get("image_b64", "")
-    image = base64.b64decode(raw) if isinstance(raw, str) else b""
-    return {
-        "image_size": len(image),
-        "caption": sample["caption"].upper() if isinstance(sample["caption"], str) else str(sample["caption"]).upper(),
-        "__key__": sample.get("__key__", ""),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Benchmark runner
-# ---------------------------------------------------------------------------
-
-SHUFFLE_BUFFER = 1000
-
-
-def time_iteration(ds: Dataset, warmup: int, repeats: int) -> list[float]:
-    """Drain the dataset iterator and return per-repeat wall-clock times."""
-    for _ in range(warmup):
-        count = 0
-        for _ in ds:
-            count += 1
-
-    times: list[float] = []
-    for _ in range(repeats):
-        t0 = time.perf_counter()
-        count = 0
-        for _ in ds:
-            count += 1
-        times.append(time.perf_counter() - t0)
-    return times
-
-
-PipelineKind = str  # "source", "map", "map+shuffle"
-
-
-def build_pipelines(base_ds: Dataset, map_fn: callable) -> dict[PipelineKind, Dataset]:
-    """Build the three pipeline variants from a base dataset."""
-    ds_map = base_ds.map(map_fn)
-    ds_map_shuffle = ds_map.shuffle(buffer_size=SHUFFLE_BUFFER)
-    return {
-        "source": base_ds,
-        "map": ds_map,
-        "map+shuffle": ds_map_shuffle,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Reporting
-# ---------------------------------------------------------------------------
-
-
-def _fmt_row(name: str, times: list[float], num_samples: int, image_kb: int) -> str:
-    avg = sum(times) / len(times)
-    best = min(times)
-    throughput = num_samples / avg
-    data_mb = num_samples * image_kb / 1024
-    bandwidth = data_mb / avg
-    return f"  {name:<34s}  avg {avg:6.2f}s  best {best:6.2f}s  {throughput:8.0f} samples/s  {bandwidth:7.1f} MB/s"
-
-
-def report(
-    all_results: dict[str, dict[PipelineKind, list[float]]],
-    num_samples: int,
-    image_kb: int,
-) -> None:
-    pipeline_kinds = ["source", "map", "map+shuffle"]
-
-    for kind in pipeline_kinds:
-        print()
-        print(f"{'=' * 86}")
-        print(f"  Pipeline: {kind:<16s}  ({num_samples} samples, ~{image_kb}KB image each)")
-        print(f"{'=' * 86}")
-        for source_name, results_by_kind in all_results.items():
-            if kind in results_by_kind:
-                print(_fmt_row(source_name, results_by_kind[kind], num_samples, image_kb))
-        print(f"{'=' * 86}")
+def _print_report(all_results: dict[SourceSpec, list[TimingResult]]) -> None:
+    print()
+    print("=" * 118)
+    print("mvp-dataset read benchmark")
+    print("=" * 118)
+    for spec, results in all_results.items():
+        print(_format_result(spec.name, spec.kind, results))
+    print("=" * 118)
     print()
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Benchmark mvp-dataset source read speed")
-    parser.add_argument("--num-samples", type=int, default=10_000)
-    parser.add_argument("--image-kb", type=int, default=50)
-    parser.add_argument("--num-shards", type=int, default=10)
-    parser.add_argument("--warmup", type=int, default=1)
-    parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--keep-data", action="store_true", help="Keep generated data after run")
+    parser = argparse.ArgumentParser(description="Benchmark read speed for user-provided mvp-dataset sources")
+    parser.add_argument(
+        "--source",
+        action="append",
+        required=True,
+        help=("Source spec. Repeatable. Format: NAME=KIND:PATH or KIND:PATH. Kinds: jsonl, tars, parquet, lance."),
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=10_000,
+        help="Samples to read per repeat. Use 0 to drain finite sources fully.",
+    )
+    parser.add_argument("--warmup-samples", type=int, default=0, help="Optional warmup samples before timing")
+    parser.add_argument("--repeats", type=int, default=3, help="Timed repeats per source")
+    parser.add_argument("--seed", type=int, default=42, help="Runtime context seed")
+    parser.add_argument("--resample", action="store_true", help="Loop sources indefinitely")
+    parser.add_argument("--recursive", action="store_true", help="When a source path is a directory, scan recursively")
+    parser.add_argument(
+        "--columns",
+        default=None,
+        help="Comma-separated projection for parquet/lance sources, for example images,conversations",
+    )
+    parser.add_argument(
+        "--measure-bytes",
+        action="store_true",
+        help="Recursively count bytes payloads and report approximate MB/s. Adds CPU overhead.",
+    )
+
+    parser.add_argument("--parquet-min-row-groups-per-fragment", type=int, default=1)
+    parser.add_argument(
+        "--parquet-use-threads",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use Arrow threaded Parquet reads",
+    )
+    parser.add_argument("--lance-batch-size", type=int, default=1024)
+    parser.add_argument("--global-shuffle", action="store_true", help="Enable Lance global row shuffle")
+    parser.add_argument(
+        "--lance-load-in-memory",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Load Lance tables in memory before reading. Not recommended for large media columns.",
+    )
+
+    parser.add_argument("--use-loader", action="store_true", help="Wrap each Dataset with TorchLoader")
+    parser.add_argument("--num-workers", type=int, default=0, help="TorchLoader worker count")
+    parser.add_argument("--worker-batch-size", type=int, default=16, help="TorchLoader worker micro-batch size")
+    parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--multiprocessing-context", choices=["fork", "spawn", "forkserver"], default=None)
     args = parser.parse_args()
 
-    ctx = RuntimeContext(seed=42)
+    if args.repeats <= 0:
+        raise ValueError("--repeats must be > 0")
+    if args.max_samples < 0:
+        raise ValueError("--max-samples must be >= 0")
+    if args.warmup_samples < 0:
+        raise ValueError("--warmup-samples must be >= 0")
+    if args.use_loader and args.worker_batch_size <= 0:
+        raise ValueError("--worker-batch-size must be > 0 when --use-loader is set")
+    if args.resample and args.max_samples <= 0:
+        raise ValueError("--max-samples must be > 0 when --resample is set")
 
-    print(f"Generating {args.num_samples} synthetic samples ({args.image_kb}KB image each) ...")
-    samples = generate_samples(args.num_samples, args.image_kb)
-    total_mb = args.num_samples * args.image_kb / 1024
-    print(f"  Total payload: ~{total_mb:.0f} MB")
+    source_specs = [_parse_source_spec(raw_spec) for raw_spec in args.source]
+    duplicate_names = {spec.name for spec in source_specs if [item.name for item in source_specs].count(spec.name) > 1}
+    if duplicate_names:
+        raise ValueError(f"duplicate source names: {sorted(duplicate_names)}")
 
-    tmpdir_obj = tempfile.mkdtemp(prefix="bench_sources_")
-    tmpdir = Path(tmpdir_obj)
-    print(f"  Working directory: {tmpdir}")
+    all_results: dict[SourceSpec, list[TimingResult]] = {}
+    for spec in source_specs:
+        print(f"benchmarking {spec.name} ({spec.kind}) from {spec.path}", flush=True)
+        all_results[spec] = _time_source(spec, args)
 
-    try:
-        # ---- write all formats ----
-        print("\nWriting formats ...")
-
-        t0 = time.perf_counter()
-        tar_paths = write_tar_shards(samples, tmpdir / "tar", args.num_shards)
-        print(f"  tar:              {time.perf_counter() - t0:.2f}s  ({len(tar_paths)} shards)")
-
-        t0 = time.perf_counter()
-        jsonl_ref_paths, jsonl_ref_tar_dir = write_jsonl_with_tar_refs(samples, tmpdir / "jsonl_ref", args.num_shards)
-        print(f"  jsonl+tar-ref:    {time.perf_counter() - t0:.2f}s  ({len(jsonl_ref_paths)} shards)")
-
-        t0 = time.perf_counter()
-        jsonl_inline_paths = write_jsonl_inline(samples, tmpdir / "jsonl_inline", args.num_shards)
-        print(f"  jsonl-inline:     {time.perf_counter() - t0:.2f}s  ({len(jsonl_inline_paths)} shards)")
-
-        t0 = time.perf_counter()
-        parquet_paths = write_parquet_files(samples, tmpdir / "parquet", args.num_shards)
-        print(f"  parquet:          {time.perf_counter() - t0:.2f}s  ({len(parquet_paths)} shards)")
-
-        t0 = time.perf_counter()
-        lance_uris = write_lance_datasets(samples, tmpdir / "lance", args.num_shards)
-        print(f"  lance:            {time.perf_counter() - t0:.2f}s  ({len(lance_uris)} datasets)")
-
-        del samples
-
-        # ---- build datasets ----
-        sources: dict[str, tuple[Dataset, callable]] = {
-            "tar": (
-                build_tar_dataset(tar_paths, ctx),
-                decode_tar_sample,
-            ),
-            "jsonl+tar-ref": (
-                build_jsonl_ref_dataset(jsonl_ref_paths, jsonl_ref_tar_dir, ctx),
-                decode_columnar_sample,
-            ),
-            "jsonl-inline (b64)": (
-                build_jsonl_inline_dataset(jsonl_inline_paths, ctx),
-                decode_jsonl_inline_sample,
-            ),
-            "parquet": (
-                build_parquet_dataset(parquet_paths, ctx),
-                decode_columnar_sample,
-            ),
-            "lance": (
-                build_lance_dataset(lance_uris, ctx),
-                decode_columnar_sample,
-            ),
-        }
-
-        # ---- benchmark ----
-        print(f"\nBenchmarking (warmup={args.warmup}, repeats={args.repeats}, shuffle_buffer={SHUFFLE_BUFFER}) ...")
-        all_results: dict[str, dict[PipelineKind, list[float]]] = {}
-
-        for source_name, (base_ds, map_fn) in sources.items():
-            pipelines = build_pipelines(base_ds, map_fn)
-            all_results[source_name] = {}
-
-            for kind, ds in pipelines.items():
-                label = f"{source_name} / {kind}"
-                print(f"  {label} ...")
-                all_results[source_name][kind] = time_iteration(ds, args.warmup, args.repeats)
-
-        # ---- report ----
-        report(all_results, args.num_samples, args.image_kb)
-
-    finally:
-        if not args.keep_data:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        else:
-            print(f"Data kept at: {tmpdir}")
+    _print_report(all_results)
 
 
 if __name__ == "__main__":
