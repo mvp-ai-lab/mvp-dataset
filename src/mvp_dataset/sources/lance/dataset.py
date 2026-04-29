@@ -9,6 +9,7 @@ from mvp_dataset.core.types import ShardInput, StageSpec
 
 from .utils import (
     LanceResolveRefFactory,
+    LanceShuffleMode,
     LanceSourceSpec,
     assign_items,
     attach_lance_ref_columns,
@@ -40,7 +41,7 @@ class _LanceSourceIter:
 
 @dataclass(frozen=True, slots=True)
 class LanceDataset(Dataset):
-    _global_shuffle: bool = False
+    _shuffle_mode: LanceShuffleMode = "none"
     _load_in_memory: bool = False
 
     @classmethod
@@ -51,7 +52,7 @@ class LanceDataset(Dataset):
         resample: bool = False,
         columns: Sequence[str] | None = None,
         batch_size: int = 1024,
-        global_shuffle: bool = False,
+        shuffle_mode: LanceShuffleMode = "none",
         load_in_memory: bool = False,
         ref_columns: dict[str, dict[str, str]] | None = None,
     ):
@@ -65,7 +66,7 @@ class LanceDataset(Dataset):
             resample: Whether to loop shards indefinitely across rounds.
             columns: Optional list of column names to read.
             batch_size: Number of rows per Arrow batch during iteration.
-            global_shuffle: Whether to shuffle rows globally across all datasets.
+            shuffle_mode: One of ``"none"``, ``"global"``, or ``"fragment_aware"``.
             load_in_memory: Whether to load entire datasets into memory.
             ref_columns: Optional mapping of source column names to explicit Lance
                          reference configs containing uri, key_column, and value_column.
@@ -96,7 +97,7 @@ class LanceDataset(Dataset):
                 batch_size=batch_size,
                 load_in_memory=load_in_memory,
             ),
-            _global_shuffle=global_shuffle,
+            _shuffle_mode=shuffle_mode,
             _load_in_memory=load_in_memory,
         )
 
@@ -106,12 +107,9 @@ class LanceDataset(Dataset):
             self._source,
             context=context,
             resample=self._resample,
-            shuffle=self._global_shuffle,
+            shuffle_mode=self._shuffle_mode,
         )
         return self._iter_source_stream(source_shard_stream)
-
-    def shuffle(self, *args, **kwargs) -> Dataset:
-        raise NotImplementedError("LanceDataset.shuffle() is not supported.")
 
     def resolve_ref(
         self,
@@ -128,7 +126,7 @@ class LanceDataset(Dataset):
 
         fingerprint_parts: list[object] = ["<lance-resolve-ref>"]
         for ref in source.ref_columns:
-            if ref.name in ref_names:
+            if ref.column in ref_names:
                 fingerprint_parts.extend((ref.column, ref.uri, ref.key_column, ref.value_column))
 
         factory = LanceResolveRefFactory(

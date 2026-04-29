@@ -24,7 +24,13 @@ from .refs import (
     validate_ref_names,
 )
 from .source import _read_batch, assign_items, iter_lance, list_lance_sources
-from .types import LanceDatasetSpec, LanceIndexItem, LanceRefSpec, LanceSourceSpec
+from .types import (
+    LanceDatasetSpec,
+    LanceIndexItem,
+    LanceRefSpec,
+    LanceShuffleMode,
+    LanceSourceSpec,
+)
 
 __all__ = [
     "REF_INDEX_BUILD_BATCH_SIZE",
@@ -38,6 +44,7 @@ __all__ = [
     "LanceRefResolverAssembler",
     "LanceResolveRefFactory",
     "LanceRefSpec",
+    "LanceShuffleMode",
     "LanceSourceSpec",
     "_apply_ref_columns",
     "_iter_table_record_batches",

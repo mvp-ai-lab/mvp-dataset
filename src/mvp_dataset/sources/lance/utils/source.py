@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import bisect
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 
 import lance
 import numpy as np
@@ -13,7 +14,16 @@ import pyarrow.dataset as pads
 from mvp_dataset.core.context import RuntimeContext
 from mvp_dataset.core.types import PathLikeStr, Sample
 
-from .types import LanceDatasetSpec, LanceIndexItem, LanceSourceSpec
+from .types import LanceDatasetSpec, LanceIndexItem, LanceShuffleMode, LanceSourceSpec
+
+FRAGMENT_SHUFFLE_BLOCK_SIZE = 64
+
+
+@dataclass(frozen=True, slots=True)
+class _FragmentRowSpan:
+    dataset_i: int
+    local_row_offset: int
+    num_rows: int
 
 
 def list_lance_sources(dataset_uris: Sequence[PathLikeStr]) -> list[LanceSourceSpec]:
@@ -23,7 +33,9 @@ def list_lance_sources(dataset_uris: Sequence[PathLikeStr]) -> list[LanceSourceS
     row_offset = 0
     for uri in dataset_uris:
         ds = lance.dataset(str(uri))
-        fragment_ids = tuple(fragment.fragment_id for fragment in ds.get_fragments())
+        fragments = tuple(ds.get_fragments())
+        fragment_ids = tuple(fragment.fragment_id for fragment in fragments)
+        fragment_row_counts = tuple(int(fragment.count_rows()) for fragment in fragments)
         num_rows = ds.count_rows()
         datasets.append(
             LanceDatasetSpec(
@@ -31,6 +43,7 @@ def list_lance_sources(dataset_uris: Sequence[PathLikeStr]) -> list[LanceSourceS
                 num_rows=num_rows,
                 row_offset=row_offset,
                 fragment_ids=fragment_ids,
+                fragment_row_counts=fragment_row_counts,
             )
         )
         row_offset += num_rows
@@ -42,12 +55,89 @@ def list_lance_sources(dataset_uris: Sequence[PathLikeStr]) -> list[LanceSourceS
     return [LanceSourceSpec(datasets=list(datasets))]
 
 
+def _iter_fragment_aware_shuffled_items(
+    source: LanceSourceSpec,
+    *,
+    context: RuntimeContext,
+    round_index: int,
+) -> Iterable[LanceIndexItem]:
+    spans: list[_FragmentRowSpan] = []
+    for dataset_i, dataset in enumerate(source.datasets):
+        local_row_offset = 0
+        for row_count in dataset.fragment_row_counts or (dataset.num_rows,):
+            row_count = int(row_count)
+            if row_count > 0:
+                spans.append(
+                    _FragmentRowSpan(
+                        dataset_i=dataset_i,
+                        local_row_offset=local_row_offset,
+                        num_rows=row_count,
+                    )
+                )
+            local_row_offset += row_count
+
+    if not spans:
+        return
+
+    # Split large fragments only when needed so every slot can receive work.
+    if len(spans) < context.total_slots:
+        split_spans: list[_FragmentRowSpan] = []
+        base_parts, extra_parts = divmod(context.total_slots, len(spans))
+        for span_i, span in enumerate(spans):
+            parts = min(span.num_rows, base_parts + (1 if span_i < extra_parts else 0))
+            chunk_size, extra_rows = divmod(span.num_rows, parts)
+            local_row_offset = span.local_row_offset
+            for part_i in range(parts):
+                num_rows = chunk_size + (1 if part_i < extra_rows else 0)
+                split_spans.append(
+                    _FragmentRowSpan(
+                        dataset_i=span.dataset_i,
+                        local_row_offset=local_row_offset,
+                        num_rows=num_rows,
+                    )
+                )
+                local_row_offset += num_rows
+        spans = split_spans
+
+    rng = np.random.default_rng(context.seed + round_index)
+    slot_spans: list[list[tuple[_FragmentRowSpan, int]]] = [[] for _ in range(context.total_slots)]
+    slot_row_counts = [0] * context.total_slots
+    for span_i in rng.permutation(len(spans)):
+        span = spans[int(span_i)]
+        slot = min(range(context.total_slots), key=slot_row_counts.__getitem__)
+        row_seed = int(rng.integers(0, np.iinfo(np.uint32).max, dtype=np.uint32))
+        slot_spans[slot].append((span, row_seed))
+        slot_row_counts[slot] += span.num_rows
+
+    assigned_spans = slot_spans[context.slot]
+    row_offsets_by_span: list[np.ndarray] = []
+    blocks: list[tuple[int, int, int]] = []
+    for assigned_span_i, (span, row_seed) in enumerate(assigned_spans):
+        row_offsets_by_span.append(np.random.default_rng(row_seed).permutation(span.num_rows))
+        for start in range(0, span.num_rows, FRAGMENT_SHUFFLE_BLOCK_SIZE):
+            stop = min(start + FRAGMENT_SHUFFLE_BLOCK_SIZE, span.num_rows)
+            blocks.append((assigned_span_i, start, stop))
+
+    for block_i in rng.permutation(len(blocks)):
+        assigned_span_i, start, stop = blocks[int(block_i)]
+        span, _row_seed = assigned_spans[assigned_span_i]
+        row_offsets = row_offsets_by_span[assigned_span_i]
+        dataset = source.datasets[span.dataset_i]
+        for row_offset in row_offsets[start:stop]:
+            local_index = span.local_row_offset + int(row_offset)
+            yield LanceIndexItem(
+                dataset_i=span.dataset_i,
+                local_index=local_index,
+                global_index=int(dataset.row_offset + local_index),
+            )
+
+
 def assign_items(
     source: Sequence[LanceSourceSpec],
     *,
     context: RuntimeContext,
     resample: bool,
-    shuffle: bool = False,
+    shuffle_mode: LanceShuffleMode = "none",
 ) -> Iterable[LanceIndexItem]:
     """Yield slot-assigned row indexes for a single logical Lance source.
 
@@ -64,8 +154,10 @@ def assign_items(
             count, and deterministic seed.
         resample: When true, repeat the source forever. Each repeat is called a
             round.
-        shuffle: When true, shuffle global row indexes before each round using
-            ``context.seed`` as the deterministic seed base.
+        shuffle_mode: ``"none"`` preserves source row order, ``"global"`` uses
+            an exact row-level global shuffle, and ``"fragment_aware"`` shuffles
+            fragment/chunk spans while keeping each slot close to fewer
+            fragments.
 
     Yields:
         ``LanceIndexItem`` objects containing ``global_index`` in the
@@ -77,37 +169,46 @@ def assign_items(
     """
 
     assert len(source) == 1, "Multiple Lance sources are not supported in this implementation"
+    if shuffle_mode not in ("none", "global", "fragment_aware"):
+        msg = f"[InvalidLanceShuffleMode] expected none, global, or fragment_aware, got {shuffle_mode!r}"
+        raise ValueError(msg)
     source_spec: LanceSourceSpec = source[0]
 
     round_index = 0
-    global_index_list = np.arange(source_spec.total_rows)
-    shuffle_rng = np.random.default_rng(context.seed + round_index)
-
     slot = context.slot
     total_slots = context.total_slots
+    global_index_list = np.arange(source_spec.total_rows)
 
     while True:
-        if shuffle:
-            shuffle_rng.shuffle(global_index_list)
-
-        for i, global_index in enumerate(global_index_list):
-            if i % total_slots != slot:
-                continue
-
-            dataset_i = (
-                bisect.bisect_right(
-                    [dataset.row_offset for dataset in source_spec.datasets],
-                    global_index,
+        if shuffle_mode == "fragment_aware":
+            yield from _iter_fragment_aware_shuffled_items(
+                source_spec,
+                context=context,
+                round_index=round_index,
+            )
+        else:
+            if shuffle_mode == "global":
+                global_index_list = np.random.default_rng(context.seed + round_index).permutation(
+                    source_spec.total_rows
                 )
-                - 1
-            )
-            dataset = source_spec.datasets[dataset_i]
-            local_index = int(global_index - dataset.row_offset)
-            yield LanceIndexItem(
-                dataset_i=dataset_i,
-                local_index=local_index,
-                global_index=int(global_index),
-            )
+            for i, global_index in enumerate(global_index_list):
+                if i % total_slots != slot:
+                    continue
+
+                dataset_i = (
+                    bisect.bisect_right(
+                        [dataset.row_offset for dataset in source_spec.datasets],
+                        global_index,
+                    )
+                    - 1
+                )
+                dataset = source_spec.datasets[dataset_i]
+                local_index = int(global_index - dataset.row_offset)
+                yield LanceIndexItem(
+                    dataset_i=dataset_i,
+                    local_index=local_index,
+                    global_index=int(global_index),
+                )
 
         if not resample:
             break
@@ -213,6 +314,7 @@ def iter_lance(
             num_rows=dataset.num_rows,
             row_offset=dataset.row_offset,
             fragment_ids=dataset.fragment_ids,
+            fragment_row_counts=dataset.fragment_row_counts,
             handle=ds_handle,
         )
 

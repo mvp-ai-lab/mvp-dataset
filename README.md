@@ -260,8 +260,7 @@ Notes:
 - inputs are local Lance dataset paths or URIs
 - `shuffle_mode="none"` preserves ordered reads and is the default used by cached Lance datasets
 - `shuffle_mode="global"` performs an exact global permutation via `take(...)`
-- `shuffle_mode="random_scan"` uses `scanner(scan_in_order=False)` for higher-throughput approximate shuffle
-- `random_scan` falls back to `global` when fragment parallelism is lower than `context.total_slots`
+- `shuffle_mode="fragment_aware"` shuffles assigned fragments/chunks and row blocks while keeping each slot close to fewer fragments
 
 ## Pipeline Semantics
 

@@ -155,7 +155,7 @@ def _build_dataset(spec: SourceSpec, args: argparse.Namespace) -> Dataset:
             resample=args.resample,
             columns=columns,
             batch_size=args.lance_batch_size,
-            global_shuffle=args.global_shuffle,
+            shuffle_mode=args.lance_shuffle_mode,
             load_in_memory=args.lance_load_in_memory,
         )
         ref_names = [ref.column for ref in dataset._source[0].ref_columns]
@@ -312,7 +312,12 @@ def main() -> None:
         help="Use Arrow threaded Parquet reads",
     )
     parser.add_argument("--lance-batch-size", type=int, default=1024)
-    parser.add_argument("--global-shuffle", action="store_true", help="Enable Lance global row shuffle")
+    parser.add_argument(
+        "--lance-shuffle-mode",
+        choices=["none", "global", "fragment_aware"],
+        default="none",
+        help="Lance row assignment mode.",
+    )
     parser.add_argument(
         "--lance-load-in-memory",
         action=argparse.BooleanOptionalAction,

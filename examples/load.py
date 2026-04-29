@@ -70,7 +70,7 @@ def main(
     max_samples: int | None,
     log_level: str,
     cache: bool,
-    shuffle: bool,
+    shuffle_mode: str,
     resample: bool,
     num_workers: int,
     worker_batch_size: int,
@@ -121,7 +121,7 @@ def main(
             source_kind,
             shards=source,
             resample=resample,
-            global_shuffle=shuffle,
+            shuffle_mode=shuffle_mode,
             ref_columns=resolved_ref_columns,
         )
         if not no_ref:
@@ -131,7 +131,8 @@ def main(
         ds = ds.map(map_func)
     else:
         ds = Dataset.from_source(source_kind, shards=source, resample=resample).map(map_func)
-        ds = ds.shuffle(1000)
+        if shuffle_mode != "none":
+            ds = ds.shuffle(1000)
     if cache:
         ds = ds.cache(cache_num_workers=8)
 
@@ -208,9 +209,10 @@ if __name__ == "__main__":
         "performance when the dataset is large and/or expensive to load.",
     )
     parser.add_argument(
-        "--shuffle",
-        action="store_true",
-        help="Whether to shuffle the dataset after loading.",
+        "--shuffle-mode",
+        choices=["none", "global", "fragment_aware"],
+        default="none",
+        help="Shuffle mode. Lance supports all choices; other source kinds treat non-none as sample-level shuffle.",
     )
     parser.add_argument(
         "--resample",
@@ -288,7 +290,7 @@ if __name__ == "__main__":
         max_samples=args.max_samples,
         log_level=args.log_level,
         cache=args.cache,
-        shuffle=args.shuffle,
+        shuffle_mode=args.shuffle_mode,
         resample=args.resample,
         num_workers=args.num_workers,
         worker_batch_size=args.worker_batch_size,

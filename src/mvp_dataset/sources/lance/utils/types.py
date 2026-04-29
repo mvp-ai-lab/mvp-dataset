@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
+
+LanceShuffleMode = Literal["none", "global", "fragment_aware"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -13,6 +16,7 @@ class LanceDatasetSpec:
     num_rows: int
     row_offset: int
     fragment_ids: tuple[int, ...]
+    fragment_row_counts: tuple[int, ...] = ()
     handle: object | None = None
 
 
