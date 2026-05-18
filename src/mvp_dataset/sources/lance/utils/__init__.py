@@ -8,7 +8,7 @@ from .config import resolve_lance_source_config
 from .refs import (
     REF_INDEX_BUILD_BATCH_SIZE,
     REF_INDEX_BUILDER_VERSION,
-    REF_INDEX_CACHE_DIR,
+    REF_INDEX_DIR,
     REF_INDEX_LOCK_POLL_SECONDS,
     REF_INDEX_MANIFEST,
     REF_INDEX_MISSING_ROW,
@@ -35,7 +35,7 @@ from .types import (
 __all__ = [
     "REF_INDEX_BUILD_BATCH_SIZE",
     "REF_INDEX_BUILDER_VERSION",
-    "REF_INDEX_CACHE_DIR",
+    "REF_INDEX_DIR",
     "REF_INDEX_LOCK_POLL_SECONDS",
     "REF_INDEX_MANIFEST",
     "REF_INDEX_MISSING_ROW",

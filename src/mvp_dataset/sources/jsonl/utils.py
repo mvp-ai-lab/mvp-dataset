@@ -183,14 +183,14 @@ def resolve_ref_field_value(
 
 
 class TarManager:
-    """Cache-aware reader for tar-referenced field payloads."""
+    """LRU reader for tar-referenced field payloads."""
 
-    def __init__(self, cache_size: int = 8) -> None:
-        if cache_size < 1:
-            msg = f"[InvalidCacheSize] cache_size must be >= 1, got={cache_size}"
+    def __init__(self, max_open_files: int = 8) -> None:
+        if max_open_files < 1:
+            msg = f"[InvalidTarManagerSize] max_open_files must be >= 1, got={max_open_files}"
             raise ValueError(msg)
-        self._cache: OrderedDict[str, tuple[tarfile.TarFile, dict[str, tarfile.TarInfo]]] = OrderedDict()
-        self._cache_size = cache_size
+        self._entries: OrderedDict[str, tuple[tarfile.TarFile, dict[str, tarfile.TarInfo]]] = OrderedDict()
+        self._max_open_files = max_open_files
 
     def __enter__(self) -> TarManager:
         return self
@@ -204,23 +204,23 @@ class TarManager:
         self.close()
 
     def close(self) -> None:
-        for tf, _member_index in self._cache.values():
+        for tf, _member_index in self._entries.values():
             try:
                 tf.close()
             except Exception:  # noqa: BLE001
                 pass
-        self._cache.clear()
+        self._entries.clear()
 
     def _get_tar_entry(
         self,
         shard_path: str,
     ) -> tuple[tarfile.TarFile, dict[str, tarfile.TarInfo]]:
-        if shard_path in self._cache:
-            self._cache.move_to_end(shard_path)
-            return self._cache[shard_path]
+        if shard_path in self._entries:
+            self._entries.move_to_end(shard_path)
+            return self._entries[shard_path]
 
-        if len(self._cache) >= self._cache_size:
-            _evicted_path, (evicted_tf, _evicted_member_index) = self._cache.popitem(last=False)
+        if len(self._entries) >= self._max_open_files:
+            _evicted_path, (evicted_tf, _evicted_member_index) = self._entries.popitem(last=False)
             try:
                 evicted_tf.close()
             except Exception:  # noqa: BLE001
@@ -230,7 +230,7 @@ class TarManager:
         members = tf.getmembers()
         member_index = {member.name: member for member in members}
         entry = (tf, member_index)
-        self._cache[shard_path] = entry
+        self._entries[shard_path] = entry
         return entry
 
     def read(self, tar_ref: TarRef) -> bytes:
@@ -360,7 +360,7 @@ def iter_jsonls(
 ) -> Iterator[Sample]:
     """Resolve tar data references while streaming JSONL shard files."""
     key_dot_level = int(os.environ.get("MVP_DATASET_TAR_KEY_DOT_LEVEL", "1"))
-    tar_cache_size = int(os.environ.get("MVP_DATASET_TAR_CACHE_SIZE", "8"))
+    max_open_tars = int(os.environ.get("MVP_DATASET_TAR_MAX_OPEN_FILES", "8"))
 
     def _resolve_one(sample: Sample, manager: TarManager) -> Sample:
         resolved = dict(sample)
@@ -376,7 +376,7 @@ def iter_jsonls(
             )
         return resolved
 
-    with TarManager(cache_size=tar_cache_size) as manager:
+    with TarManager(max_open_files=max_open_tars) as manager:
         for shard_path in shard_paths:
             with open(shard_path, encoding="utf-8") as handle:
                 for line_index, line in enumerate(handle):

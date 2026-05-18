@@ -1,7 +1,6 @@
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
-from mvp_dataset.cache.fingerprint import hash_bytes
 from mvp_dataset.core.context import RuntimeContext
 from mvp_dataset.core.dataset import Dataset
 from mvp_dataset.core.stages import _AssembleStage
@@ -124,11 +123,6 @@ class LanceDataset(Dataset):
         ref_names = validate_ref_names(self._source[0], ref_names)
         source = self._source[0]
 
-        fingerprint_parts: list[object] = ["<lance-resolve-ref>"]
-        for ref in source.ref_columns:
-            if ref.column in ref_names:
-                fingerprint_parts.extend((ref.column, ref.uri, ref.key_column, ref.value_column))
-
         factory = LanceResolveRefFactory(
             source=source,
             ref_names=ref_names,
@@ -139,7 +133,5 @@ class LanceDataset(Dataset):
         spec = StageSpec(
             kind="assemble",
             apply=_AssembleStage(factory=factory, context=stage_context),
-            fn_fingerprint=hash_bytes(*fingerprint_parts),
-            trace_policy="traceable",
         )
         return self._append_stage(spec)

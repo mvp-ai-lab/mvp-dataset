@@ -35,12 +35,6 @@ RefFieldSpec = tuple[str, PathLikeStr]
 Stage = Callable[[Iterable[object]], Iterable[object]]
 """One lazy transformation stage in the iterator pipeline."""
 
-CacheLayout = Literal["single_dataset", "global_merge"]
-"""Cache materialization layout for full-cache mode."""
-
-CacheTracePolicy = Literal["traceable", "unsupported"]
-"""Whether a stage participates in cache invalidation."""
-
 StageKind = Literal["map", "select", "shuffle", "batch", "assemble", "unbatch"]
 """Recognized pipeline stage kinds."""
 
@@ -51,45 +45,11 @@ class StageSpec:
 
     Attributes:
         kind: Symbolic stage name (``"map"``, ``"shuffle"``, ``"batch"``, etc.).
-        apply: Standard stage callable used during normal (non-cache) iteration.
-        fn_fingerprint: Stable hash of the user-provided callable, used to
-            detect when a stage's logic changes and the cache must be rebuilt.
-            Empty string for unsupported stages.
-        cache_trace_policy: Whether the stage participates in per-field
-            signature tracking and cache invalidation.
-        cache_stage: Optional cache-aware version of the stage that propagates
-            ``__cache_meta__`` through the sample stream.  ``None`` for
-            unsupported stages that use the regular ``apply`` callable during
-            warm-up.
+        apply: Stage callable used during iteration.
     """
 
     kind: StageKind
     apply: Stage
-    fn_fingerprint: str | None = None
-    fn_ref: Callable | None = None
-    trace_policy: CacheTracePolicy | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class CacheSpec:
-    """Cache boundary descriptor attached to a :class:`~mvp_dataset.Dataset`.
-
-    Attributes:
-        boundary_index: Number of pre-cache :class:`StageSpec` entries.
-        cache_dir: Root directory for standalone cache datasets.
-        cache_num_workers: Number of worker threads used to build the full
-            cache from independent source shards or fragments.
-        cache_write_batch_size: Number of samples buffered before each cache
-            write flush to Lance.
-        plan_fingerprint: Stable hash of all pre-cache stage fingerprints
-            combined with the source identity.
-    """
-
-    boundary_index: int
-    cache_dir: str
-    cache_num_workers: int
-    cache_write_batch_size: int
-    plan_fingerprint: str
 
 
 class Assembler[T, U](Protocol):

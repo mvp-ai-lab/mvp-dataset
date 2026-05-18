@@ -1,12 +1,10 @@
-"""Pipeline stage classes and group-execution utilities."""
+"""Pipeline stage classes."""
 
 from __future__ import annotations
 
 import importlib
 import random
-from collections import deque
-from collections.abc import Callable, Iterable, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from types import ModuleType
 
@@ -19,7 +17,7 @@ from ..pipeline.ops import (
     unbatch_samples,
 )
 from .context import RuntimeContext
-from .types import Assembler, StageSpec
+from .types import Assembler
 
 
 def torch_iterabledataset_class(
@@ -111,47 +109,3 @@ class _AssembleStage:
 class _UnbatchStage:
     def __call__(self, data: Iterable[object]) -> Iterable[object]:
         return unbatch_samples(data)
-
-
-# ---------------------------------------------------------------------------
-# Stage group execution (used by cache pipeline)
-# ---------------------------------------------------------------------------
-
-# Stage kinds that are safe to run in parallel (1-in → 1-out, no cross-sample state).
-PARALLELIZABLE_STAGE_KINDS = frozenset({"map"})
-
-
-def _apply_stage_group(item: object, specs: tuple[StageSpec, ...]) -> object:
-    """Apply a group of 1-to-1 stages to a single item."""
-    stream = iter((item,))
-    for spec in specs:
-        stream = spec.apply(stream)
-    outputs = list(stream)
-    if len(outputs) != 1:
-        msg = "[CacheError] pre-cache map stages must preserve one input -> one output sample"
-        raise ValueError(msg)
-    return outputs[0]
-
-
-def iter_stage_group(
-    data: Iterable[object],
-    specs: tuple[StageSpec, ...],
-    num_workers: int,
-) -> Iterator[object]:
-    """Iterate ``data`` through ``specs``, running in a thread pool when ``num_workers > 1``."""
-    if not specs:
-        yield from data
-        return
-    if num_workers == 1:
-        for item in data:
-            yield _apply_stage_group(item, specs)
-        return
-    max_inflight = num_workers * 2
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        pending: deque = deque()
-        for item in data:
-            pending.append(executor.submit(_apply_stage_group, item, specs))
-            if len(pending) >= max_inflight:
-                yield pending.popleft().result()
-        while pending:
-            yield pending.popleft().result()

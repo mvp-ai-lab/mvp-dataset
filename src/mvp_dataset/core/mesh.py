@@ -67,8 +67,7 @@ class DataLoadMesh:
 
         The leader is defined as the rank whose non-data-parallel mesh
         coordinates are all zero. This selects exactly one representative from
-        each model-parallel replica group so TP co-members do not duplicate
-        cache writes.
+        each model-parallel replica group.
         """
 
         dim_names = getattr(self.device_mesh, "mesh_dim_names", None)

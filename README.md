@@ -7,7 +7,6 @@ It is built around a few ideas:
 - one immutable `Dataset` pipeline
 - deterministic sharding across distributed ranks and worker processes
 - simple on-the-fly transforms
-- a practical `.cache()` boundary for expensive preprocessing
 - optional `TorchLoader` integration for PyTorch `DataLoader`
 
 ## Installation
@@ -53,7 +52,6 @@ Chainable dataset stages:
 - `.assemble(factory, drop_last=False)`
 - `.batch(batch_size, drop_last=False, collate_fn=None)`
 - `.unbatch()`
-- `.cache(cache_dir=".cache", cache_num_workers=1, cache_write_batch_size=1024, max_rows_per_fragment=5000)`
 
 `TorchLoader` supports post-merge stages:
 
@@ -178,7 +176,7 @@ from mvp_dataset import Dataset
 
 dataset = Dataset.from_source(
     "lance",
-    "/data/cache/train.lance",
+    "/data/lance/train.lance",
     columns=["tokens", "label"],
 )
 ```
@@ -258,7 +256,7 @@ Dataset.from_source(
 Notes:
 
 - inputs are local Lance dataset paths or URIs
-- `shuffle_mode="none"` preserves ordered reads and is the default used by cached Lance datasets
+- `shuffle_mode="none"` preserves ordered reads
 - `shuffle_mode="global"` performs an exact global permutation via `take(...)`
 - `shuffle_mode="fragment_aware"` shuffles assigned fragments/chunks and row blocks while keeping each slot close to fewer fragments
 
@@ -289,95 +287,7 @@ The `factory` receives the runtime-resolved `RuntimeContext`, so it can safely d
 
 ### `batch` / `unbatch`
 
-Operate directly on the dataset stream. These are valid for normal iteration, but `batch` and `unbatch` are intentionally rejected before `.cache()`.
-
-## Caching
-
-`.cache()` materializes all upstream outputs into a local Lance dataset.
-
-This is intended for expensive preprocessing such as:
-
-- image decode
-- tokenization
-- feature extraction
-- multimodal assembly
-
-Basic example:
-
-```python
-from mvp_dataset import Dataset
-
-def tokenize(sample: dict[str, object]) -> dict[str, object]:
-    return {**sample, "tokens": sample["text"].split()}
-
-dataset = (
-    Dataset.from_source("jsonl", "/data/train.jsonl")
-    .map(tokenize)
-    .cache()
-    .shuffle(buffer_size=4096)
-)
-```
-
-### What Is Cached
-
-All stages before `.cache()` are materialized once. All stages after `.cache()` run on every iteration.
-
-```python
-dataset = (
-    Dataset.from_source("tars", shards)
-    .map(expensive_preprocess)   # cached
-    .cache()
-    .map(random_augment)         # not cached
-    .shuffle(buffer_size=2048)   # not cached
-)
-```
-
-### Cache Storage
-
-- storage format: Lance
-- default cache root: `.cache` under the current working directory
-- output path is derived from a plan fingerprint
-
-### Cache Invalidation
-
-The cache plan fingerprint is built from:
-
-- source listing / fragment identity
-- every pre-cache stage marked as traceable
-
-Current behavior:
-
-- `.map()` participates in invalidation
-- `.select()` participates in invalidation
-- `.assemble()` participates in invalidation, including `drop_last`
-- `.shuffle()` is intentionally allowed before `.cache()`, but does not participate in invalidation
-
-If `.shuffle()` appears before `.cache()`, a warning is logged to make that tradeoff explicit.
-
-Lambdas and local closures are rejected before `.cache()` because their identity is not stable across process restarts.
-
-### Supported Pre-Cache Stages
-
-Supported:
-
-- `map`
-- `select`
-- `shuffle`
-- `assemble`
-
-Rejected:
-
-- `batch`
-- `unbatch`
-
-### Pre-Cache Execution Model
-
-The current implementation preserves full-stream semantics:
-
-- only the leading contiguous `map(...)` prefix is parallelized with `cache_num_workers`
-- once a non-`map` stage is reached, all remaining pre-cache stages run on the merged stream in declaration order
-
-This is why `shuffle` and `assemble` behave the same with and without cache.
+Operate directly on the dataset stream.
 
 ## Distributed and Tensor-Parallel Behavior
 
@@ -402,16 +312,6 @@ ctx = RuntimeContext.from_runtime(
 
 dataset = Dataset.from_source("tars", shards, context=ctx)
 ```
-
-### Cache Under TP
-
-The cache layer is mesh-aware:
-
-- per-slot cache shards are keyed by `dp_rank`, not global `rank`
-- only one DP leader writes each per-slot cache shard
-- merge consumes one shard per DP slot
-
-This prevents TP co-members from duplicating cached samples.
 
 ## TorchLoader
 
@@ -501,7 +401,7 @@ Distributed / runtime context:
 Source behavior:
 
 - `LOADER_TAR_KEY_DOT_LEVEL`
-- `LOADER_JSONL_TAR_CACHE_SIZE`
+- `MVP_DATASET_TAR_MAX_OPEN_FILES`
 
 ## Demo Commands
 

@@ -14,7 +14,6 @@ import pyarrow.parquet as pq
 from ...core.types import PathLikeStr, Sample
 
 _DEFAULT_BATCH_SIZE: Final[int] = 65536
-_FRAGMENT_SUFFIX: Final[str] = "@@rg="
 _MAX_METADATA_WORKERS: Final[int] = 16
 _BATCH_SIZE_ENV_VAR: Final[str] = "MVP_DATASET_PARQUET_BATCH_SIZE"
 
@@ -27,15 +26,6 @@ class ParquetFragment:
     row_groups: tuple[int, ...]
     row_offset: int
     num_rows: int
-
-    @property
-    def cache_key(self) -> str:
-        """Stable shard identifier used by cache manifests and routing."""
-
-        rg_spec = (
-            str(self.row_groups[0]) if len(self.row_groups) == 1 else f"{self.row_groups[0]}-{self.row_groups[-1]}"
-        )
-        return f"{self.path}{_FRAGMENT_SUFFIX}{rg_spec}"
 
 
 def list_parquet_fragments(

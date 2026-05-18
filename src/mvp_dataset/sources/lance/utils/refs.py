@@ -25,7 +25,7 @@ from .types import LanceRefSpec, LanceSourceSpec
 REF_INDEX_BUILDER_VERSION = 1
 REF_INDEX_MISSING_ROW = -1
 REF_INDEX_MANIFEST = "metadata.json"
-REF_INDEX_CACHE_DIR = "_mvp_ref_index"
+REF_INDEX_DIR = "_mvp_ref_index"
 REF_INDEX_BUILD_BATCH_SIZE = 65536
 REF_INDEX_LOCK_POLL_SECONDS = 0.25
 
@@ -156,10 +156,10 @@ def _ref_index_is_valid(
     if not index_dir.exists() or not manifest_path.exists():
         return False
     try:
-        cached_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        stored_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    return cached_manifest == manifest and all(
+    return stored_manifest == manifest and all(
         (index_dir / ref_files[ref.column]["offsets_file"]).exists()
         and (index_dir / ref_files[ref.column]["entries_file"]).exists()
         for ref in active_refs
@@ -227,7 +227,7 @@ def prepare_ref_indexes(
         },
     }
     digest = hashlib.sha256(json.dumps(manifest, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:32]
-    index_root = Path(source.datasets[0].uri) / REF_INDEX_CACHE_DIR
+    index_root = Path(source.datasets[0].uri) / REF_INDEX_DIR
     index_dir = index_root / f"ref-index-{digest}"
     manifest_path = index_dir / REF_INDEX_MANIFEST
     lock_dir = index_root / f"ref-index-{digest}.lock"
@@ -308,7 +308,7 @@ def prepare_ref_indexes(
             shutil.rmtree(lock_dir, ignore_errors=True)
 
     if not _ref_index_is_valid(index_dir, manifest, ref_files, active_refs):
-        msg = f"[InvalidLanceRefIndex] ref index cache was not completed at {index_dir}"
+        msg = f"[InvalidLanceRefIndex] ref index was not completed at {index_dir}"
         raise RuntimeError(msg)
 
     prepared_refs: list[LanceRefSpec] = []
@@ -384,7 +384,7 @@ def _apply_ref_columns(
     global_indices = np.asarray([item["__global_index__"] for item in batch], dtype=np.int64)
     for ref in active_refs:
         # Step 3: Validate that ``prepare_ref_indexes`` has attached the CSR
-        # arrays and the cached reference dataset handle for this ref column.
+        # arrays and the prepared reference dataset handle for this ref column.
         if not isinstance(ref.index_handle, dict):
             msg = f"[UnpreparedLanceRefIndex] ref index for {ref.column!r} was not prepared"
             raise RuntimeError(msg)
