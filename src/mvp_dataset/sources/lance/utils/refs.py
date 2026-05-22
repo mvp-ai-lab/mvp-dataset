@@ -7,10 +7,11 @@ import json
 import os
 import shutil
 import time
+import uuid
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import lance
 import numpy as np
@@ -28,6 +29,9 @@ REF_INDEX_MANIFEST = "metadata.json"
 REF_INDEX_DIR = "_mvp_ref_index"
 REF_INDEX_BUILD_BATCH_SIZE = 65536
 REF_INDEX_LOCK_POLL_SECONDS = 0.25
+REF_INDEX_WAIT_TIMEOUT_SECONDS = 30 * 60
+
+LanceRefIndexScope = Literal["shared", "node_local", "process"]
 
 
 def parse_lance_ref_columns(ref_columns: object) -> tuple[LanceRefSpec, ...]:
@@ -166,26 +170,129 @@ def _ref_index_is_valid(
     )
 
 
-def _acquire_ref_index_build_lock(
-    lock_dir: Path,
+def _resolve_ref_index_scope(scope: LanceRefIndexScope | None) -> LanceRefIndexScope:
+    raw_scope = scope or os.environ.get("MVP_LANCE_REF_INDEX_SCOPE", "node_local")
+    if raw_scope not in ("shared", "node_local", "process"):
+        msg = f"[InvalidLanceRefIndexScope] expected shared, node_local, or process, got {raw_scope!r}"
+        raise ValueError(msg)
+    return raw_scope
+
+
+def _is_ref_index_builder(context: RuntimeContext | None, scope: LanceRefIndexScope) -> bool:
+    if scope == "process" or context is None:
+        return True
+    if scope == "shared":
+        return context.rank == 0 and context.worker_id == 0
+    if scope == "node_local":
+        return context.local_rank == 0 and context.worker_id == 0
+    msg = f"[InvalidLanceRefIndexScope] expected shared, node_local, or process, got {scope!r}"
+    raise ValueError(msg)
+
+
+def _wait_for_ref_index(
     index_dir: Path,
     manifest: dict[str, Any],
     ref_files: dict[str, dict[str, Any]],
     active_refs: Sequence[LanceRefSpec],
-) -> bool:
-    lock_dir.parent.mkdir(parents=True, exist_ok=True)
-    while True:
-        if _ref_index_is_valid(index_dir, manifest, ref_files, active_refs):
-            return False
-        try:
-            lock_dir.mkdir()
-            (lock_dir / "owner.json").write_text(
-                json.dumps({"pid": os.getpid(), "created_at": time.time()}, sort_keys=True),
-                encoding="utf-8",
+    *,
+    timeout_seconds: float = REF_INDEX_WAIT_TIMEOUT_SECONDS,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    poll_seconds = REF_INDEX_LOCK_POLL_SECONDS
+    while not _ref_index_is_valid(index_dir, manifest, ref_files, active_refs):
+        if time.monotonic() >= deadline:
+            msg = f"[LanceRefIndexTimeout] timed out waiting for ref index at {index_dir}"
+            raise TimeoutError(msg)
+        time.sleep(poll_seconds)
+        poll_seconds = min(poll_seconds * 2, 5.0)
+
+
+def _publish_ref_index(tmp_index_dir: Path, index_dir: Path) -> None:
+    try:
+        tmp_index_dir.replace(index_dir)
+    except FileExistsError:
+        return
+    except OSError:
+        if not index_dir.exists():
+            raise
+
+
+def _build_ref_index(
+    index_dir: Path,
+    manifest: dict[str, Any],
+    ref_files: dict[str, dict[str, Any]],
+    active_refs: Sequence[LanceRefSpec],
+    source: LanceSourceSpec,
+) -> None:
+    manifest_path = index_dir / REF_INDEX_MANIFEST
+    index_dir.mkdir(parents=True, exist_ok=False)
+
+    offsets_by_column: dict[str, np.memmap] = {}
+    requested_positions: dict[str, dict[Any, list[int]]] = {ref.column: {} for ref in active_refs}
+    entry_counts = {ref.column: 0 for ref in active_refs}
+    for ref in active_refs:
+        offsets_by_column[ref.column] = np.memmap(
+            index_dir / ref_files[ref.column]["offsets_file"],
+            dtype=np.uint64,
+            mode="w+",
+            shape=(source.total_rows + 1,),
+        )
+        offsets_by_column[ref.column][0] = 0
+
+    global_row_index = 0
+    main_columns = [ref.column for ref in active_refs]
+    for dataset in source.datasets:
+        for batch in _iter_table_record_batches(lance.dataset(dataset.uri), columns=main_columns):
+            for row in batch.to_pylist():
+                global_row_index += 1
+                for ref in active_refs:
+                    for key in _iter_ref_keys(row[ref.column]):
+                        requested_positions[ref.column].setdefault(key, []).append(entry_counts[ref.column])
+                        entry_counts[ref.column] += 1
+                    offsets_by_column[ref.column][global_row_index] = entry_counts[ref.column]
+
+    if global_row_index != source.total_rows:
+        msg = f"[InvalidLanceRefIndex] expected {source.total_rows} main rows, scanned {global_row_index}"
+        raise RuntimeError(msg)
+
+    entries_by_column: dict[str, np.memmap | np.ndarray] = {}
+    for ref in active_refs:
+        offsets_by_column[ref.column].flush()
+        entries_path = index_dir / ref_files[ref.column]["entries_file"]
+        if entry_counts[ref.column] == 0:
+            entries_path.touch()
+            entries = np.empty(0, dtype=np.int64)
+        else:
+            entries = np.memmap(
+                entries_path,
+                dtype=np.int64,
+                mode="w+",
+                shape=(entry_counts[ref.column],),
             )
-            return True
-        except FileExistsError:
-            time.sleep(REF_INDEX_LOCK_POLL_SECONDS)
+            entries[:] = REF_INDEX_MISSING_ROW
+        entries_by_column[ref.column] = entries
+
+    for ref in active_refs:
+        row_index = 0
+        resolved_keys: set[Any] = set()
+        for batch in _iter_table_record_batches(lance.dataset(ref.uri), columns=[ref.key_column]):
+            for row in batch.to_pylist():
+                key = row[ref.key_column]
+                positions = requested_positions[ref.column].get(key)
+                if positions is not None:
+                    if key in resolved_keys:
+                        msg = f"[DuplicateLanceRefKey] duplicate key {key!r} in {ref.uri}:{ref.key_column}"
+                        raise ValueError(msg)
+                    resolved_keys.add(key)
+                    entries_by_column[ref.column][positions] = row_index
+                row_index += 1
+        flush = getattr(entries_by_column[ref.column], "flush", None)
+        if callable(flush):
+            flush()
+
+    tmp_manifest_path = manifest_path.with_suffix(f"{manifest_path.suffix}.tmp")
+    tmp_manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2, default=str), encoding="utf-8")
+    tmp_manifest_path.replace(manifest_path)
 
 
 def prepare_ref_indexes(
@@ -193,6 +300,8 @@ def prepare_ref_indexes(
     *,
     columns: Sequence[str] | None = None,
     load_in_memory: bool = False,
+    context: RuntimeContext | None = None,
+    ref_index_scope: LanceRefIndexScope | None = None,
 ) -> LanceSourceSpec:
     if not source.ref_columns:
         return source
@@ -229,83 +338,23 @@ def prepare_ref_indexes(
     digest = hashlib.sha256(json.dumps(manifest, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:32]
     index_root = Path(source.datasets[0].uri) / REF_INDEX_DIR
     index_dir = index_root / f"ref-index-{digest}"
-    manifest_path = index_dir / REF_INDEX_MANIFEST
-    lock_dir = index_root / f"ref-index-{digest}.lock"
+    scope = _resolve_ref_index_scope(ref_index_scope)
+    is_builder = _is_ref_index_builder(context, scope)
 
-    should_build = _acquire_ref_index_build_lock(lock_dir, index_dir, manifest, ref_files, active_refs)
-    if should_build:
-        try:
-            if not _ref_index_is_valid(index_dir, manifest, ref_files, active_refs):
-                if index_dir.exists():
-                    shutil.rmtree(index_dir, ignore_errors=True)
-                index_dir.mkdir(parents=True, exist_ok=True)
-
-                offsets_by_column: dict[str, np.memmap] = {}
-                requested_positions: dict[str, dict[Any, list[int]]] = {ref.column: {} for ref in active_refs}
-                entry_counts = {ref.column: 0 for ref in active_refs}
-                for ref in active_refs:
-                    offsets_by_column[ref.column] = np.memmap(
-                        index_dir / ref_files[ref.column]["offsets_file"],
-                        dtype=np.uint64,
-                        mode="w+",
-                        shape=(source.total_rows + 1,),
-                    )
-                    offsets_by_column[ref.column][0] = 0
-
-                global_row_index = 0
-                main_columns = [ref.column for ref in active_refs]
-                for dataset in source.datasets:
-                    for batch in _iter_table_record_batches(lance.dataset(dataset.uri), columns=main_columns):
-                        for row in batch.to_pylist():
-                            global_row_index += 1
-                            for ref in active_refs:
-                                for key in _iter_ref_keys(row[ref.column]):
-                                    requested_positions[ref.column].setdefault(key, []).append(entry_counts[ref.column])
-                                    entry_counts[ref.column] += 1
-                                offsets_by_column[ref.column][global_row_index] = entry_counts[ref.column]
-
-                if global_row_index != source.total_rows:
-                    msg = f"[InvalidLanceRefIndex] expected {source.total_rows} main rows, scanned {global_row_index}"
-                    raise RuntimeError(msg)
-
-                entries_by_column: dict[str, np.memmap] = {}
-                for ref in active_refs:
-                    offsets_by_column[ref.column].flush()
-                    entries_path = index_dir / ref_files[ref.column]["entries_file"]
-                    if entry_counts[ref.column] == 0:
-                        entries_path.touch()
-                        entries = np.empty(0, dtype=np.int64)
-                    else:
-                        entries = np.memmap(
-                            entries_path,
-                            dtype=np.int64,
-                            mode="w+",
-                            shape=(entry_counts[ref.column],),
-                        )
-                        entries[:] = REF_INDEX_MISSING_ROW
-                    entries_by_column[ref.column] = entries
-
-                for ref in active_refs:
-                    row_index = 0
-                    resolved_keys: set[Any] = set()
-                    for batch in _iter_table_record_batches(lance.dataset(ref.uri), columns=[ref.key_column]):
-                        for row in batch.to_pylist():
-                            key = row[ref.key_column]
-                            positions = requested_positions[ref.column].get(key)
-                            if positions is not None:
-                                if key in resolved_keys:
-                                    msg = f"[DuplicateLanceRefKey] duplicate key {key!r} in {ref.uri}:{ref.key_column}"
-                                    raise ValueError(msg)
-                                resolved_keys.add(key)
-                                entries_by_column[ref.column][positions] = row_index
-                            row_index += 1
-                    flush = getattr(entries_by_column[ref.column], "flush", None)
-                    if callable(flush):
-                        flush()
-
-                manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2, default=str), encoding="utf-8")
-        finally:
-            shutil.rmtree(lock_dir, ignore_errors=True)
+    if not _ref_index_is_valid(index_dir, manifest, ref_files, active_refs):
+        if is_builder:
+            tmp_root = index_root / ".tmp"
+            tmp_index_dir = tmp_root / f"ref-index-{digest}-{os.getpid()}-{uuid.uuid4().hex}"
+            if tmp_index_dir.exists():
+                shutil.rmtree(tmp_index_dir, ignore_errors=True)
+            try:
+                _build_ref_index(tmp_index_dir, manifest, ref_files, active_refs, source)
+                if not _ref_index_is_valid(index_dir, manifest, ref_files, active_refs):
+                    _publish_ref_index(tmp_index_dir, index_dir)
+            finally:
+                shutil.rmtree(tmp_index_dir, ignore_errors=True)
+        else:
+            _wait_for_ref_index(index_dir, manifest, ref_files, active_refs)
 
     if not _ref_index_is_valid(index_dir, manifest, ref_files, active_refs):
         msg = f"[InvalidLanceRefIndex] ref index was not completed at {index_dir}"
@@ -474,6 +523,8 @@ def iter_lance_ref_resolver(
     *,
     batch_size: int = 1024,
     load_in_memory: bool = False,
+    context: RuntimeContext | None = None,
+    ref_index_scope: LanceRefIndexScope | None = None,
 ):
     """Resolve configured Lance reference columns for already-read samples."""
 
@@ -482,6 +533,8 @@ def iter_lance_ref_resolver(
         ref_names=ref_names,
         batch_size=batch_size,
         load_in_memory=load_in_memory,
+        context=context,
+        ref_index_scope=ref_index_scope,
     )
     for sample in sample_stream:
         yield from assembler.push(sample)
@@ -494,14 +547,16 @@ class LanceResolveRefFactory:
     ref_names: tuple[str, ...]
     batch_size: int = 1024
     load_in_memory: bool = False
+    ref_index_scope: LanceRefIndexScope | None = None
 
     def __call__(self, context: RuntimeContext) -> LanceRefResolverAssembler:
-        _ = context
         return LanceRefResolverAssembler(
             source=self.source,
             ref_names=self.ref_names,
             batch_size=self.batch_size,
             load_in_memory=self.load_in_memory,
+            context=context,
+            ref_index_scope=self.ref_index_scope,
         )
 
 
@@ -513,13 +568,21 @@ class LanceRefResolverAssembler:
         ref_names: Sequence[str],
         batch_size: int = 1024,
         load_in_memory: bool = False,
+        context: RuntimeContext | None = None,
+        ref_index_scope: LanceRefIndexScope | None = None,
     ) -> None:
         if batch_size <= 0:
             msg = f"[InvalidLanceRefBatchSize] batch_size must be > 0, got {batch_size}"
             raise ValueError(msg)
 
         self.ref_names = validate_ref_names(source, ref_names)
-        self.source = prepare_ref_indexes(source, columns=self.ref_names, load_in_memory=load_in_memory)
+        self.source = prepare_ref_indexes(
+            source,
+            columns=self.ref_names,
+            load_in_memory=load_in_memory,
+            context=context,
+            ref_index_scope=ref_index_scope,
+        )
         self.batch_size = batch_size
         self.batch: list[Sample] = []
         self.queue_size = 0
