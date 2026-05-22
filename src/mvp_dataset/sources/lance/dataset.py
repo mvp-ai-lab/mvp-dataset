@@ -7,6 +7,7 @@ from mvp_dataset.core.stages import _AssembleStage
 from mvp_dataset.core.types import ShardInput, StageSpec
 
 from .utils import (
+    LanceRefIndexScope,
     LanceResolveRefFactory,
     LanceShuffleMode,
     LanceSourceSpec,
@@ -42,6 +43,7 @@ class _LanceSourceIter:
 class LanceDataset(Dataset):
     _shuffle_mode: LanceShuffleMode = "none"
     _load_in_memory: bool = False
+    _ref_index_scope: LanceRefIndexScope | None = None
 
     @classmethod
     def from_source(
@@ -54,6 +56,7 @@ class LanceDataset(Dataset):
         shuffle_mode: LanceShuffleMode = "none",
         load_in_memory: bool = False,
         ref_columns: dict[str, dict[str, str]] | None = None,
+        ref_index_scope: LanceRefIndexScope | None = None,
     ):
         """Build a dataset from local Lance dataset paths.
 
@@ -71,6 +74,10 @@ class LanceDataset(Dataset):
                          reference configs containing uri, key_column, and value_column.
                          Use ``resolve_ref(...)`` later in the pipeline to read
                          and replace these referenced values.
+            ref_index_scope: Reference-index build scope. ``node_local`` builds once
+                             per node, ``shared`` builds once on global rank 0, and
+                             ``process`` lets each process attempt to publish. Defaults
+                             to ``MVP_LANCE_REF_INDEX_SCOPE`` or ``shared``.
         Returns:
             A lance dataset.
         """
@@ -98,6 +105,7 @@ class LanceDataset(Dataset):
             ),
             _shuffle_mode=shuffle_mode,
             _load_in_memory=load_in_memory,
+            _ref_index_scope=ref_index_scope,
         )
 
     def _build_source_stream(self, *, context: RuntimeContext) -> Iterable[object]:
@@ -116,6 +124,7 @@ class LanceDataset(Dataset):
         *,
         batch_size: int = 1024,
         context: RuntimeContext | None = None,
+        ref_index_scope: LanceRefIndexScope | None = None,
     ) -> Dataset:
         """Append a lazy stage that resolves configured Lance reference columns."""
         assert batch_size > 0, "batch_size must be a positive integer"
@@ -128,6 +137,7 @@ class LanceDataset(Dataset):
             ref_names=ref_names,
             batch_size=batch_size,
             load_in_memory=self._load_in_memory,
+            ref_index_scope=ref_index_scope if ref_index_scope is not None else self._ref_index_scope,
         )
         stage_context = self.context if context is None else context
         spec = StageSpec(
