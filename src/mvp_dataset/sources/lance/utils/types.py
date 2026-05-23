@@ -25,7 +25,7 @@ class LanceRefSpec:
     """Configuration for one Lance reference column."""
 
     column: str
-    uri: str
+    uri: str | tuple[str, ...]
     key_column: str
     value_column: str
     index_uri: str | None = None

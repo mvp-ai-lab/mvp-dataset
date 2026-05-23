@@ -19,7 +19,16 @@ def _resolve_config_uri(uri: object, *, base_dir: Path) -> str:
     return str(base_dir / uri)
 
 
-def _load_lance_source_config(config_path: Path) -> tuple[list[str], dict[str, dict[str, str]] | None]:
+def _resolve_config_uri_or_list(uri: object, *, base_dir: Path) -> str | list[str]:
+    if isinstance(uri, list):
+        if not uri:
+            msg = "[InvalidLanceConfig] expected a non-empty URI list"
+            raise ValueError(msg)
+        return [_resolve_config_uri(item, base_dir=base_dir) for item in uri]
+    return _resolve_config_uri(uri, base_dir=base_dir)
+
+
+def _load_lance_source_config(config_path: Path) -> tuple[list[str], dict[str, dict[str, object]] | None]:
     if not config_path.exists():
         msg = f"[MissingLanceConfig] Lance source config was not found: {config_path}"
         raise FileNotFoundError(msg)
@@ -56,7 +65,7 @@ def _load_lance_source_config(config_path: Path) -> tuple[list[str], dict[str, d
         msg = f"[InvalidLanceConfig] ref_columns must be a mapping in {config_path}"
         raise ValueError(msg)
 
-    resolved_ref_columns: dict[str, dict[str, str]] = {}
+    resolved_ref_columns: dict[str, dict[str, object]] = {}
     for column, ref_config in raw_ref_columns.items():
         if not isinstance(column, str) or not column:
             msg = f"[InvalidLanceConfig] ref column names must be non-empty strings in {config_path}"
@@ -64,10 +73,10 @@ def _load_lance_source_config(config_path: Path) -> tuple[list[str], dict[str, d
         if not isinstance(ref_config, dict):
             msg = f"[InvalidLanceConfig] ref config for {column!r} must be a mapping in {config_path}"
             raise ValueError(msg)
-        resolved_ref_config: dict[str, str] = {}
+        resolved_ref_config: dict[str, object] = {}
         for key, value in ref_config.items():
             if key == "uri":
-                resolved_ref_config[key] = _resolve_config_uri(value, base_dir=base_dir)
+                resolved_ref_config[key] = _resolve_config_uri_or_list(value, base_dir=base_dir)
             elif isinstance(value, str):
                 resolved_ref_config[key] = value
             else:
@@ -80,8 +89,8 @@ def _load_lance_source_config(config_path: Path) -> tuple[list[str], dict[str, d
 
 def resolve_lance_source_config(
     shards: ShardInput | Sequence[ShardInput],
-    ref_columns: dict[str, dict[str, str]] | None,
-) -> tuple[list[str], dict[str, dict[str, str]] | None]:
+    ref_columns: dict[str, dict[str, object]] | None,
+) -> tuple[list[str], dict[str, dict[str, object]] | None]:
     normalized_shards = normalize_paths(shards)
     json_config_paths = [Path(path) for path in normalized_shards if Path(path).suffix.lower() == ".json"]
     if not json_config_paths:

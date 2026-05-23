@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import os
@@ -21,7 +22,8 @@ import pyarrow.dataset as pads
 from mvp_dataset.core.context import RuntimeContext
 from mvp_dataset.core.types import Sample
 
-from .types import LanceRefSpec, LanceSourceSpec
+from .source import list_lance_sources
+from .types import LanceDatasetSpec, LanceIndexItem, LanceRefSpec, LanceSourceSpec
 
 REF_INDEX_BUILDER_VERSION = 1
 REF_INDEX_MISSING_ROW = -1
@@ -55,10 +57,25 @@ def parse_lance_ref_columns(ref_columns: object) -> tuple[LanceRefSpec, ...]:
         if missing:
             msg = f"[InvalidLanceRefColumn] config for {column!r} is missing: {', '.join(missing)}"
             raise ValueError(msg)
+        raw_uri = config["uri"]
+        if isinstance(raw_uri, (list, tuple)):
+            if not raw_uri:
+                msg = f"[InvalidLanceRefColumn] config for {column!r} has an empty uri list"
+                raise ValueError(msg)
+            if not all(isinstance(uri, str) and uri for uri in raw_uri):
+                msg = f"[InvalidLanceRefColumn] config for {column!r}.uri must contain non-empty strings"
+                raise ValueError(msg)
+            uri: str | tuple[str, ...] = tuple(raw_uri)
+        elif isinstance(raw_uri, str) and raw_uri:
+            uri = raw_uri
+        else:
+            msg = f"[InvalidLanceRefColumn] config for {column!r}.uri must be a string or list of strings"
+            raise ValueError(msg)
+
         specs.append(
             LanceRefSpec(
                 column=column,
-                uri=str(config["uri"]),
+                uri=uri,
                 key_column=str(config["key_column"]),
                 value_column=str(config["value_column"]),
             )
@@ -148,6 +165,83 @@ def _dataset_manifest_fingerprint(uri: str) -> dict[str, Any]:
                 "size": stat.st_size,
             }
     return fingerprint
+
+
+def _ref_uris(ref: LanceRefSpec) -> tuple[str, ...]:
+    return (ref.uri,) if isinstance(ref.uri, str) else ref.uri
+
+
+def _ref_manifest_fingerprint(ref: LanceRefSpec) -> dict[str, Any]:
+    uris = _ref_uris(ref)
+    if len(uris) == 1:
+        return _dataset_manifest_fingerprint(uris[0])
+    datasets = [_dataset_manifest_fingerprint(uri) for uri in uris]
+    return {
+        "uris": list(uris),
+        "datasets": datasets,
+        "num_rows": sum(int(dataset["num_rows"]) for dataset in datasets),
+    }
+
+
+def _open_ref_value_source(ref: LanceRefSpec, *, load_in_memory: bool) -> LanceSourceSpec:
+    source = list_lance_sources(_ref_uris(ref))[0]
+    for dataset_i, dataset in enumerate(source.datasets):
+        ds_handle: object = lance.dataset(dataset.uri)
+        if load_in_memory:
+            ds_handle = pads.InMemoryDataset(ds_handle.to_table())
+        source.datasets[dataset_i] = LanceDatasetSpec(
+            uri=dataset.uri,
+            num_rows=dataset.num_rows,
+            row_offset=dataset.row_offset,
+            fragment_ids=dataset.fragment_ids,
+            fragment_row_counts=dataset.fragment_row_counts,
+            handle=ds_handle,
+        )
+    return source
+
+
+def _read_ref_value_rows(
+    value_source: LanceSourceSpec,
+    row_indices: Sequence[int],
+    *,
+    columns: Sequence[str],
+) -> list[Sample]:
+    if not row_indices:
+        return []
+
+    row_offsets = [dataset.row_offset for dataset in value_source.datasets]
+    batch_indexes: list[LanceIndexItem] = []
+    for row_index in row_indices:
+        dataset_i = bisect.bisect_right(row_offsets, row_index) - 1
+        dataset = value_source.datasets[dataset_i]
+        local_index = int(row_index - dataset.row_offset)
+        batch_indexes.append(LanceIndexItem(dataset_i=dataset_i, local_index=local_index, global_index=int(row_index)))
+
+    per_dataset_indices: dict[int, list[int]] = {}
+    for index_item in batch_indexes:
+        per_dataset_indices.setdefault(index_item.dataset_i, []).append(index_item.local_index)
+
+    per_dataset_rows: dict[int, list[Sample]] = {}
+    for dataset_i, local_indices in per_dataset_indices.items():
+        dataset = value_source.datasets[dataset_i]
+        dataset_handle = dataset.handle if dataset.handle is not None else lance.dataset(dataset.uri)
+        per_dataset_rows[dataset_i] = _read_table_rows(dataset_handle, local_indices, columns=columns)
+
+    per_dataset_offsets = {dataset_i: 0 for dataset_i in per_dataset_indices}
+    rows: list[Sample] = []
+    for index_item in batch_indexes:
+        dataset_offset = per_dataset_offsets[index_item.dataset_i]
+        rows.append(per_dataset_rows[index_item.dataset_i][dataset_offset])
+        per_dataset_offsets[index_item.dataset_i] += 1
+    return rows
+
+
+def _looks_like_lance_index_items(value: object) -> bool:
+    if value is None:
+        return False
+    if not isinstance(value, Sequence) or isinstance(value, str):
+        return False
+    return bool(value) and isinstance(value[0], LanceIndexItem)
 
 
 def _ref_index_is_valid(
@@ -297,17 +391,18 @@ def _build_ref_index(
     for ref in active_refs:
         row_index = 0
         resolved_keys: set[Any] = set()
-        for batch in _iter_table_record_batches(lance.dataset(ref.uri), columns=[ref.key_column]):
-            for row in batch.to_pylist():
-                key = row[ref.key_column]
-                positions = requested_positions[ref.column].get(key)
-                if positions is not None:
-                    if key in resolved_keys:
-                        msg = f"[DuplicateLanceRefKey] duplicate key {key!r} in {ref.uri}:{ref.key_column}"
-                        raise ValueError(msg)
-                    resolved_keys.add(key)
-                    entries_by_column[ref.column][positions] = row_index
-                row_index += 1
+        for uri in _ref_uris(ref):
+            for batch in _iter_table_record_batches(lance.dataset(uri), columns=[ref.key_column]):
+                for row in batch.to_pylist():
+                    key = row[ref.key_column]
+                    positions = requested_positions[ref.column].get(key)
+                    if positions is not None:
+                        if key in resolved_keys:
+                            msg = f"[DuplicateLanceRefKey] duplicate key {key!r} in {uri}:{ref.key_column}"
+                            raise ValueError(msg)
+                        resolved_keys.add(key)
+                        entries_by_column[ref.column][positions] = row_index
+                    row_index += 1
         flush = getattr(entries_by_column[ref.column], "flush", None)
         if callable(flush):
             flush()
@@ -350,7 +445,7 @@ def prepare_ref_indexes(
         "refs": {
             ref.column: {
                 **ref_files[ref.column],
-                "ref_dataset": _dataset_manifest_fingerprint(ref.uri),
+                "ref_dataset": _ref_manifest_fingerprint(ref),
                 "key_column": ref.key_column,
                 "value_column": ref.value_column,
             }
@@ -389,10 +484,11 @@ def prepare_ref_indexes(
             if entry_count == 0
             else np.memmap(entries_path, dtype=np.int64, mode="r", shape=(entry_count,))
         )
-        value_dataset: object = lance.dataset(ref.uri)
+        value_source = _open_ref_value_source(ref, load_in_memory=load_in_memory)
         if load_in_memory:
             offsets = np.asarray(offsets)
             entries = np.asarray(entries)
+        value_dataset = value_source.datasets[0].handle if len(value_source.datasets) == 1 else None
         prepared_refs.append(
             LanceRefSpec(
                 column=ref.column,
@@ -402,7 +498,12 @@ def prepare_ref_indexes(
                 index_uri=str(index_dir),
                 index_offsets_path=str(offsets_path),
                 index_entries_path=str(entries_path),
-                index_handle={"offsets": offsets, "entries": entries, "value_dataset": value_dataset},
+                index_handle={
+                    "offsets": offsets,
+                    "entries": entries,
+                    "value_dataset": value_dataset,
+                    "value_source": value_source,
+                },
             )
         )
 
@@ -412,7 +513,9 @@ def prepare_ref_indexes(
 def _apply_ref_columns(
     source: LanceSourceSpec,
     batch: list[Sample],
-    columns: Sequence[str] | None,
+    columns_or_indexes: Sequence[str] | Sequence[LanceIndexItem] | None = None,
+    *,
+    columns: Sequence[str] | None = None,
 ) -> None:
     """Resolve configured Lance reference columns in-place for one sample batch.
 
@@ -439,6 +542,9 @@ def _apply_ref_columns(
     # Step 1: Restrict work to the requested/projection-visible ref columns.
     # If ``columns`` is None, all configured refs are active. Otherwise a ref is
     # resolved only when its source column is present in the current projection.
+    if columns is None:
+        columns = None if _looks_like_lance_index_items(columns_or_indexes) else columns_or_indexes
+
     active_refs = (
         source.ref_columns if columns is None else tuple(ref for ref in source.ref_columns if ref.column in columns)
     )
@@ -490,10 +596,10 @@ def _apply_ref_columns(
         # ``value_column`` into every sample/value slot recorded in the plan.
         if positions_by_row_index:
             ordered_row_indices = list(positions_by_row_index)
-            ref_dataset = ref.index_handle.get("value_dataset")
-            if ref_dataset is None:
-                ref_dataset = lance.dataset(ref.uri)
-            ref_rows = _read_table_rows(ref_dataset, ordered_row_indices, columns=[ref.value_column])
+            value_source = ref.index_handle.get("value_source")
+            if not isinstance(value_source, LanceSourceSpec):
+                value_source = _open_ref_value_source(ref, load_in_memory=False)
+            ref_rows = _read_ref_value_rows(value_source, ordered_row_indices, columns=[ref.value_column])
             for row_index, row in zip(ordered_row_indices, ref_rows, strict=True):
                 for sample_position, value_position in positions_by_row_index[row_index]:
                     resolved_values[sample_position][value_position] = row[ref.value_column]

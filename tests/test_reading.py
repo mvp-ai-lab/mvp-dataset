@@ -551,6 +551,69 @@ def test_lance_ref_columns_resolve_multi_value_refs(tmp_path, monkeypatch) -> No
     assert [sample["images"] for sample in observed] == [[b"one", b"zero"], [], [b"zero"]]
 
 
+def test_lance_ref_columns_resolve_multi_part_ref_uri_from_meta_json(tmp_path, monkeypatch) -> None:
+    if importlib.util.find_spec("lance") is None:
+        pytest.skip("lance is not installed")
+
+    monkeypatch.chdir(tmp_path)
+    meta_a_path = write_lance_table(
+        tmp_path,
+        "meta-a.lance",
+        [
+            {"id": "sample-0", "images": ["image-1", "image-0"]},
+            {"id": "sample-1", "images": ["image-2"]},
+        ],
+    )
+    meta_b_path = write_lance_table(
+        tmp_path,
+        "meta-b.lance",
+        [
+            {"id": "sample-2", "images": ["image-3"]},
+        ],
+    )
+    image_a_path = write_lance_table(
+        tmp_path,
+        "image-a.lance",
+        [
+            {"image_id": "image-0", "image": b"zero"},
+            {"image_id": "image-1", "image": b"one"},
+        ],
+    )
+    image_b_path = write_lance_table(
+        tmp_path,
+        "image-b.lance",
+        [
+            {"image_id": "image-2", "image": b"two"},
+            {"image_id": "image-3", "image": b"three"},
+        ],
+    )
+    config_path = tmp_path / "meta.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "main_uri": [meta_a_path, meta_b_path],
+                "ref_columns": {
+                    "images": {
+                        "uri": [image_a_path, image_b_path],
+                        "key_column": "image_id",
+                        "value_column": "image",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    dataset = Dataset.from_source("lance", shards=str(config_path)).resolve_ref(["images"])
+    observed = list(dataset)
+    index_paths = list((tmp_path / "meta-a.lance" / "_mvp_ref_index").glob("ref-index-*"))
+    manifest = json.loads((index_paths[0] / "metadata.json").read_text(encoding="utf-8"))
+
+    assert [sample["images"] for sample in observed] == [[b"one", b"zero"], [b"two"], [b"three"]]
+    assert manifest["main_total_rows"] == 3
+    assert manifest["refs"]["images"]["ref_dataset"]["uris"] == [image_a_path, image_b_path]
+
+
 def test_lance_ref_columns_respect_projection(tmp_path, monkeypatch) -> None:
     if importlib.util.find_spec("lance") is None:
         pytest.skip("lance is not installed")
