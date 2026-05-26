@@ -13,10 +13,11 @@ from .utils import iter_jsonls, split_jsonl_files
 class _JsonlSourceIter:
     ref_fields: tuple[RefFieldSpec, ...] = ()
 
-    def __call__(self, shard_stream):
+    def __call__(self, shard_stream, *, resume_cursor=None):
         return iter_jsonls(
             shard_stream,
             ref_fields=self.ref_fields,
+            resume_cursor=resume_cursor,
         )
 
 

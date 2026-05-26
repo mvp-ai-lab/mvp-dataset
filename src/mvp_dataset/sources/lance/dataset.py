@@ -29,13 +29,14 @@ class _LanceSourceIter:
 
     handles_sharding = True
 
-    def __call__(self, source_stream):
+    def __call__(self, source_stream, *, resume_cursor=None):
         return iter_lance(
             self.source,
             source_stream,
             columns=self.columns,
             batch_size=self.batch_size,
             load_in_memory=self.load_in_memory,
+            resume_cursor=resume_cursor,
         )
 
 
@@ -115,8 +116,27 @@ class LanceDataset(Dataset):
             context=context,
             resample=self._resample,
             shuffle_mode=self._shuffle_mode,
+            resume_cursor=self._resume_state.get("source_cursor") if self._resume_state is not None else None,
         )
-        return self._iter_source_stream(source_shard_stream)
+        return self._iter_source_stream(source_shard_stream, resume_cursor=None)
+
+    def _resume_source_payload(self) -> dict[str, object]:
+        payload = Dataset._resume_source_payload(self)
+        payload["lance"] = {
+            "shuffle_mode": self._shuffle_mode,
+            "load_in_memory": self._load_in_memory,
+            "ref_index_scope": self._ref_index_scope,
+        }
+        return payload
+
+    def _validate_resume_supported(self) -> None:
+        Dataset._validate_resume_supported(self)
+        if self._shuffle_mode != "none":
+            msg = (
+                "[UnsupportedResumeSource] Lance resume currently supports only "
+                "shuffle_mode='none'; shuffle state is not checkpointed"
+            )
+            raise ValueError(msg)
 
     def resolve_ref(
         self,

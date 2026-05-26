@@ -5,6 +5,7 @@ from __future__ import annotations
 import random
 from collections.abc import Callable, Iterable, Iterator
 
+from ..core.resume import RESUME_TOKEN_KEY
 from ..core.types import Assembler
 
 
@@ -29,7 +30,7 @@ def select_samples(
         yield {
             key: value
             for key, value in sample.items()
-            if key in selected or (key.startswith("__") and key.endswith("__"))
+            if key in selected or (key != RESUME_TOKEN_KEY and key.startswith("__") and key.endswith("__"))
         }
 
 

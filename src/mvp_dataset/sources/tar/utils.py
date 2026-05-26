@@ -9,6 +9,7 @@ from collections.abc import Iterator, Sequence
 from pathlib import PurePosixPath
 from typing import Final, cast
 
+from ...core.resume import RESUME_TOKEN_KEY, token_matches
 from ...core.types import PathLikeStr, Sample, SidecarSpec
 
 
@@ -123,6 +124,7 @@ def _require_sample_key(sample: Sample, *, shard_path: PathLikeStr, source_name:
 def iter_tars(
     shard_paths: Iterator[PathLikeStr],
     sidecars: Sequence[SidecarSpec] | None = None,
+    resume_cursor: object | None = None,
 ) -> Iterator[Sample]:
     """Iterate multiple tar shards, optionally merging sidecar tars.
 
@@ -139,9 +141,21 @@ def iter_tars(
             shards raise a :class:`ValueError`.
     """
     key_dot_level = int(os.environ.get("MVP_DATASET_TAR_KEY_DOT_LEVEL", "1"))
+    resume_seen = resume_cursor is None
     for shard_path in shard_paths:
         if not sidecars:
-            yield from iter_tar(shard_path, key_dot_level=key_dot_level)
+            for sample in iter_tar(shard_path, key_dot_level=key_dot_level):
+                token = {
+                    "kind": "tars",
+                    "shard": str(shard_path),
+                    "sample_index_in_shard": sample["__index_in_shard__"],
+                    "key": sample["__key__"],
+                }
+                sample[RESUME_TOKEN_KEY] = token
+                if not resume_seen:
+                    resume_seen = token_matches(token, resume_cursor)
+                    continue
+                yield sample
             continue
 
         # Build one iterator per sidecar alongside the main iterator.
@@ -194,4 +208,14 @@ def iter_tars(
                         raise ValueError(msg)
                     merged[field] = value
 
+            token = {
+                "kind": "tars",
+                "shard": str(shard_path),
+                "sample_index_in_shard": merged["__index_in_shard__"],
+                "key": main_key,
+            }
+            merged[RESUME_TOKEN_KEY] = token
+            if not resume_seen:
+                resume_seen = token_matches(token, resume_cursor)
+                continue
             yield merged

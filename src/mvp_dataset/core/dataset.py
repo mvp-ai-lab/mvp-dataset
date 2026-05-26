@@ -8,6 +8,7 @@ from dataclasses import replace as dataclass_replace
 
 from ..utils.sharding import assign_items
 from .context import RuntimeContext
+from .resume import RESUME_TOKEN_KEY, make_resume_state, validate_resume_state
 from .stages import (
     _AssembleStage,
     _BatchStage,
@@ -37,13 +38,67 @@ class Dataset(torch_iterabledataset_class()):
     _stages: tuple[StageSpec, ...]
     _resample: bool
     _iter_source_stream: Callable
+    _resume_state: dict[str, object] | None = None
+    _last_resume_token: object | None = None
+    _resume_step: int = 0
 
     def _build_source_stream(self, *, context: RuntimeContext) -> Iterable[object]:
         source_shard_stream = assign_items(self._source, context=context, resample=self._resample)
-        return self._iter_source_stream(source_shard_stream)
+        resume_cursor = self._resume_state.get("source_cursor") if self._resume_state is not None else None
+        return self._iter_source_stream(source_shard_stream, resume_cursor=resume_cursor)
 
     def _append_stage(self, spec: StageSpec) -> Dataset:
         return dataclass_replace(self, _stages=self._stages + (spec,))
+
+    def _resume_source_payload(self) -> dict[str, object]:
+        return {
+            "source": self._source,
+            "resample": self._resample,
+            "reader": self._iter_source_stream,
+        }
+
+    def _validate_resume_supported(self) -> None:
+        return None
+
+    def _track_source_resume(self, stream: Iterable[object]) -> Iterator[object]:
+        for sample in stream:
+            if isinstance(sample, dict) and RESUME_TOKEN_KEY in sample:
+                object.__setattr__(self, "_last_resume_token", sample[RESUME_TOKEN_KEY])
+            yield sample
+
+    def state_dict(self) -> dict[str, object]:
+        """Return a checkpointable state for the next dataset item."""
+
+        self._validate_resume_supported()
+        context = RuntimeContext.from_runtime(base=self.context)
+        source_cursor = self._last_resume_token
+        if source_cursor is None and self._resume_state is not None:
+            source_cursor = self._resume_state.get("source_cursor")
+        return make_resume_state(
+            source_kind=self._source_kind,
+            source=self._resume_source_payload(),
+            stages=self._stages,
+            context=context,
+            source_cursor=source_cursor,
+            step=self._resume_step,
+        )
+
+    def load_state_dict(self, state: dict[str, object]) -> Dataset:
+        """Load a previously returned dataset resume state."""
+
+        self._validate_resume_supported()
+        context = RuntimeContext.from_runtime(base=self.context)
+        validate_resume_state(
+            state,
+            source_kind=self._source_kind,
+            source=self._resume_source_payload(),
+            stages=self._stages,
+            context=context,
+        )
+        object.__setattr__(self, "_resume_state", dict(state))
+        object.__setattr__(self, "_last_resume_token", state.get("source_cursor"))
+        object.__setattr__(self, "_resume_step", int(state.get("step", 0)))
+        return self
 
     def map(self, fn: Callable[[object], object]) -> Dataset:
         """Append a lazy map stage.
@@ -162,10 +217,12 @@ class Dataset(torch_iterabledataset_class()):
     def __iter__(self) -> Iterator[object]:
         """Materialize and run the full lazy pipeline."""
         context = RuntimeContext.from_runtime(base=self.context)
-        stream: Iterable[object] = self._build_source_stream(context=context)
+        stream: Iterable[object] = self._track_source_resume(self._build_source_stream(context=context))
         for spec in self._stages:
             stream = spec.apply(stream)
-        yield from stream
+        for sample in stream:
+            object.__setattr__(self, "_resume_step", self._resume_step + 1)
+            yield sample
 
     @classmethod
     def from_source(cls, source_kind: SourceKind, *args, **kwargs) -> Dataset:
