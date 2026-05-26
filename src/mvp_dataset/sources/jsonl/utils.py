@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 
+from ...core.resume import RESUME_TOKEN_KEY, token_matches
 from ...core.types import PathLikeStr, RefFieldSpec, Sample
 
 _TAR_URI_PREFIX = "tar://"
@@ -357,10 +358,12 @@ def materialize_jsonl_shards(
 def iter_jsonls(
     shard_paths: Iterator[PathLikeStr],
     ref_fields: tuple[RefFieldSpec, ...],
+    resume_cursor: object | None = None,
 ) -> Iterator[Sample]:
     """Resolve tar data references while streaming JSONL shard files."""
     key_dot_level = int(os.environ.get("MVP_DATASET_TAR_KEY_DOT_LEVEL", "1"))
     max_open_tars = int(os.environ.get("MVP_DATASET_TAR_MAX_OPEN_FILES", "8"))
+    resume_seen = resume_cursor is None
 
     def _resolve_one(sample: Sample, manager: TarManager) -> Sample:
         resolved = dict(sample)
@@ -381,6 +384,16 @@ def iter_jsonls(
             with open(shard_path, encoding="utf-8") as handle:
                 for line_index, line in enumerate(handle):
                     sample = _parse_jsonl_line(str(shard_path), line_index, line, allow_preannotated=True)
+                    token = {
+                        "kind": "jsonl",
+                        "file": str(shard_path),
+                        "line_index": sample["__index_in_file__"],
+                        "key": sample["__key__"],
+                    }
+                    sample[RESUME_TOKEN_KEY] = token
+                    if not resume_seen:
+                        resume_seen = token_matches(token, resume_cursor)
+                        continue
                     yield _resolve_one(sample, manager)
 
 

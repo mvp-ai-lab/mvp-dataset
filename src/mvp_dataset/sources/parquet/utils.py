@@ -11,6 +11,7 @@ from typing import Final
 
 import pyarrow.parquet as pq
 
+from ...core.resume import RESUME_TOKEN_KEY
 from ...core.types import PathLikeStr, Sample
 
 _DEFAULT_BATCH_SIZE: Final[int] = 65536
@@ -147,6 +148,7 @@ def iter_parquet(
     columns: Sequence[str] | None = None,
     batch_size: int | None = None,
     use_threads: bool = True,
+    start_index: int | None = None,
 ) -> Iterator[Sample]:
     """Iterate one parquet row-group fragment and yield one sample dict per row."""
 
@@ -163,6 +165,9 @@ def iter_parquet(
         column_names = record_batch.schema.names
         columns_data = [record_batch.column(i) for i in range(record_batch.num_columns)]
         for batch_row_index in range(record_batch.num_rows):
+            if start_index is not None and index_in_file < start_index:
+                index_in_file += 1
+                continue
             sample: Sample = {
                 name: columns_data[column_index][batch_row_index].as_py()
                 for column_index, name in enumerate(column_names)
@@ -170,6 +175,13 @@ def iter_parquet(
             sample["__file__"] = fragment.path
             sample["__index_in_file__"] = index_in_file
             sample["__key__"] = f"{fragment.path}:{index_in_file}"
+            sample[RESUME_TOKEN_KEY] = {
+                "kind": "parquet",
+                "path": fragment.path,
+                "row_groups": list(fragment.row_groups),
+                "fragment_row_offset": fragment.row_offset,
+                "row_index": index_in_file,
+            }
             yield sample
             index_in_file += 1
 
@@ -180,13 +192,32 @@ def iter_parquets(
     columns: Sequence[str] | None = None,
     batch_size: int | None = None,
     use_threads: bool = True,
+    resume_cursor: object | None = None,
 ) -> Iterator[Sample]:
     """Iterate parquet row-group fragments in order and yield row samples."""
 
+    resume_path = resume_row = None
+    resume_fragment_row_offset = None
+    if isinstance(resume_cursor, dict) and resume_cursor.get("kind") == "parquet":
+        resume_path = resume_cursor.get("path")
+        resume_row = resume_cursor.get("row_index")
+        resume_fragment_row_offset = resume_cursor.get("fragment_row_offset")
+
     for fragment in fragments:
+        start_index = None
+        if resume_path is not None and isinstance(resume_row, int):
+            if fragment.path != resume_path or fragment.row_offset != resume_fragment_row_offset:
+                continue
+            fragment_end = fragment.row_offset + fragment.num_rows
+            if resume_row >= fragment_end:
+                resume_path = resume_row = resume_fragment_row_offset = None
+                continue
+            start_index = max(fragment.row_offset, resume_row + 1)
+            resume_path = resume_row = resume_fragment_row_offset = None
         yield from iter_parquet(
             fragment,
             columns=columns,
             batch_size=batch_size,
             use_threads=use_threads,
+            start_index=start_index,
         )

@@ -13,10 +13,11 @@ from .utils import iter_tars
 class _TarSourceIter:
     sidecars: tuple[SidecarSpec, ...] = ()
 
-    def __call__(self, shard_stream):
+    def __call__(self, shard_stream, *, resume_cursor=None):
         return iter_tars(
             shard_stream,
             sidecars=self.sidecars or None,
+            resume_cursor=resume_cursor,
         )
 
 

@@ -12,6 +12,7 @@ import pyarrow as pa
 import pyarrow.dataset as pads
 
 from mvp_dataset.core.context import RuntimeContext
+from mvp_dataset.core.resume import RESUME_TOKEN_KEY
 from mvp_dataset.core.types import PathLikeStr, Sample
 
 from .types import LanceDatasetSpec, LanceIndexItem, LanceShuffleMode, LanceSourceSpec
@@ -138,6 +139,7 @@ def assign_items(
     context: RuntimeContext,
     resample: bool,
     shuffle_mode: LanceShuffleMode = "none",
+    resume_cursor: object | None = None,
 ) -> Iterable[LanceIndexItem]:
     """Yield slot-assigned row indexes for a single logical Lance source.
 
@@ -178,6 +180,14 @@ def assign_items(
     slot = context.slot
     total_slots = context.total_slots
     global_index_list = np.arange(source_spec.total_rows)
+    start_global_index = 0
+    if (
+        shuffle_mode == "none"
+        and isinstance(resume_cursor, dict)
+        and resume_cursor.get("kind") == "lance"
+        and isinstance(resume_cursor.get("global_index"), int)
+    ):
+        start_global_index = int(resume_cursor["global_index"]) + 1
 
     while True:
         if shuffle_mode == "fragment_aware":
@@ -192,6 +202,8 @@ def assign_items(
                     source_spec.total_rows
                 )
             for i, global_index in enumerate(global_index_list):
+                if shuffle_mode == "none" and int(global_index) < start_global_index:
+                    continue
                 if i % total_slots != slot:
                     continue
 
@@ -213,6 +225,7 @@ def assign_items(
         if not resample:
             break
         round_index += 1
+        start_global_index = 0
 
 
 def _read_batch(
@@ -263,6 +276,12 @@ def _read_batch(
         sample["__local_index__"] = index_item.local_index
         sample["__global_index__"] = index_item.global_index
         sample["__key__"] = f"{dataset.uri}:{index_item.local_index}"
+        sample[RESUME_TOKEN_KEY] = {
+            "kind": "lance",
+            "dataset_i": index_item.dataset_i,
+            "local_index": index_item.local_index,
+            "global_index": index_item.global_index,
+        }
         batch.append(sample)
         per_dataset_offsets[index_item.dataset_i] += 1
 
@@ -276,6 +295,7 @@ def iter_lance(
     columns: Sequence[str] | None = None,
     batch_size: int = 1024,
     load_in_memory: bool = False,
+    resume_cursor: object | None = None,
 ):
     """Read Lance rows from an index stream and yield sample dictionaries.
 
@@ -318,6 +338,7 @@ def iter_lance(
             handle=ds_handle,
         )
 
+    _ = resume_cursor
     batch_indexes: list[LanceIndexItem] = []
     for index_item in index_stream:
         batch_indexes.append(index_item)

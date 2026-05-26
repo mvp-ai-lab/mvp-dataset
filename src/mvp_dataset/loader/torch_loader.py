@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import random
 from collections.abc import Callable, Iterable, Iterator
 from typing import Any
@@ -134,6 +135,7 @@ class TorchLoader:
         collate_fn: Callable[[list[object]], object] | None = None,
         drop_last: bool = False,
         _stages: tuple[LoaderStage, ...] | None = None,
+        resume_state: dict[str, object] | None = None,
         **loader_kwargs: Any,
     ) -> None:
         """Initialize a PyTorch-backed loader wrapper.
@@ -181,6 +183,9 @@ class TorchLoader:
         self._drop_last = drop_last
         self._loader_kwargs: dict[str, object] = dict(loader_kwargs)
         self._stages = tuple() if _stages is None else _stages
+        self._resume_step = 0
+        if resume_state is not None:
+            self.load_state_dict(resume_state)
 
     def _append_stage(self, stage: LoaderStage) -> TorchLoader:
         """Return a new loader with one additional post-merge stage.
@@ -204,8 +209,65 @@ class TorchLoader:
             collate_fn=self._collate_fn,
             drop_last=self._drop_last,
             _stages=self._stages + (stage,),
+            resume_state=self.state_dict() if self._resume_step else None,
             **self._loader_kwargs,
         )
+
+    def _loader_fingerprint(self) -> str:
+        payload = {
+            "num_workers": self._num_workers,
+            "batch_size": self._batch_size,
+            "pin_memory": self._pin_memory,
+            "persistent_workers": self._persistent_workers,
+            "prefetch_factor": self._prefetch_factor,
+            "multiprocessing_context": self._multiprocessing_context,
+            "drop_last": self._drop_last,
+            "collate_fn": repr(self._collate_fn),
+            "loader_kwargs": self._loader_kwargs,
+            "stages": [stage.__class__.__name__ for stage in self._stages],
+        }
+        return json.dumps(payload, sort_keys=True, default=repr)
+
+    def state_dict(self) -> dict[str, object]:
+        """Return a checkpointable loader state for the next yielded batch."""
+
+        if self._num_workers != 0:
+            msg = "[UnsupportedResume] TorchLoader resume currently supports num_workers=0"
+            raise ValueError(msg)
+        if self._stages:
+            msg = "[UnsupportedResume] loader-side stages are not resumable in this implementation"
+            raise ValueError(msg)
+        dataset_state_dict = getattr(self._dataset, "state_dict", None)
+        if not callable(dataset_state_dict):
+            msg = "[UnsupportedResume] upstream dataset does not expose state_dict()"
+            raise ValueError(msg)
+        return {
+            "version": 1,
+            "step": self._resume_step,
+            "loader_fingerprint": self._loader_fingerprint(),
+            "dataset": dataset_state_dict(),
+        }
+
+    def load_state_dict(self, state: dict[str, object]) -> TorchLoader:
+        """Load a state returned by :meth:`state_dict`."""
+
+        if state.get("version") != 1:
+            msg = f"[InvalidResumeState] unsupported loader state version={state.get('version')!r}"
+            raise ValueError(msg)
+        if state.get("loader_fingerprint") != self._loader_fingerprint():
+            msg = "[InvalidResumeState] loader settings do not match current TorchLoader"
+            raise ValueError(msg)
+        dataset_state = state.get("dataset")
+        if not isinstance(dataset_state, dict):
+            msg = "[InvalidResumeState] loader state is missing dataset state"
+            raise ValueError(msg)
+        dataset_load_state_dict = getattr(self._dataset, "load_state_dict", None)
+        if not callable(dataset_load_state_dict):
+            msg = "[UnsupportedResume] upstream dataset does not expose load_state_dict()"
+            raise ValueError(msg)
+        dataset_load_state_dict(dataset_state)
+        self._resume_step = int(state.get("step", 0))
+        return self
 
     def _build_torch_dataloader(self) -> Iterable[object]:
         """Build the underlying ``torch.utils.data.DataLoader`` instance.
@@ -349,4 +411,6 @@ class TorchLoader:
         stream: Iterable[object] = self._build_torch_dataloader()
         for stage in self._stages:
             stream = stage(stream)
-        yield from stream
+        for item in stream:
+            self._resume_step += 1
+            yield item

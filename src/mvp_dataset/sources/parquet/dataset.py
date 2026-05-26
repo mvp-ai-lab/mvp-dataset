@@ -14,11 +14,12 @@ class _ParquetSourceIter:
     columns: Sequence[str] | None = None
     use_threads: bool = True
 
-    def __call__(self, fragment_stream):
+    def __call__(self, fragment_stream, *, resume_cursor=None):
         return iter_parquets(
             fragment_stream,
             columns=self.columns,
             use_threads=self.use_threads,
+            resume_cursor=resume_cursor,
         )
 
 
