@@ -250,6 +250,8 @@ Dataset.from_source(
     columns=None,
     batch_size=65536,
     shuffle_mode="none",
+    chunk_aware_shuffle_chunk_size=250_000,
+    chunk_aware_shuffle_k=8,
 )
 ```
 
@@ -258,6 +260,7 @@ Notes:
 - inputs are local Lance dataset paths or URIs
 - `shuffle_mode="none"` preserves ordered reads
 - `shuffle_mode="global"` performs an exact global permutation via `take(...)`
+- `shuffle_mode="chunk_aware"` shuffles chunk order and interleaves a bounded active chunk window without building a full row permutation
 - `shuffle_mode="fragment_aware"` shuffles assigned fragments/chunks and row blocks while keeping each slot close to fewer fragments
 
 ## Pipeline Semantics
