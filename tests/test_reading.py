@@ -171,6 +171,139 @@ def test_lance_assign_items_shuffle_uses_context_seed() -> None:
     assert sorted(first) == list(range(10))
 
 
+def test_lance_assign_items_chunk_aware_shuffle_is_bounded_and_deterministic(monkeypatch) -> None:
+    pytest.importorskip("lance")
+
+    import mvp_dataset.sources.lance.utils.source as lance_source_utils
+    from mvp_dataset.sources.lance.utils import (
+        LanceDatasetSpec,
+        LanceSourceSpec,
+        assign_items,
+    )
+
+    source = [
+        LanceSourceSpec(
+            datasets=[
+                LanceDatasetSpec(uri="a", num_rows=12, row_offset=0, fragment_ids=()),
+                LanceDatasetSpec(uri="b", num_rows=8, row_offset=12, fragment_ids=()),
+            ]
+        )
+    ]
+    context = RuntimeContext(seed=101)
+
+    original_arange = lance_source_utils.np.arange
+
+    def fail_full_row_arange(*args, **kwargs):
+        if args and args[0] == 20:
+            raise AssertionError("chunk-aware shuffle should not allocate a full row index array")
+        return original_arange(*args, **kwargs)
+
+    monkeypatch.setattr(lance_source_utils.np, "arange", fail_full_row_arange)
+    first = [
+        item.global_index
+        for item in assign_items(
+            source,
+            context=context,
+            resample=False,
+            shuffle_mode="chunk_aware",
+            chunk_aware_shuffle_chunk_size=5,
+            chunk_aware_shuffle_k=2,
+        )
+    ]
+    second = [
+        item.global_index
+        for item in assign_items(
+            source,
+            context=context,
+            resample=False,
+            shuffle_mode="chunk_aware",
+            chunk_aware_shuffle_chunk_size=5,
+            chunk_aware_shuffle_k=2,
+        )
+    ]
+
+    assert first == second
+    assert sorted(first) == list(range(20))
+    assert first != list(range(20))
+
+
+def test_lance_assign_items_chunk_aware_shuffle_shards_rows_across_slots() -> None:
+    pytest.importorskip("lance")
+
+    from mvp_dataset.sources.lance.utils import (
+        LanceDatasetSpec,
+        LanceSourceSpec,
+        assign_items,
+    )
+
+    source = [
+        LanceSourceSpec(
+            datasets=[
+                LanceDatasetSpec(uri="a", num_rows=20, row_offset=0, fragment_ids=()),
+            ]
+        )
+    ]
+
+    ranks = [
+        [
+            item.global_index
+            for item in assign_items(
+                source,
+                context=RuntimeContext(rank=rank, world_size=2, seed=103),
+                resample=False,
+                shuffle_mode="chunk_aware",
+                chunk_aware_shuffle_chunk_size=4,
+                chunk_aware_shuffle_k=3,
+            )
+        ]
+        for rank in range(2)
+    ]
+
+    assert sorted(index for rank_items in ranks for index in rank_items) == list(range(20))
+    assert set(ranks[0]).isdisjoint(ranks[1])
+    assert [len(rank_items) for rank_items in ranks] == [10, 10]
+
+
+def test_lance_assign_items_chunk_aware_shuffle_validates_parameters() -> None:
+    pytest.importorskip("lance")
+
+    from mvp_dataset.sources.lance.utils import (
+        LanceDatasetSpec,
+        LanceSourceSpec,
+        assign_items,
+    )
+
+    source = [
+        LanceSourceSpec(
+            datasets=[
+                LanceDatasetSpec(uri="a", num_rows=4, row_offset=0, fragment_ids=()),
+            ]
+        )
+    ]
+
+    with pytest.raises(ValueError, match="chunk_size"):
+        list(
+            assign_items(
+                source,
+                context=RuntimeContext(seed=107),
+                resample=False,
+                shuffle_mode="chunk_aware",
+                chunk_aware_shuffle_chunk_size=0,
+            )
+        )
+
+    with pytest.raises(ValueError, match="k"):
+        list(
+            assign_items(
+                source,
+                context=RuntimeContext(seed=107),
+                resample=False,
+                shuffle_mode="chunk_aware",
+                chunk_aware_shuffle_k=0,
+            )
+        )
+
+
 def test_lance_assign_items_shuffle_prefers_fragment_affinity_across_slots() -> None:
     pytest.importorskip("lance")
 
@@ -325,6 +458,40 @@ def test_lance_dataset_global_shuffle_shards_rows_across_slots(tmp_path, monkeyp
 
     assert observed_rank0 == [records[index] for index in shuffled_indices[0::2]]
     assert observed_rank1 == [records[index] for index in shuffled_indices[1::2]]
+
+
+def test_lance_dataset_chunk_aware_shuffle_reads_all_rows_once(tmp_path, monkeypatch) -> None:
+    if importlib.util.find_spec("lance") is None:
+        pytest.skip("lance is not installed")
+
+    records = build_records(count=12)
+    path = write_lance_dataset(tmp_path, records)
+    rank0 = Dataset.from_source(
+        "lance",
+        shards=path,
+        context=RuntimeContext(seed=109),
+        shuffle_mode="chunk_aware",
+        chunk_aware_shuffle_chunk_size=3,
+        chunk_aware_shuffle_k=2,
+    )
+    rank1 = Dataset.from_source(
+        "lance",
+        shards=path,
+        context=RuntimeContext(seed=109),
+        shuffle_mode="chunk_aware",
+        chunk_aware_shuffle_chunk_size=3,
+        chunk_aware_shuffle_k=2,
+    )
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "0")
+    observed_rank0 = [normalize_sample(sample) for sample in rank0]
+    monkeypatch.setenv("RANK", "1")
+    observed_rank1 = [normalize_sample(sample) for sample in rank1]
+    observed = observed_rank0 + observed_rank1
+
+    assert sorted(observed, key=lambda sample: int(sample["value"])) == records
+    assert observed != records
 
 
 def test_lance_dataset_fragment_aware_shuffle_reads_all_rows_once(tmp_path) -> None:

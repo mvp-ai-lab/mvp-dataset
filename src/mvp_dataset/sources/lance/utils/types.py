@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-LanceShuffleMode = Literal["none", "global", "fragment_aware"]
+LanceShuffleMode = Literal["none", "global", "fragment_aware", "chunk_aware"]
 
 
 @dataclass(frozen=True, slots=True)

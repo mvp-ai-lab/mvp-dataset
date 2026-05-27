@@ -18,6 +18,7 @@ from .utils import (
     resolve_lance_source_config,
     validate_ref_names,
 )
+from .utils.source import DEFAULT_CHUNK_AWARE_SHUFFLE_CHUNK_SIZE, DEFAULT_CHUNK_AWARE_SHUFFLE_K
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +43,8 @@ class _LanceSourceIter:
 @dataclass(frozen=True, slots=True)
 class LanceDataset(Dataset):
     _shuffle_mode: LanceShuffleMode = "none"
+    _chunk_aware_shuffle_chunk_size: int = DEFAULT_CHUNK_AWARE_SHUFFLE_CHUNK_SIZE
+    _chunk_aware_shuffle_k: int = DEFAULT_CHUNK_AWARE_SHUFFLE_K
     _load_in_memory: bool = False
     _ref_index_scope: LanceRefIndexScope | None = None
 
@@ -54,6 +57,8 @@ class LanceDataset(Dataset):
         columns: Sequence[str] | None = None,
         batch_size: int = 1024,
         shuffle_mode: LanceShuffleMode = "none",
+        chunk_aware_shuffle_chunk_size: int = DEFAULT_CHUNK_AWARE_SHUFFLE_CHUNK_SIZE,
+        chunk_aware_shuffle_k: int = DEFAULT_CHUNK_AWARE_SHUFFLE_K,
         load_in_memory: bool = False,
         ref_columns: dict[str, dict[str, str]] | None = None,
         ref_index_scope: LanceRefIndexScope | None = None,
@@ -68,7 +73,11 @@ class LanceDataset(Dataset):
             resample: Whether to loop shards indefinitely across rounds.
             columns: Optional list of column names to read.
             batch_size: Number of rows per Arrow batch during iteration.
-            shuffle_mode: One of ``"none"``, ``"global"``, or ``"fragment_aware"``.
+            shuffle_mode: One of ``"none"``, ``"global"``, ``"chunk_aware"``, or ``"fragment_aware"``.
+            chunk_aware_shuffle_chunk_size: Number of rows per chunk when using
+                                            ``shuffle_mode="chunk_aware"``.
+            chunk_aware_shuffle_k: Number of active chunks to interleave when
+                                   using ``shuffle_mode="chunk_aware"``.
             load_in_memory: Whether to load entire datasets into memory.
             ref_columns: Optional mapping of source column names to explicit Lance
                          reference configs containing uri, key_column, and value_column.
@@ -104,6 +113,8 @@ class LanceDataset(Dataset):
                 load_in_memory=load_in_memory,
             ),
             _shuffle_mode=shuffle_mode,
+            _chunk_aware_shuffle_chunk_size=chunk_aware_shuffle_chunk_size,
+            _chunk_aware_shuffle_k=chunk_aware_shuffle_k,
             _load_in_memory=load_in_memory,
             _ref_index_scope=ref_index_scope,
         )
@@ -115,6 +126,8 @@ class LanceDataset(Dataset):
             context=context,
             resample=self._resample,
             shuffle_mode=self._shuffle_mode,
+            chunk_aware_shuffle_chunk_size=self._chunk_aware_shuffle_chunk_size,
+            chunk_aware_shuffle_k=self._chunk_aware_shuffle_k,
         )
         return self._iter_source_stream(source_shard_stream)
 

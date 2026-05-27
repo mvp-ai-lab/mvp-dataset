@@ -16,7 +16,10 @@ from mvp_dataset.core.types import PathLikeStr, Sample
 
 from .types import LanceDatasetSpec, LanceIndexItem, LanceShuffleMode, LanceSourceSpec
 
+DEFAULT_CHUNK_AWARE_SHUFFLE_CHUNK_SIZE = 250_000
+DEFAULT_CHUNK_AWARE_SHUFFLE_K = 8
 FRAGMENT_SHUFFLE_BLOCK_SIZE = 64
+_SEED_MASK = (1 << 64) - 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +27,17 @@ class _FragmentRowSpan:
     dataset_i: int
     local_row_offset: int
     num_rows: int
+
+
+@dataclass(slots=True)
+class _ChunkAwareChunkState:
+    start: int
+    row_offsets: np.ndarray
+    position: int = 0
+
+    @property
+    def remaining(self) -> int:
+        return int(len(self.row_offsets) - self.position)
 
 
 def list_lance_sources(dataset_uris: Sequence[PathLikeStr]) -> list[LanceSourceSpec]:
@@ -53,6 +67,96 @@ def list_lance_sources(dataset_uris: Sequence[PathLikeStr]) -> list[LanceSourceS
         raise ValueError(msg)
 
     return [LanceSourceSpec(datasets=list(datasets))]
+
+
+def _mix_seed(*parts: int) -> int:
+    seed = 0xCBF29CE484222325
+    for part in parts:
+        seed ^= int(part) & _SEED_MASK
+        seed = (seed * 0x100000001B3) & _SEED_MASK
+    return seed
+
+
+def _index_item_from_global_index(
+    source: LanceSourceSpec,
+    row_offsets: Sequence[int],
+    global_index: int,
+) -> LanceIndexItem:
+    dataset_i = bisect.bisect_right(row_offsets, global_index) - 1
+    dataset = source.datasets[dataset_i]
+    local_index = int(global_index - dataset.row_offset)
+    return LanceIndexItem(
+        dataset_i=dataset_i,
+        local_index=local_index,
+        global_index=int(global_index),
+    )
+
+
+def _iter_chunk_aware_shuffled_items(
+    source: LanceSourceSpec,
+    *,
+    context: RuntimeContext,
+    round_index: int,
+    chunk_size: int,
+    k: int,
+) -> Iterable[LanceIndexItem]:
+    if chunk_size <= 0:
+        msg = f"[InvalidLanceChunkAwareShuffle] chunk_size must be > 0, got {chunk_size}"
+        raise ValueError(msg)
+    if k <= 0:
+        msg = f"[InvalidLanceChunkAwareShuffle] k must be > 0, got {k}"
+        raise ValueError(msg)
+
+    total_rows = source.total_rows
+    if total_rows <= 0:
+        return
+
+    row_offsets = [dataset.row_offset for dataset in source.datasets]
+    num_chunks = (total_rows + chunk_size - 1) // chunk_size
+    chunk_order_rng = np.random.default_rng(_mix_seed(context.seed, round_index, 0))
+    chunk_order = chunk_order_rng.permutation(num_chunks)
+    interleave_rng = np.random.default_rng(_mix_seed(context.seed, round_index, 1))
+
+    next_chunk_order_i = 0
+    active_chunks: list[_ChunkAwareChunkState] = []
+
+    def activate_next_chunk() -> bool:
+        nonlocal next_chunk_order_i
+        if next_chunk_order_i >= len(chunk_order):
+            return False
+        chunk_id = int(chunk_order[next_chunk_order_i])
+        next_chunk_order_i += 1
+        start = chunk_id * chunk_size
+        stop = min(start + chunk_size, total_rows)
+        chunk_rng = np.random.default_rng(_mix_seed(context.seed, round_index, 2, chunk_id))
+        active_chunks.append(_ChunkAwareChunkState(start=start, row_offsets=chunk_rng.permutation(stop - start)))
+        return True
+
+    while len(active_chunks) < min(k, num_chunks):
+        activate_next_chunk()
+
+    stream_position = 0
+    while active_chunks:
+        total_remaining = sum(chunk.remaining for chunk in active_chunks)
+        selected_offset = int(interleave_rng.integers(total_remaining))
+        selected_chunk_i = 0
+        for chunk_i, chunk in enumerate(active_chunks):
+            if selected_offset < chunk.remaining:
+                selected_chunk_i = chunk_i
+                break
+            selected_offset -= chunk.remaining
+
+        chunk = active_chunks[selected_chunk_i]
+        global_index = chunk.start + int(chunk.row_offsets[chunk.position])
+        chunk.position += 1
+
+        if stream_position % context.total_slots == context.slot:
+            yield _index_item_from_global_index(source, row_offsets, global_index)
+        stream_position += 1
+
+        if chunk.remaining == 0:
+            active_chunks.pop(selected_chunk_i)
+            activate_next_chunk()
 
 
 def _iter_fragment_aware_shuffled_items(
@@ -138,6 +242,8 @@ def assign_items(
     context: RuntimeContext,
     resample: bool,
     shuffle_mode: LanceShuffleMode = "none",
+    chunk_aware_shuffle_chunk_size: int = DEFAULT_CHUNK_AWARE_SHUFFLE_CHUNK_SIZE,
+    chunk_aware_shuffle_k: int = DEFAULT_CHUNK_AWARE_SHUFFLE_K,
 ) -> Iterable[LanceIndexItem]:
     """Yield slot-assigned row indexes for a single logical Lance source.
 
@@ -155,9 +261,14 @@ def assign_items(
         resample: When true, repeat the source forever. Each repeat is called a
             round.
         shuffle_mode: ``"none"`` preserves source row order, ``"global"`` uses
-            an exact row-level global shuffle, and ``"fragment_aware"`` shuffles
-            fragment/chunk spans while keeping each slot close to fewer
-            fragments.
+            the original exact row-level full-size permutation, ``"chunk_aware"``
+            shuffles chunk order and interleaves a bounded active chunk window,
+            and ``"fragment_aware"`` shuffles fragment/chunk spans while
+            keeping each slot close to fewer fragments.
+        chunk_aware_shuffle_chunk_size: Number of rows per chunk for
+            ``shuffle_mode="chunk_aware"``.
+        chunk_aware_shuffle_k: Number of active chunks to interleave for
+            ``shuffle_mode="chunk_aware"``.
 
     Yields:
         ``LanceIndexItem`` objects containing ``global_index`` in the
@@ -169,15 +280,15 @@ def assign_items(
     """
 
     assert len(source) == 1, "Multiple Lance sources are not supported in this implementation"
-    if shuffle_mode not in ("none", "global", "fragment_aware"):
-        msg = f"[InvalidLanceShuffleMode] expected none, global, or fragment_aware, got {shuffle_mode!r}"
+    if shuffle_mode not in ("none", "global", "fragment_aware", "chunk_aware"):
+        msg = f"[InvalidLanceShuffleMode] expected none, global, fragment_aware, or chunk_aware, got {shuffle_mode!r}"
         raise ValueError(msg)
     source_spec: LanceSourceSpec = source[0]
 
     round_index = 0
     slot = context.slot
     total_slots = context.total_slots
-    global_index_list = np.arange(source_spec.total_rows)
+    row_offsets = [dataset.row_offset for dataset in source_spec.datasets]
 
     while True:
         if shuffle_mode == "fragment_aware":
@@ -186,7 +297,16 @@ def assign_items(
                 context=context,
                 round_index=round_index,
             )
+        elif shuffle_mode == "chunk_aware":
+            yield from _iter_chunk_aware_shuffled_items(
+                source_spec,
+                context=context,
+                round_index=round_index,
+                chunk_size=chunk_aware_shuffle_chunk_size,
+                k=chunk_aware_shuffle_k,
+            )
         else:
+            global_index_list = np.arange(source_spec.total_rows)
             if shuffle_mode == "global":
                 global_index_list = np.random.default_rng(context.seed + round_index).permutation(
                     source_spec.total_rows
@@ -195,19 +315,10 @@ def assign_items(
                 if i % total_slots != slot:
                     continue
 
-                dataset_i = (
-                    bisect.bisect_right(
-                        [dataset.row_offset for dataset in source_spec.datasets],
-                        global_index,
-                    )
-                    - 1
-                )
-                dataset = source_spec.datasets[dataset_i]
-                local_index = int(global_index - dataset.row_offset)
-                yield LanceIndexItem(
-                    dataset_i=dataset_i,
-                    local_index=local_index,
-                    global_index=int(global_index),
+                yield _index_item_from_global_index(
+                    source_spec,
+                    row_offsets,
+                    int(global_index),
                 )
 
         if not resample:
