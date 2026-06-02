@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 
 from .mesh import DataLoadMesh, resolve_data_load_mesh
+from .resume import stable_fingerprint
 
 
 def _read_torch_runtime_values() -> tuple[int | None, int | None, int | None, int | None]:
@@ -138,6 +139,25 @@ class RuntimeContext:
         """Return the deterministic seed for sample-level shuffle."""
 
         return self.seed + self.slot
+
+    def fingerprint(self) -> str:
+        """Return a stable fingerprint for this explicit runtime context."""
+
+        payload = {
+            "rank": self.rank,
+            "world_size": self.world_size,
+            "worker_id": self.worker_id,
+            "num_workers": self.num_workers,
+            "epoch": self.epoch,
+            "seed": self.seed,
+            "mesh": None
+            if self.mesh is None
+            else {
+                "dp_rank": self.mesh.dp_rank,
+                "dp_size": self.mesh.dp_size,
+            },
+        }
+        return stable_fingerprint(payload)
 
     @classmethod
     def from_runtime(

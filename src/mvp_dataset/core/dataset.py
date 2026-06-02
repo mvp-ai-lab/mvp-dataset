@@ -8,6 +8,14 @@ from dataclasses import replace as dataclass_replace
 
 from ..utils.sharding import assign_items
 from .context import RuntimeContext
+from .resume import (
+    RESUME_STATE_VERSION,
+    ResumeStateError,
+    StatefulIterator,
+    StatefulStage,
+    UnsupportedResume,
+    stable_fingerprint,
+)
 from .stages import (
     _AssembleStage,
     _BatchStage,
@@ -37,13 +45,114 @@ class Dataset(torch_iterabledataset_class()):
     _stages: tuple[StageSpec, ...]
     _resample: bool
     _iter_source_stream: Callable
+    _resume_state: dict[str, object] | None = None
 
     def _build_source_stream(self, *, context: RuntimeContext) -> Iterable[object]:
         source_shard_stream = assign_items(self._source, context=context, resample=self._resample)
         return self._iter_source_stream(source_shard_stream)
 
     def _append_stage(self, spec: StageSpec) -> Dataset:
-        return dataclass_replace(self, _stages=self._stages + (spec,))
+        return dataclass_replace(self, _stages=self._stages + (spec,), _resume_state=None)
+
+    def _source_fingerprint(self) -> dict[str, object]:
+        return {
+            "kind": self._source_kind,
+            "resample": self._resample,
+            "iter_class": (
+                f"{self._iter_source_stream.__class__.__module__}.{self._iter_source_stream.__class__.__qualname__}"
+            ),
+            "iter_config": repr(self._iter_source_stream),
+            "store": repr(self._source),
+        }
+
+    def _stages_fingerprint(self) -> list[dict[str, object]]:
+        return [
+            {
+                "kind": spec.kind,
+                "apply_class": f"{spec.apply.__class__.__module__}.{spec.apply.__class__.__qualname__}",
+                "apply_config": repr(spec.apply),
+            }
+            for spec in self._stages
+        ]
+
+    def _pipeline_fingerprint(self) -> str:
+        payload = {
+            "source": self._source_fingerprint(),
+            "stages": self._stages_fingerprint(),
+        }
+        return stable_fingerprint(payload)
+
+    def state_dict(self) -> dict[str, object]:
+        """Return the resumable state for future pipeline outputs."""
+
+        stage_states: list[dict[str, object]] = []
+        for index, spec in enumerate(self._stages):
+            if not isinstance(spec.apply, StatefulStage):
+                msg = f"[UnsupportedResume] stage kind={spec.kind!r} index={index}"
+                raise UnsupportedResume(msg)
+            stage_states.append(
+                {
+                    "kind": spec.kind,
+                    "fingerprint": spec.apply.fingerprint(),
+                    "state": spec.apply.state_dict(),
+                }
+            )
+
+        source_iter = self._iter_source_stream
+        if not isinstance(source_iter, StatefulIterator):
+            msg = f"[UnsupportedResume] source kind={self._source_kind!r}"
+            raise UnsupportedResume(msg)
+
+        return {
+            "version": RESUME_STATE_VERSION,
+            "runtime_fingerprint": self.context.fingerprint(),
+            "pipeline_fingerprint": self._pipeline_fingerprint(),
+            "output_step": 0,
+            "source": {
+                "kind": self._source_kind,
+                "fingerprint": source_iter.fingerprint(),
+                "state": source_iter.state_dict(),
+            },
+            "stages": stage_states,
+        }
+
+    def load_state_dict(self, state: dict[str, object]) -> Dataset:
+        """Return a dataset with validated resume state attached."""
+
+        if not isinstance(state, dict):
+            msg = "[InvalidResumeState] state must be a dict"
+            raise ResumeStateError(msg)
+        version = state.get("version")
+        if version != RESUME_STATE_VERSION:
+            msg = f"[InvalidResumeStateVersion] expected={RESUME_STATE_VERSION} got={version!r}"
+            raise ResumeStateError(msg)
+
+        runtime_fingerprint = state.get("runtime_fingerprint")
+        if not isinstance(runtime_fingerprint, str):
+            msg = "[InvalidResumeState] runtime_fingerprint must be a string"
+            raise ResumeStateError(msg)
+        if runtime_fingerprint != self.context.fingerprint():
+            msg = "[ResumeRuntimeMismatch] runtime fingerprint does not match"
+            raise ResumeStateError(msg)
+
+        pipeline_fingerprint = state.get("pipeline_fingerprint")
+        if not isinstance(pipeline_fingerprint, str):
+            msg = "[InvalidResumeState] pipeline_fingerprint must be a string"
+            raise ResumeStateError(msg)
+        if pipeline_fingerprint != self._pipeline_fingerprint():
+            msg = "[ResumePipelineMismatch] pipeline fingerprint does not match"
+            raise ResumeStateError(msg)
+
+        source = state.get("source")
+        if not isinstance(source, dict):
+            msg = "[InvalidResumeState] source must be a dict"
+            raise ResumeStateError(msg)
+        stages = state.get("stages")
+        if not isinstance(stages, list):
+            msg = "[InvalidResumeState] stages must be a list"
+            raise ResumeStateError(msg)
+
+        return dataclass_replace(self, _resume_state=state)
 
     def map(self, fn: Callable[[object], object]) -> Dataset:
         """Append a lazy map stage.

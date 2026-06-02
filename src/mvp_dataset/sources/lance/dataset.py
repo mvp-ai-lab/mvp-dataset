@@ -118,6 +118,44 @@ class LanceDataset(Dataset):
         )
         return self._iter_source_stream(source_shard_stream)
 
+    def _source_fingerprint(self) -> dict[str, object]:
+        assert isinstance(self._iter_source_stream, _LanceSourceIter)
+        source = self._iter_source_stream.source
+        return {
+            "kind": "lance",
+            "resample": self._resample,
+            "shuffle_mode": self._shuffle_mode,
+            "load_in_memory": self._load_in_memory,
+            "ref_index_scope": self._ref_index_scope,
+            "iter": {
+                "columns": list(self._iter_source_stream.columns) if self._iter_source_stream.columns else None,
+                "batch_size": self._iter_source_stream.batch_size,
+                "load_in_memory": self._iter_source_stream.load_in_memory,
+            },
+            "datasets": [
+                {
+                    "uri": dataset.uri,
+                    "num_rows": dataset.num_rows,
+                    "row_offset": dataset.row_offset,
+                    "fragment_ids": list(dataset.fragment_ids),
+                    "fragment_row_counts": list(dataset.fragment_row_counts),
+                }
+                for dataset in source.datasets
+            ],
+            "ref_columns": [
+                {
+                    "column": ref.column,
+                    "uri": ref.uri,
+                    "key_column": ref.key_column,
+                    "value_column": ref.value_column,
+                    "index_uri": ref.index_uri,
+                    "index_offsets_path": ref.index_offsets_path,
+                    "index_entries_path": ref.index_entries_path,
+                }
+                for ref in source.ref_columns
+            ],
+        }
+
     def resolve_ref(
         self,
         ref_names: Sequence[str],
