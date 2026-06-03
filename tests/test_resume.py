@@ -36,6 +36,20 @@ def _consume(stream, count: int) -> list[dict[str, object]]:
     return [normalize_sample(next(stream)) for _ in range(count)]
 
 
+def _add_marker(sample: dict[str, object]) -> dict[str, object]:
+    return {**sample, "marker": f"marked-{sample['id']}"}
+
+
+def _normalize_stage_sample(sample: dict[str, object]) -> dict[str, object]:
+    marker = sample["marker"]
+    if isinstance(marker, (bytes, bytearray)):
+        marker = marker.decode("utf-8")
+    sample_id = sample["id"]
+    if isinstance(sample_id, (bytes, bytearray)):
+        sample_id = sample_id.decode("utf-8")
+    return {"id": sample_id, "marker": marker}
+
+
 def _compatible_state(dataset: Dataset) -> dict[str, object]:
     return {
         "version": RESUME_STATE_VERSION,
@@ -64,10 +78,10 @@ def test_state_dict_rejects_unsupported_stage_with_clear_error(tmp_path) -> None
     pytest.importorskip("lance")
 
     path = write_lance_dataset(tmp_path, build_records())
-    dataset = Dataset.from_source("lance", shards=path).map(lambda sample: sample)
+    dataset = Dataset.from_source("lance", shards=path).batch(2)
 
     with pytest.warns(UserWarning, match="Dataset.state_dict"):
-        with pytest.raises(UnsupportedResume, match=r"\[UnsupportedResume\] stage kind='map' index=0"):
+        with pytest.raises(UnsupportedResume, match=r"\[UnsupportedResume\] stage kind='batch' index=0"):
             dataset.state_dict()
 
 
@@ -240,6 +254,84 @@ def test_lance_source_resume_matches_continued_iterator(
 
     assert consumed + continued == expected
     assert resumed == continued
+
+
+@pytest.mark.parametrize("shuffle_mode", ["none", "global", "fragment_aware"])
+@pytest.mark.parametrize("checkpoint_after", [0, 1, 3, 7])
+def test_lance_map_select_resume_matches_continued_iterator(
+    tmp_path,
+    shuffle_mode: str,
+    checkpoint_after: int,
+) -> None:
+    pytest.importorskip("lance")
+
+    records = build_records(count=7)
+    path = write_lance_dataset(tmp_path, records, max_rows_per_file=2)
+    dataset = (
+        Dataset.from_source(
+            "lance",
+            shards=path,
+            context=RuntimeContext(seed=17),
+            batch_size=2,
+            shuffle_mode=shuffle_mode,
+        )
+        .map(_add_marker)
+        .select(["id", "marker"])
+    )
+    iterator = iter(dataset)
+
+    consumed = [_normalize_stage_sample(next(iterator)) for _ in range(checkpoint_after)]
+    state = iterator.state_dict()
+    continued = [_normalize_stage_sample(sample) for sample in iterator]
+    expected = [_normalize_stage_sample(sample) for sample in dataset]
+
+    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
+        resumed_dataset = (
+            Dataset.from_source(
+                "lance",
+                shards=path,
+                context=RuntimeContext(seed=17),
+                batch_size=2,
+                shuffle_mode=shuffle_mode,
+            )
+            .map(_add_marker)
+            .select(["id", "marker"])
+            .load_state_dict(state)
+        )
+    resumed = [_normalize_stage_sample(sample) for sample in resumed_dataset]
+
+    assert [stage["kind"] for stage in state["stages"]] == ["map", "select"]
+    assert consumed + continued == expected
+    assert resumed == continued
+
+
+def test_lance_stage_resume_rejects_stage_fingerprint_mismatch(tmp_path) -> None:
+    pytest.importorskip("lance")
+
+    path = write_lance_dataset(tmp_path, build_records())
+    dataset = Dataset.from_source("lance", shards=path).select(["id"])
+    iterator = iter(dataset)
+    next(iterator)
+    state = iterator.state_dict()
+    state["stages"][0]["fingerprint"] = "changed"
+
+    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
+        resumed_dataset = Dataset.from_source("lance", shards=path).select(["id"]).load_state_dict(state)
+
+    with pytest.raises(ResumeStateError, match=r"\[ResumeStageMismatch\]"):
+        list(resumed_dataset)
+
+
+def test_load_state_dict_rejects_stateless_stage_pipeline_change(tmp_path) -> None:
+    pytest.importorskip("lance")
+
+    path = write_lance_dataset(tmp_path, build_records())
+    dataset = Dataset.from_source("lance", shards=path).map(_add_marker).select(["id", "marker"])
+    state = iter(dataset).state_dict()
+    changed_pipeline = Dataset.from_source("lance", shards=path).select(["id", "marker"]).map(_add_marker)
+
+    with pytest.raises(ResumeStateError, match=r"\[ResumePipelineMismatch\]"):
+        changed_pipeline.load_state_dict(state)
 
 
 @pytest.mark.parametrize("shuffle_mode", ["none", "global", "fragment_aware"])

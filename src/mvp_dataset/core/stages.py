@@ -17,6 +17,7 @@ from ..pipeline.ops import (
     unbatch_samples,
 )
 from .context import RuntimeContext
+from .resume import ResumeStateError, stable_fingerprint
 from .types import Assembler
 
 
@@ -44,6 +45,24 @@ class _MapStage:
     def __call__(self, data: Iterable[object]) -> Iterable[object]:
         return map_samples(data, self.fn)
 
+    def state_dict(self) -> dict[str, object]:
+        return {}
+
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        if state != {}:
+            msg = "[InvalidResumeState] map stage state must be empty"
+            raise ResumeStateError(msg)
+
+    def fingerprint(self) -> str:
+        fn_type = type(self.fn)
+        return stable_fingerprint(
+            {
+                "kind": "map",
+                "fn_class": f"{fn_type.__module__}.{fn_type.__qualname__}",
+                "fn_config": repr(self.fn),
+            }
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class _ShuffleStage:
@@ -64,6 +83,17 @@ class _SelectStage:
 
     def __call__(self, data: Iterable[object]) -> Iterable[object]:
         return select_samples(data, self.fields)
+
+    def state_dict(self) -> dict[str, object]:
+        return {}
+
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        if state != {}:
+            msg = "[InvalidResumeState] select stage state must be empty"
+            raise ResumeStateError(msg)
+
+    def fingerprint(self) -> str:
+        return stable_fingerprint({"kind": "select", "fields": list(self.fields)})
 
 
 @dataclass(frozen=True, slots=True)
