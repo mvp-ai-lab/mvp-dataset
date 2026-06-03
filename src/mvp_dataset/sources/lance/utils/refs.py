@@ -183,12 +183,10 @@ def _ref_manifest_fingerprint(ref: LanceRefSpec) -> dict[str, Any]:
     }
 
 
-def _open_ref_value_source(ref: LanceRefSpec, *, load_in_memory: bool) -> LanceSourceSpec:
+def _open_ref_value_source(ref: LanceRefSpec) -> LanceSourceSpec:
     source = list_lance_sources(_ref_uris(ref))[0]
     for dataset_i, dataset in enumerate(source.datasets):
         ds_handle: object = lance.dataset(dataset.uri)
-        if load_in_memory:
-            ds_handle = pads.InMemoryDataset(ds_handle.to_table())
         source.datasets[dataset_i] = LanceDatasetSpec(
             uri=dataset.uri,
             num_rows=dataset.num_rows,
@@ -416,7 +414,6 @@ def prepare_ref_indexes(
     source: LanceSourceSpec,
     *,
     columns: Sequence[str] | None = None,
-    load_in_memory: bool = False,
     context: RuntimeContext | None = None,
     ref_index_scope: LanceRefIndexScope | None = None,
 ) -> LanceSourceSpec:
@@ -484,10 +481,7 @@ def prepare_ref_indexes(
             if entry_count == 0
             else np.memmap(entries_path, dtype=np.int64, mode="r", shape=(entry_count,))
         )
-        value_source = _open_ref_value_source(ref, load_in_memory=load_in_memory)
-        if load_in_memory:
-            offsets = np.asarray(offsets)
-            entries = np.asarray(entries)
+        value_source = _open_ref_value_source(ref)
         value_dataset = value_source.datasets[0].handle if len(value_source.datasets) == 1 else None
         prepared_refs.append(
             LanceRefSpec(
@@ -598,7 +592,7 @@ def _apply_ref_columns(
             ordered_row_indices = list(positions_by_row_index)
             value_source = ref.index_handle.get("value_source")
             if not isinstance(value_source, LanceSourceSpec):
-                value_source = _open_ref_value_source(ref, load_in_memory=False)
+                value_source = _open_ref_value_source(ref)
             ref_rows = _read_ref_value_rows(value_source, ordered_row_indices, columns=[ref.value_column])
             for row_index, row in zip(ordered_row_indices, ref_rows, strict=True):
                 for sample_position, value_position in positions_by_row_index[row_index]:
@@ -646,7 +640,6 @@ def iter_lance_ref_resolver(
     ref_names: Sequence[str],
     *,
     batch_size: int = 1024,
-    load_in_memory: bool = False,
     context: RuntimeContext | None = None,
     ref_index_scope: LanceRefIndexScope | None = None,
 ):
@@ -656,7 +649,6 @@ def iter_lance_ref_resolver(
         source=source,
         ref_names=ref_names,
         batch_size=batch_size,
-        load_in_memory=load_in_memory,
         context=context,
         ref_index_scope=ref_index_scope,
     )
@@ -670,7 +662,6 @@ class LanceResolveRefFactory:
     source: LanceSourceSpec
     ref_names: tuple[str, ...]
     batch_size: int = 1024
-    load_in_memory: bool = False
     ref_index_scope: LanceRefIndexScope | None = None
 
     def __call__(self, context: RuntimeContext) -> LanceRefResolverAssembler:
@@ -678,7 +669,6 @@ class LanceResolveRefFactory:
             source=self.source,
             ref_names=self.ref_names,
             batch_size=self.batch_size,
-            load_in_memory=self.load_in_memory,
             context=context,
             ref_index_scope=self.ref_index_scope,
         )
@@ -691,7 +681,6 @@ class LanceRefResolverAssembler:
         source: LanceSourceSpec,
         ref_names: Sequence[str],
         batch_size: int = 1024,
-        load_in_memory: bool = False,
         context: RuntimeContext | None = None,
         ref_index_scope: LanceRefIndexScope | None = None,
     ) -> None:
@@ -703,7 +692,6 @@ class LanceRefResolverAssembler:
         self.source = prepare_ref_indexes(
             source,
             columns=self.ref_names,
-            load_in_memory=load_in_memory,
             context=context,
             ref_index_scope=ref_index_scope,
         )

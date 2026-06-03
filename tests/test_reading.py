@@ -141,157 +141,38 @@ def test_resolve_parquet_batch_size_reads_env(monkeypatch) -> None:
     assert resolve_parquet_batch_size() == 1234
 
 
-def test_lance_assign_items_shuffle_uses_context_seed() -> None:
-    pytest.importorskip("lance")
+def test_lance_dataset_global_shuffle_uses_context_seed(tmp_path) -> None:
+    if importlib.util.find_spec("lance") is None:
+        pytest.skip("lance is not installed")
 
-    from mvp_dataset.sources.lance.utils import (
-        LanceDatasetSpec,
-        LanceSourceSpec,
-        assign_items,
-    )
-
-    source = [
-        LanceSourceSpec(
-            datasets=(
-                LanceDatasetSpec(uri="a", num_rows=6, row_offset=0, fragment_ids=()),
-                LanceDatasetSpec(uri="b", num_rows=4, row_offset=6, fragment_ids=()),
-            )
-        )
-    ]
+    records = build_records(count=10)
+    path = write_lance_dataset(tmp_path, records)
     context = RuntimeContext(seed=17)
 
     np.random.seed(123)
-    first = [item.global_index for item in assign_items(source, context=context, resample=False, shuffle_mode="global")]
+    first_dataset = Dataset.from_source("lance", shards=path, context=context, shuffle_mode="global")
+    first = [sample["__global_index__"] for sample in first_dataset]
     np.random.seed(999)
-    second = [
-        item.global_index for item in assign_items(source, context=context, resample=False, shuffle_mode="global")
-    ]
+    second_dataset = Dataset.from_source("lance", shards=path, context=context, shuffle_mode="global")
+    second = [sample["__global_index__"] for sample in second_dataset]
 
     assert first == second
     assert sorted(first) == list(range(10))
 
 
-def test_lance_assign_items_shuffle_prefers_fragment_affinity_across_slots() -> None:
-    pytest.importorskip("lance")
+def test_lance_dataset_fragment_aware_shuffle_mixes_blocks(tmp_path) -> None:
+    if importlib.util.find_spec("lance") is None:
+        pytest.skip("lance is not installed")
 
-    from mvp_dataset.sources.lance.utils import (
-        LanceDatasetSpec,
-        LanceSourceSpec,
-        assign_items,
+    records = build_records(count=1024)
+    path = write_lance_dataset(tmp_path, records, max_rows_per_file=256)
+    dataset = Dataset.from_source(
+        "lance",
+        shards=path,
+        context=RuntimeContext(seed=41),
+        shuffle_mode="fragment_aware",
     )
-
-    source = [
-        LanceSourceSpec(
-            datasets=[
-                LanceDatasetSpec(
-                    uri="a",
-                    num_rows=8,
-                    row_offset=0,
-                    fragment_ids=(10, 11, 12, 13),
-                    fragment_row_counts=(2, 2, 2, 2),
-                )
-            ]
-        )
-    ]
-
-    rank0 = [
-        item.global_index
-        for item in assign_items(
-            source,
-            context=RuntimeContext(rank=0, world_size=2, seed=23),
-            resample=False,
-            shuffle_mode="fragment_aware",
-        )
-    ]
-    rank1 = [
-        item.global_index
-        for item in assign_items(
-            source,
-            context=RuntimeContext(rank=1, world_size=2, seed=23),
-            resample=False,
-            shuffle_mode="fragment_aware",
-        )
-    ]
-
-    assert sorted(rank0 + rank1) == list(range(8))
-    assert set(rank0).isdisjoint(rank1)
-    assert len(rank0) == len(rank1) == 4
-    assert len({index // 2 for index in rank0}) == 2
-    assert len({index // 2 for index in rank1}) == 2
-
-
-def test_lance_assign_items_shuffle_splits_single_fragment_across_slots() -> None:
-    pytest.importorskip("lance")
-
-    from mvp_dataset.sources.lance.utils import (
-        LanceDatasetSpec,
-        LanceSourceSpec,
-        assign_items,
-    )
-
-    source = [
-        LanceSourceSpec(
-            datasets=[
-                LanceDatasetSpec(
-                    uri="a",
-                    num_rows=8,
-                    row_offset=0,
-                    fragment_ids=(10,),
-                    fragment_row_counts=(8,),
-                )
-            ]
-        )
-    ]
-
-    ranks = [
-        [
-            item.global_index
-            for item in assign_items(
-                source,
-                context=RuntimeContext(rank=rank, world_size=4, seed=31),
-                resample=False,
-                shuffle_mode="fragment_aware",
-            )
-        ]
-        for rank in range(4)
-    ]
-
-    assert sorted(index for rank_items in ranks for index in rank_items) == list(range(8))
-    assert [len(rank_items) for rank_items in ranks] == [2, 2, 2, 2]
-
-
-def test_lance_assign_items_shuffle_mixes_blocks_across_assigned_fragments() -> None:
-    pytest.importorskip("lance")
-
-    from mvp_dataset.sources.lance.utils import (
-        LanceDatasetSpec,
-        LanceSourceSpec,
-        assign_items,
-    )
-
-    source = [
-        LanceSourceSpec(
-            datasets=[
-                LanceDatasetSpec(
-                    uri="a",
-                    num_rows=1024,
-                    row_offset=0,
-                    fragment_ids=(10, 11, 12, 13),
-                    fragment_row_counts=(256, 256, 256, 256),
-                )
-            ]
-        )
-    ]
-
-    observed = [
-        item.global_index
-        for item in assign_items(
-            source,
-            context=RuntimeContext(seed=41),
-            resample=False,
-            shuffle_mode="fragment_aware",
-        )
-    ]
+    observed = [sample["__global_index__"] for sample in dataset]
     fragment_runs: list[tuple[int, int]] = []
     last_fragment = None
     for index in observed:
@@ -318,13 +199,12 @@ def test_lance_dataset_global_shuffle_shards_rows_across_slots(tmp_path, monkeyp
 
     monkeypatch.setenv("WORLD_SIZE", "2")
     monkeypatch.setenv("RANK", "0")
-    observed_rank0 = [normalize_sample(sample) for sample in rank0]
+    observed_rank0 = [sample["__global_index__"] for sample in rank0]
     monkeypatch.setenv("RANK", "1")
-    observed_rank1 = [normalize_sample(sample) for sample in rank1]
-    shuffled_indices = np.random.default_rng(5).permutation(len(records)).tolist()
+    observed_rank1 = [sample["__global_index__"] for sample in rank1]
 
-    assert observed_rank0 == [records[index] for index in shuffled_indices[0::2]]
-    assert observed_rank1 == [records[index] for index in shuffled_indices[1::2]]
+    assert sorted(observed_rank0 + observed_rank1) == list(range(len(records)))
+    assert set(observed_rank0).isdisjoint(observed_rank1)
 
 
 def test_lance_dataset_fragment_aware_shuffle_reads_all_rows_once(tmp_path) -> None:

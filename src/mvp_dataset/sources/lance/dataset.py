@@ -1,48 +1,164 @@
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from mvp_dataset.core.context import RuntimeContext
 from mvp_dataset.core.dataset import Dataset
+from mvp_dataset.core.resume import ResumeStateError, stable_fingerprint
 from mvp_dataset.core.stages import _AssembleStage
 from mvp_dataset.core.types import ShardInput, StageSpec
 
 from .utils import (
+    LanceIndexItem,
     LanceRefIndexScope,
     LanceResolveRefFactory,
     LanceShuffleMode,
     LanceSourceSpec,
-    assign_items,
+    _read_batch,
     attach_lance_ref_columns,
-    iter_lance,
     list_lance_sources,
     resolve_lance_source_config,
     validate_ref_names,
 )
+from .utils.shuffle import fragment_aware_index_order, lance_index_at, lance_round_size
 
 
-@dataclass(frozen=True, slots=True)
-class _LanceSourceIter:
+@dataclass(slots=True)
+class _LanceSourceIterator:
     source: LanceSourceSpec
-    columns: Sequence[str] | None = None
-    batch_size: int = 65536
-    load_in_memory: bool = False
+    context: RuntimeContext
+    resample: bool
+    columns: Sequence[str] | None
+    batch_size: int
+    source_fingerprint: str
+    shuffle_mode: LanceShuffleMode = "none"
+    round_index: int = 0
+    position_in_round: int = 0
+    _pending_samples: list[object] = field(default_factory=list)
+    _pending_positions: list[tuple[int, int]] = field(default_factory=list)
+    _index_order: list[LanceIndexItem] = field(default_factory=list)
+    _index_order_round: int | None = None
 
-    handles_sharding = True
+    def __post_init__(self) -> None:
+        if self.batch_size <= 0:
+            msg = "[InvalidLanceBatchSize] batch_size must be a positive integer"
+            raise ValueError(msg)
 
-    def __call__(self, source_stream):
-        return iter_lance(
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> object:
+        if not self._pending_samples:
+            self._fill_pending()
+        if not self._pending_samples:
+            raise StopIteration
+
+        sample = self._pending_samples.pop(0)
+        self.round_index, self.position_in_round = self._pending_positions.pop(0)
+        return sample
+
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "kind": "lance",
+            "shuffle_mode": self.shuffle_mode,
+            "round_index": self.round_index,
+            "position_in_round": self.position_in_round,
+        }
+
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        if state.get("kind") != "lance":
+            msg = f"[InvalidResumeState] expected source kind='lance', got={state.get('kind')!r}"
+            raise ResumeStateError(msg)
+        if state.get("shuffle_mode") != self.shuffle_mode:
+            msg = "[InvalidResumeState] shuffle_mode does not match"
+            raise ResumeStateError(msg)
+
+        round_index = state.get("round_index")
+        if not isinstance(round_index, int) or round_index < 0:
+            msg = "[InvalidResumeState] round_index must be a non-negative integer"
+            raise ResumeStateError(msg)
+        if round_index != 0 and not self.resample:
+            msg = "[InvalidResumeState] round_index must be 0 when resample=False"
+            raise ResumeStateError(msg)
+
+        position_in_round = state.get("position_in_round")
+        if not isinstance(position_in_round, int) or position_in_round < 0:
+            msg = "[InvalidResumeState] position_in_round must be a non-negative integer"
+            raise ResumeStateError(msg)
+        if position_in_round > self._round_size(round_index):
+            msg = "[InvalidResumeState] position_in_round is out of range"
+            raise ResumeStateError(msg)
+
+        self.round_index = round_index
+        self.position_in_round = position_in_round
+        self._pending_samples.clear()
+        self._pending_positions.clear()
+
+    def fingerprint(self) -> str:
+        return self.source_fingerprint
+
+    def _fill_pending(self) -> None:
+        batch_indexes: list[LanceIndexItem] = []
+        batch_positions: list[tuple[int, int]] = []
+        round_index = self.round_index
+        position_in_round = self.position_in_round
+        while len(batch_indexes) < self.batch_size:
+            round_size = self._round_size(round_index)
+            if position_in_round >= round_size:
+                if not self.resample:
+                    break
+                round_index += 1
+                position_in_round = 0
+                round_size = self._round_size(round_index)
+                if round_size <= 0:
+                    break
+
+            batch_indexes.append(self._index_item_at(round_index, position_in_round))
+            position_in_round += 1
+            batch_positions.append((round_index, position_in_round))
+
+        if not batch_indexes:
+            return
+        self._pending_samples.extend(_read_batch(self.source, batch_indexes, columns=self.columns))
+        self._pending_positions.extend(batch_positions)
+
+    def _round_size(self, round_index: int) -> int:
+        fragment_order = self._index_order_for_round(round_index) if self.shuffle_mode == "fragment_aware" else []
+        return lance_round_size(self.source, self.context, self.shuffle_mode, fragment_order)
+
+    def _index_item_at(self, round_index: int, position_in_round: int) -> LanceIndexItem:
+        fragment_order = self._index_order_for_round(round_index) if self.shuffle_mode == "fragment_aware" else []
+        return lance_index_at(
             self.source,
-            source_stream,
-            columns=self.columns,
-            batch_size=self.batch_size,
-            load_in_memory=self.load_in_memory,
+            self.context,
+            self.shuffle_mode,
+            round_index,
+            position_in_round,
+            fragment_order,
         )
+
+    def _index_order_for_round(self, round_index: int) -> list[LanceIndexItem]:
+        if self._index_order_round == round_index:
+            return self._index_order
+
+        if self.shuffle_mode == "fragment_aware":
+            index_order = fragment_aware_index_order(self.source, self.context, round_index)
+        else:
+            msg = (
+                "[InvalidLanceShuffleMode] index order is only materialized for "
+                f"fragment_aware, got {self.shuffle_mode!r}"
+            )
+            raise ValueError(msg)
+
+        self._index_order = index_order
+        self._index_order_round = round_index
+        return self._index_order
 
 
 @dataclass(frozen=True, slots=True)
 class LanceDataset(Dataset):
     _shuffle_mode: LanceShuffleMode = "none"
-    _load_in_memory: bool = False
+    _columns: tuple[str, ...] | None = None
+    _batch_size: int = 1024
     _ref_index_scope: LanceRefIndexScope | None = None
 
     @classmethod
@@ -54,7 +170,6 @@ class LanceDataset(Dataset):
         columns: Sequence[str] | None = None,
         batch_size: int = 1024,
         shuffle_mode: LanceShuffleMode = "none",
-        load_in_memory: bool = False,
         ref_columns: dict[str, dict[str, str]] | None = None,
         ref_index_scope: LanceRefIndexScope | None = None,
     ):
@@ -69,7 +184,6 @@ class LanceDataset(Dataset):
             columns: Optional list of column names to read.
             batch_size: Number of rows per Arrow batch during iteration.
             shuffle_mode: One of ``"none"``, ``"global"``, or ``"fragment_aware"``.
-            load_in_memory: Whether to load entire datasets into memory.
             ref_columns: Optional mapping of source column names to explicit Lance
                          reference configs containing uri, key_column, and value_column.
                          Use ``resolve_ref(...)`` later in the pipeline to read
@@ -81,6 +195,10 @@ class LanceDataset(Dataset):
         Returns:
             A lance dataset.
         """
+        if batch_size <= 0:
+            msg = "[InvalidLanceBatchSize] batch_size must be a positive integer"
+            raise ValueError(msg)
+
         runtime_context = RuntimeContext.from_runtime() if context is None else context
         normalized_shards, resolved_ref_columns = resolve_lance_source_config(shards, ref_columns)
         # 1. Merge all shards into a single source spec, validating that they can be read together.
@@ -97,40 +215,35 @@ class LanceDataset(Dataset):
             _resample=resample,
             _source_kind="lance",
             _stages=(),
-            _iter_source_stream=_LanceSourceIter(
-                source=sources[0],
-                columns=columns,
-                batch_size=batch_size,
-                load_in_memory=load_in_memory,
-            ),
+            _iter_source_stream=None,
             _shuffle_mode=shuffle_mode,
-            _load_in_memory=load_in_memory,
+            _columns=tuple(columns) if columns is not None else None,
+            _batch_size=batch_size,
             _ref_index_scope=ref_index_scope,
         )
 
     def _build_source_stream(self, *, context: RuntimeContext) -> Iterable[object]:
         assert len(self._source) == 1, "Multiple Lance sources are not supported in this implementation"
-        source_shard_stream = assign_items(
-            self._source,
+        return _LanceSourceIterator(
+            source=self._source[0],
             context=context,
             resample=self._resample,
+            columns=self._columns,
+            batch_size=self._batch_size,
+            source_fingerprint=stable_fingerprint(self._source_fingerprint()),
             shuffle_mode=self._shuffle_mode,
         )
-        return self._iter_source_stream(source_shard_stream)
 
     def _source_fingerprint(self) -> dict[str, object]:
-        assert isinstance(self._iter_source_stream, _LanceSourceIter)
-        source = self._iter_source_stream.source
+        source = self._source[0]
         return {
             "kind": "lance",
             "resample": self._resample,
             "shuffle_mode": self._shuffle_mode,
-            "load_in_memory": self._load_in_memory,
             "ref_index_scope": self._ref_index_scope,
             "iter": {
-                "columns": list(self._iter_source_stream.columns) if self._iter_source_stream.columns else None,
-                "batch_size": self._iter_source_stream.batch_size,
-                "load_in_memory": self._iter_source_stream.load_in_memory,
+                "columns": list(self._columns) if self._columns else None,
+                "batch_size": self._batch_size,
             },
             "datasets": [
                 {
@@ -174,7 +287,6 @@ class LanceDataset(Dataset):
             source=source,
             ref_names=ref_names,
             batch_size=batch_size,
-            load_in_memory=self._load_in_memory,
             ref_index_scope=ref_index_scope if ref_index_scope is not None else self._ref_index_scope,
         )
         stage_context = self.context if context is None else context

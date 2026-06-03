@@ -25,7 +25,7 @@ from .refs import (
     prepare_ref_indexes,
     validate_ref_names,
 )
-from .source import _read_batch, assign_items, iter_lance, list_lance_sources
+from .source import _read_batch, list_lance_sources
 from .types import (
     LanceDatasetSpec,
     LanceIndexItem,
@@ -54,9 +54,7 @@ __all__ = [
     "_iter_table_record_batches",
     "_read_batch",
     "_read_table_rows",
-    "assign_items",
     "attach_lance_ref_columns",
-    "iter_lance",
     "iter_lance_ref_resolver",
     "lance",
     "list_lance_sources",

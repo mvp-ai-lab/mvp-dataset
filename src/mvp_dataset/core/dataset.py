@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
@@ -28,6 +29,90 @@ from .stages import (
 from .types import Assembler, SourceKind, SourceStore, StageSpec
 
 
+class DatasetIterator:
+    """Materialized iterator for one Dataset pipeline execution."""
+
+    def __init__(self, dataset: Dataset):
+        self.dataset = dataset
+        self.context = RuntimeContext.from_runtime(base=dataset.context)
+        self.num_yielded = 0
+
+        source = dataset._build_source_stream(context=self.context)
+        if not isinstance(source, StatefulIterator):
+            msg = f"[UnsupportedResume] source kind={dataset._source_kind!r}"
+            raise UnsupportedResume(msg)
+        self.source = source
+
+        self._load_resume_state(dataset._resume_state)
+
+        stream: Iterable[object] = self.source
+        for spec in dataset._stages:
+            stream = spec.apply(stream)
+        self.stream = iter(stream)
+
+    def __iter__(self) -> DatasetIterator:
+        return self
+
+    def __next__(self) -> object:
+        item = next(self.stream)
+        self.num_yielded += 1
+        return item
+
+    def state_dict(self) -> dict[str, object]:
+        stage_states: list[dict[str, object]] = []
+        for index, spec in enumerate(self.dataset._stages):
+            if not isinstance(spec.apply, StatefulStage):
+                msg = f"[UnsupportedResume] stage kind={spec.kind!r} index={index}"
+                raise UnsupportedResume(msg)
+            stage_states.append(
+                {
+                    "kind": spec.kind,
+                    "fingerprint": spec.apply.fingerprint(),
+                    "state": spec.apply.state_dict(),
+                }
+            )
+
+        return {
+            "version": RESUME_STATE_VERSION,
+            "runtime_fingerprint": self.dataset.context.fingerprint(),
+            "pipeline_fingerprint": self.dataset._pipeline_fingerprint(),
+            "num_yielded": self.num_yielded,
+            "source": {
+                "kind": self.dataset._source_kind,
+                "fingerprint": self.source.fingerprint(),
+                "state": self.source.state_dict(),
+            },
+            "stages": stage_states,
+        }
+
+    def _load_resume_state(self, state: dict[str, object] | None) -> None:
+        if state is None:
+            return
+
+        num_yielded = state.get("num_yielded")
+        if not isinstance(num_yielded, int) or num_yielded < 0:
+            msg = "[InvalidResumeState] num_yielded must be a non-negative integer"
+            raise ResumeStateError(msg)
+        stages = state.get("stages")
+        if stages != []:
+            msg = "[UnsupportedResume] stage resume is not supported yet"
+            raise UnsupportedResume(msg)
+
+        source_state = state.get("source")
+        if not isinstance(source_state, dict):
+            msg = "[InvalidResumeState] source must be a dict"
+            raise ResumeStateError(msg)
+        if source_state.get("fingerprint") != self.source.fingerprint():
+            msg = "[ResumeSourceMismatch] source fingerprint does not match"
+            raise ResumeStateError(msg)
+        raw_source_state = source_state.get("state")
+        if not isinstance(raw_source_state, dict):
+            msg = "[InvalidResumeState] source.state must be a dict"
+            raise ResumeStateError(msg)
+        self.source.load_state_dict(raw_source_state)
+        self.num_yielded = num_yielded
+
+
 @dataclass(frozen=True, slots=True)
 class Dataset(torch_iterabledataset_class()):
     """Chainable iterable dataset built from local shard sources.
@@ -44,10 +129,12 @@ class Dataset(torch_iterabledataset_class()):
     _source: SourceStore
     _stages: tuple[StageSpec, ...]
     _resample: bool
-    _iter_source_stream: Callable
+    # TODO: rename it as factory?
+    _iter_source_stream: Callable | None
     _resume_state: dict[str, object] | None = None
 
     def _build_source_stream(self, *, context: RuntimeContext) -> Iterable[object]:
+        assert self._iter_source_stream is not None, "source stream factory is required"
         source_shard_stream = assign_items(self._source, context=context, resample=self._resample)
         return self._iter_source_stream(source_shard_stream)
 
@@ -84,37 +171,13 @@ class Dataset(torch_iterabledataset_class()):
 
     def state_dict(self) -> dict[str, object]:
         """Return the resumable state for future pipeline outputs."""
-
-        stage_states: list[dict[str, object]] = []
-        for index, spec in enumerate(self._stages):
-            if not isinstance(spec.apply, StatefulStage):
-                msg = f"[UnsupportedResume] stage kind={spec.kind!r} index={index}"
-                raise UnsupportedResume(msg)
-            stage_states.append(
-                {
-                    "kind": spec.kind,
-                    "fingerprint": spec.apply.fingerprint(),
-                    "state": spec.apply.state_dict(),
-                }
-            )
-
-        source_iter = self._iter_source_stream
-        if not isinstance(source_iter, StatefulIterator):
-            msg = f"[UnsupportedResume] source kind={self._source_kind!r}"
-            raise UnsupportedResume(msg)
-
-        return {
-            "version": RESUME_STATE_VERSION,
-            "runtime_fingerprint": self.context.fingerprint(),
-            "pipeline_fingerprint": self._pipeline_fingerprint(),
-            "output_step": 0,
-            "source": {
-                "kind": self._source_kind,
-                "fingerprint": source_iter.fingerprint(),
-                "state": source_iter.state_dict(),
-            },
-            "stages": stage_states,
-        }
+        warnings.warn(
+            "Dataset.state_dict() creates a fresh initial iterator state. "
+            "Use iterator.state_dict() to checkpoint an in-progress iteration.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return DatasetIterator(self).state_dict()
 
     def load_state_dict(self, state: dict[str, object]) -> Dataset:
         """Return a dataset with validated resume state attached."""
@@ -152,6 +215,12 @@ class Dataset(torch_iterabledataset_class()):
             msg = "[InvalidResumeState] stages must be a list"
             raise ResumeStateError(msg)
 
+        warnings.warn(
+            "Dataset.load_state_dict() stores pending resume state. "
+            "The source cursor is restored when iter(dataset) creates a DatasetIterator.",
+            UserWarning,
+            stacklevel=2,
+        )
         return dataclass_replace(self, _resume_state=state)
 
     def map(self, fn: Callable[[object], object]) -> Dataset:
@@ -270,11 +339,7 @@ class Dataset(torch_iterabledataset_class()):
 
     def __iter__(self) -> Iterator[object]:
         """Materialize and run the full lazy pipeline."""
-        context = RuntimeContext.from_runtime(base=self.context)
-        stream: Iterable[object] = self._build_source_stream(context=context)
-        for spec in self._stages:
-            stream = spec.apply(stream)
-        yield from stream
+        return DatasetIterator(self)
 
     @classmethod
     def from_source(cls, source_kind: SourceKind, *args, **kwargs) -> Dataset:
