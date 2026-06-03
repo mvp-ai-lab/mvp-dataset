@@ -50,6 +50,14 @@ def _normalize_stage_sample(sample: dict[str, object]) -> dict[str, object]:
     return {"id": sample_id, "marker": marker}
 
 
+def _normalize_batch(batch: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [normalize_sample(sample) for sample in batch]
+
+
+def _collate_ids(batch: list[dict[str, object]]) -> list[object]:
+    return [sample["id"] for sample in batch]
+
+
 def _compatible_state(dataset: Dataset) -> dict[str, object]:
     return {
         "version": RESUME_STATE_VERSION,
@@ -78,10 +86,10 @@ def test_state_dict_rejects_unsupported_stage_with_clear_error(tmp_path) -> None
     pytest.importorskip("lance")
 
     path = write_lance_dataset(tmp_path, build_records())
-    dataset = Dataset.from_source("lance", shards=path).batch(2)
+    dataset = Dataset.from_source("lance", shards=path).shuffle(2)
 
     with pytest.warns(UserWarning, match="Dataset.state_dict"):
-        with pytest.raises(UnsupportedResume, match=r"\[UnsupportedResume\] stage kind='batch' index=0"):
+        with pytest.raises(UnsupportedResume, match=r"\[UnsupportedResume\] stage kind='shuffle' index=0"):
             dataset.state_dict()
 
 
@@ -332,6 +340,102 @@ def test_load_state_dict_rejects_stateless_stage_pipeline_change(tmp_path) -> No
 
     with pytest.raises(ResumeStateError, match=r"\[ResumePipelineMismatch\]"):
         changed_pipeline.load_state_dict(state)
+
+
+@pytest.mark.parametrize("shuffle_mode", ["none", "global", "fragment_aware"])
+@pytest.mark.parametrize("checkpoint_after", [0, 1, 2, 3])
+def test_lance_batch_resume_matches_continued_iterator(
+    tmp_path,
+    shuffle_mode: str,
+    checkpoint_after: int,
+) -> None:
+    pytest.importorskip("lance")
+
+    records = build_records(count=7)
+    path = write_lance_dataset(tmp_path, records, max_rows_per_file=2)
+    dataset = Dataset.from_source(
+        "lance",
+        shards=path,
+        context=RuntimeContext(seed=43),
+        batch_size=2,
+        shuffle_mode=shuffle_mode,
+    ).batch(3)
+    iterator = iter(dataset)
+
+    consumed = [_normalize_batch(next(iterator)) for _ in range(checkpoint_after)]
+    state = iterator.state_dict()
+    continued = [_normalize_batch(batch) for batch in iterator]
+    expected = [_normalize_batch(batch) for batch in dataset]
+
+    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
+        resumed_dataset = (
+            Dataset.from_source(
+                "lance",
+                shards=path,
+                context=RuntimeContext(seed=43),
+                batch_size=2,
+                shuffle_mode=shuffle_mode,
+            )
+            .batch(3)
+            .load_state_dict(state)
+        )
+    resumed = [_normalize_batch(batch) for batch in resumed_dataset]
+
+    assert state["stages"][0]["kind"] == "batch"
+    assert state["stages"][0]["state"]["emitted"] == checkpoint_after
+    assert consumed + continued == expected
+    assert resumed == continued
+
+
+def test_lance_batch_resume_uses_pending_samples(tmp_path) -> None:
+    pytest.importorskip("lance")
+
+    records = build_records(count=5)
+    path = write_lance_dataset(tmp_path, records, max_rows_per_file=2)
+    source_dataset = Dataset.from_source("lance", shards=path, batch_size=2, shuffle_mode="none")
+    source_iterator = iter(source_dataset)
+    pending = [next(source_iterator), next(source_iterator)]
+    state = source_iterator.state_dict()
+
+    batch_dataset = Dataset.from_source("lance", shards=path, batch_size=2, shuffle_mode="none").batch(3)
+    batch_fingerprint = iter(batch_dataset).stages[0].fingerprint()
+    state["pipeline_fingerprint"] = batch_dataset._pipeline_fingerprint()
+    state["num_yielded"] = 0
+    state["stages"] = [
+        {
+            "kind": "batch",
+            "fingerprint": batch_fingerprint,
+            "state": {"pending": pending, "emitted": 0},
+        }
+    ]
+
+    expected_first = _normalize_batch([*pending, next(source_iterator)])
+    expected_tail = [_normalize_batch(list(source_iterator))]
+
+    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
+        resumed_dataset = batch_dataset.load_state_dict(state)
+    resumed = [_normalize_batch(batch) for batch in resumed_dataset]
+
+    assert resumed == [expected_first, *expected_tail]
+
+
+@pytest.mark.parametrize(
+    "changed_dataset",
+    [
+        lambda path: Dataset.from_source("lance", shards=path).batch(4),
+        lambda path: Dataset.from_source("lance", shards=path).batch(3, drop_last=True),
+        lambda path: Dataset.from_source("lance", shards=path).batch(3, collate_fn=_collate_ids),
+    ],
+)
+def test_load_state_dict_rejects_batch_stage_config_change(tmp_path, changed_dataset) -> None:
+    pytest.importorskip("lance")
+
+    path = write_lance_dataset(tmp_path, build_records())
+    dataset = Dataset.from_source("lance", shards=path).batch(3)
+    state = iter(dataset).state_dict()
+
+    with pytest.raises(ResumeStateError, match=r"\[ResumePipelineMismatch\]"):
+        changed_dataset(path).load_state_dict(state)
 
 
 @pytest.mark.parametrize("shuffle_mode", ["none", "global", "fragment_aware"])

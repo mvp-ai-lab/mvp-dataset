@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable
 from typing import Protocol, runtime_checkable
 
 RESUME_STATE_VERSION = 1
@@ -36,8 +35,6 @@ class StatefulIterator(Protocol):
 @runtime_checkable
 class StatefulStage(Protocol):
     """Pipeline stage that can persist and restore its internal state."""
-
-    def __call__(self, upstream: Iterable[object]) -> Iterable[object]: ...
 
     def state_dict(self) -> dict[str, object]: ...
 

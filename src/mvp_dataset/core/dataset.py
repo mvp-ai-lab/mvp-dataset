@@ -43,11 +43,16 @@ class DatasetIterator:
             raise UnsupportedResume(msg)
         self.source = source
 
-        self._load_resume_state(dataset._resume_state)
+        stage_resume_states = self._load_resume_state(dataset._resume_state)
 
         stream: Iterable[object] = self.source
+        self.stages: list[object] = []
         for spec in dataset._stages:
             stream = spec.apply(stream)
+            stage = stream if isinstance(stream, StatefulStage) else spec.apply
+            self.stages.append(stage)
+        if stage_resume_states is not None:
+            self._load_stage_resume_state(stage_resume_states)
         self.stream = iter(stream)
 
     def __iter__(self) -> DatasetIterator:
@@ -60,15 +65,15 @@ class DatasetIterator:
 
     def state_dict(self) -> dict[str, object]:
         stage_states: list[dict[str, object]] = []
-        for index, spec in enumerate(self.dataset._stages):
-            if not isinstance(spec.apply, StatefulStage):
+        for index, (spec, stage) in enumerate(zip(self.dataset._stages, self.stages, strict=True)):
+            if not isinstance(stage, StatefulStage):
                 msg = f"[UnsupportedResume] stage kind={spec.kind!r} index={index}"
                 raise UnsupportedResume(msg)
             stage_states.append(
                 {
                     "kind": spec.kind,
-                    "fingerprint": spec.apply.fingerprint(),
-                    "state": spec.apply.state_dict(),
+                    "fingerprint": stage.fingerprint(),
+                    "state": stage.state_dict(),
                 }
             )
 
@@ -85,9 +90,9 @@ class DatasetIterator:
             "stages": stage_states,
         }
 
-    def _load_resume_state(self, state: dict[str, object] | None) -> None:
+    def _load_resume_state(self, state: dict[str, object] | None) -> list[object] | None:
         if state is None:
-            return
+            return None
 
         num_yielded = state.get("num_yielded")
         if not isinstance(num_yielded, int) or num_yielded < 0:
@@ -100,24 +105,6 @@ class DatasetIterator:
         if len(stages) != len(self.dataset._stages):
             msg = "[ResumeStageMismatch] stage count does not match"
             raise ResumeStateError(msg)
-        for index, (spec, stage_state) in enumerate(zip(self.dataset._stages, stages, strict=True)):
-            if not isinstance(stage_state, dict):
-                msg = "[InvalidResumeState] stage must be a dict"
-                raise ResumeStateError(msg)
-            if stage_state.get("kind") != spec.kind:
-                msg = f"[ResumeStageMismatch] stage kind does not match index={index}"
-                raise ResumeStateError(msg)
-            if not isinstance(spec.apply, StatefulStage):
-                msg = f"[UnsupportedResume] stage kind={spec.kind!r} index={index}"
-                raise UnsupportedResume(msg)
-            if stage_state.get("fingerprint") != spec.apply.fingerprint():
-                msg = f"[ResumeStageMismatch] stage fingerprint does not match index={index}"
-                raise ResumeStateError(msg)
-            raw_stage_state = stage_state.get("state")
-            if not isinstance(raw_stage_state, dict):
-                msg = "[InvalidResumeState] stage.state must be a dict"
-                raise ResumeStateError(msg)
-            spec.apply.load_state_dict(raw_stage_state)
 
         source_state = state.get("source")
         if not isinstance(source_state, dict):
@@ -132,6 +119,27 @@ class DatasetIterator:
             raise ResumeStateError(msg)
         self.source.load_state_dict(raw_source_state)
         self.num_yielded = num_yielded
+        return stages
+
+    def _load_stage_resume_state(self, stages: list[object]) -> None:
+        for index, (spec, stage, stage_state) in enumerate(zip(self.dataset._stages, self.stages, stages, strict=True)):
+            if not isinstance(stage_state, dict):
+                msg = "[InvalidResumeState] stage must be a dict"
+                raise ResumeStateError(msg)
+            if stage_state.get("kind") != spec.kind:
+                msg = f"[ResumeStageMismatch] stage kind does not match index={index}"
+                raise ResumeStateError(msg)
+            if not isinstance(stage, StatefulStage):
+                msg = f"[UnsupportedResume] stage kind={spec.kind!r} index={index}"
+                raise UnsupportedResume(msg)
+            if stage_state.get("fingerprint") != stage.fingerprint():
+                msg = f"[ResumeStageMismatch] stage fingerprint does not match index={index}"
+                raise ResumeStateError(msg)
+            raw_stage_state = stage_state.get("state")
+            if not isinstance(raw_stage_state, dict):
+                msg = "[InvalidResumeState] stage.state must be a dict"
+                raise ResumeStateError(msg)
+            stage.load_state_dict(raw_stage_state)
 
 
 @dataclass(frozen=True, slots=True)
