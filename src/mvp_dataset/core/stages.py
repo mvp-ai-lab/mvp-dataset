@@ -8,7 +8,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from types import ModuleType
 
-from ..pipeline.ops import map_samples, select_samples, unbatch_samples
+from ..pipeline.ops import map_samples, select_samples
 from .context import RuntimeContext
 from .resume import ResumeStateError, UnsupportedResume, stable_fingerprint
 from .types import Assembler, StatefulAssembler
@@ -364,4 +364,52 @@ class _AssembleStageIterator:
 @dataclass(frozen=True, slots=True)
 class _UnbatchStage:
     def __call__(self, data: Iterable[object]) -> Iterable[object]:
-        return unbatch_samples(data)
+        return _UnbatchStageIterator(upstream=data)
+
+
+class _UnbatchStageIterator:
+    def __init__(self, *, upstream: Iterable[object]) -> None:
+        self.upstream = iter(upstream)
+        self.pending: list[object] = []
+
+    def __iter__(self) -> Iterator[object]:
+        return self
+
+    def __next__(self) -> object:
+        while not self.pending:
+            self.pending.extend(self._expand_batch(next(self.upstream)))
+        return self.pending.pop(0)
+
+    def state_dict(self) -> dict[str, object]:
+        return {"pending": list(self.pending)}
+
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        pending = state.get("pending")
+        if not isinstance(pending, list):
+            msg = "[InvalidResumeState] unbatch stage pending must be a list"
+            raise ResumeStateError(msg)
+        self.pending = list(pending)
+
+    def fingerprint(self) -> str:
+        return stable_fingerprint({"kind": "unbatch"})
+
+    def _expand_batch(self, batch: object) -> list[object]:
+        if isinstance(batch, (list, tuple)):
+            return list(batch)
+
+        if isinstance(batch, dict):
+            if not batch:
+                return []
+            if not all(isinstance(value, (list, tuple)) for value in batch.values()):
+                msg = "dict batches must contain only list/tuple values"
+                raise TypeError(msg)
+
+            lengths = {len(value) for value in batch.values()}
+            if len(lengths) != 1:
+                msg = f"dict batch values must have equal lengths, got {sorted(lengths)}"
+                raise ValueError(msg)
+
+            return [{key: value[index] for key, value in batch.items()} for index in range(next(iter(lengths)))]
+
+        msg = f"unsupported batch type: {type(batch)!r}"
+        raise TypeError(msg)

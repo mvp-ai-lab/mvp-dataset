@@ -58,6 +58,14 @@ def _collate_ids(batch: list[dict[str, object]]) -> list[object]:
     return [sample["id"] for sample in batch]
 
 
+def _collate_columns(batch: list[dict[str, object]]) -> dict[str, list[object]]:
+    return {
+        "id": [sample["id"] for sample in batch],
+        "text": [sample["text"] for sample in batch],
+        "value": [sample["value"] for sample in batch],
+    }
+
+
 _ASSEMBLER_FINGERPRINT_VERSION = "v1"
 
 
@@ -136,15 +144,14 @@ def test_state_dict_rejects_unsupported_sources(tmp_path, source_kind: str) -> N
             dataset.state_dict()
 
 
-def test_state_dict_rejects_unsupported_stage_with_clear_error(tmp_path) -> None:
+def test_iter_rejects_unsupported_assemble_stage_with_clear_error(tmp_path) -> None:
     pytest.importorskip("lance")
 
     path = write_lance_dataset(tmp_path, build_records())
-    dataset = Dataset.from_source("lance", shards=path).unbatch()
+    dataset = Dataset.from_source("lance", shards=path).assemble(_build_non_stateful_assembler)
 
-    with pytest.warns(UserWarning, match="Dataset.state_dict"):
-        with pytest.raises(UnsupportedResume, match=r"\[UnsupportedResume\] stage kind='unbatch' index=0"):
-            dataset.state_dict()
+    with pytest.raises(UnsupportedResume, match=r"\[UnsupportedResume\] stage kind='assemble'"):
+        iter(dataset)
 
 
 def test_load_state_dict_rejects_unknown_schema_version(tmp_path) -> None:
@@ -553,6 +560,60 @@ def test_load_state_dict_rejects_batch_stage_config_change(tmp_path, changed_dat
 
     with pytest.raises(ResumeStateError, match=r"\[ResumePipelineMismatch\]"):
         changed_dataset(path).load_state_dict(state)
+
+
+@pytest.mark.parametrize("checkpoint_after", [0, 1, 4, 7])
+def test_lance_unbatch_resume_matches_continued_iterator(tmp_path, checkpoint_after: int) -> None:
+    pytest.importorskip("lance")
+
+    records = build_records(count=7)
+    path = write_lance_dataset(tmp_path, records, max_rows_per_file=2)
+    dataset = Dataset.from_source("lance", shards=path, batch_size=2).batch(3).unbatch()
+    iterator = iter(dataset)
+
+    consumed = _consume(iterator, checkpoint_after)
+    state = iterator.state_dict()
+    continued = [normalize_sample(sample) for sample in iterator]
+    expected = [normalize_sample(sample) for sample in dataset]
+
+    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
+        resumed_dataset = (
+            Dataset.from_source("lance", shards=path, batch_size=2).batch(3).unbatch().load_state_dict(state)
+        )
+    resumed = [normalize_sample(sample) for sample in resumed_dataset]
+
+    assert [stage["kind"] for stage in state["stages"]] == ["batch", "unbatch"]
+    if checkpoint_after == 1:
+        assert len(state["stages"][1]["state"]["pending"]) == 2
+    assert consumed + continued == expected
+    assert resumed == continued
+
+
+def test_lance_unbatch_resume_expands_dict_batch(tmp_path) -> None:
+    pytest.importorskip("lance")
+
+    records = build_records(count=5)
+    path = write_lance_dataset(tmp_path, records, max_rows_per_file=2)
+    dataset = Dataset.from_source("lance", shards=path, batch_size=2).batch(3, collate_fn=_collate_columns).unbatch()
+    iterator = iter(dataset)
+
+    consumed = _consume(iterator, 1)
+    state = iterator.state_dict()
+    continued = [normalize_sample(sample) for sample in iterator]
+    expected = [normalize_sample(sample) for sample in dataset]
+
+    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
+        resumed_dataset = (
+            Dataset.from_source("lance", shards=path, batch_size=2)
+            .batch(3, collate_fn=_collate_columns)
+            .unbatch()
+            .load_state_dict(state)
+        )
+    resumed = [normalize_sample(sample) for sample in resumed_dataset]
+
+    assert len(state["stages"][1]["state"]["pending"]) == 2
+    assert consumed + continued == expected
+    assert resumed == continued
 
 
 @pytest.mark.parametrize("checkpoint_after", [0, 1, 2, 4, 5])
