@@ -135,7 +135,7 @@ def _compatible_state(dataset: Dataset) -> dict[str, object]:
     }
 
 
-@pytest.mark.parametrize("source_kind", ["jsonl", "tars"])
+@pytest.mark.parametrize("source_kind", ["tars"])
 def test_state_dict_rejects_unsupported_sources(tmp_path, source_kind: str) -> None:
     dataset = Dataset.from_source(source_kind, shards=_source_path(tmp_path, source_kind))
 
@@ -196,9 +196,9 @@ def test_load_state_dict_attaches_validated_state_to_new_dataset(tmp_path) -> No
 
 
 def test_iterating_non_stateful_source_is_rejected(tmp_path) -> None:
-    dataset = _jsonl_dataset(tmp_path)
+    dataset = Dataset.from_source("tars", shards=_source_path(tmp_path, "tars"))
 
-    with pytest.raises(UnsupportedResume, match=r"\[UnsupportedResume\] source kind='jsonl'"):
+    with pytest.raises(UnsupportedResume, match=r"\[UnsupportedResume\] source kind='tars'"):
         list(dataset)
 
 
@@ -323,6 +323,82 @@ def test_lance_source_resume_matches_continued_iterator(
 
     assert consumed + continued == expected
     assert resumed == continued
+
+
+@pytest.mark.parametrize("checkpoint_after", [0, 1, 3, 6])
+def test_jsonl_source_resume_matches_continued_iterator(tmp_path, checkpoint_after: int) -> None:
+    records = build_records(count=6)
+    path = write_jsonl_file(tmp_path, records)
+    dataset = Dataset.from_source("jsonl", shards=path, context=RuntimeContext(seed=23))
+    iterator = iter(dataset)
+
+    consumed = _consume(iterator, checkpoint_after)
+    state = iterator.state_dict()
+    continued = [normalize_sample(sample) for sample in iterator]
+    expected = [normalize_sample(sample) for sample in dataset]
+
+    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
+        resumed_dataset = Dataset.from_source(
+            "jsonl",
+            shards=path,
+            context=RuntimeContext(seed=23),
+        ).load_state_dict(state)
+    resumed = [normalize_sample(sample) for sample in resumed_dataset]
+
+    assert state["source"]["kind"] == "jsonl"
+    assert "byte_offset" in state["source"]["state"]
+    assert consumed + continued == expected
+    assert resumed == continued
+
+
+def test_jsonl_source_resume_supports_resample_across_rounds(tmp_path) -> None:
+    records = build_records(count=4)
+    path = write_jsonl_file(tmp_path, records)
+    dataset = Dataset.from_source("jsonl", shards=path, context=RuntimeContext(seed=29), resample=True)
+    iterator = iter(dataset)
+
+    _consume(iterator, 6)
+    state = iterator.state_dict()
+    continued = _consume(iterator, 5)
+
+    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
+        resumed_dataset = Dataset.from_source(
+            "jsonl",
+            shards=path,
+            context=RuntimeContext(seed=29),
+            resample=True,
+        ).load_state_dict(state)
+    resumed = _consume(iter(resumed_dataset), 5)
+
+    assert state["source"]["state"]["round_index"] >= 0
+    assert resumed == continued
+
+
+def test_load_state_dict_rejects_jsonl_source_file_change(tmp_path) -> None:
+    path = write_jsonl_file(tmp_path, build_records(count=3))
+    dataset = Dataset.from_source("jsonl", shards=path, context=RuntimeContext(seed=31))
+    state = iter(dataset).state_dict()
+
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write('{"id":"sample-new","text":"text-new","value":999}\n')
+
+    with pytest.raises(ResumeStateError, match=r"\[ResumePipelineMismatch\]"):
+        dataset.load_state_dict(state)
+
+
+def test_load_state_dict_rejects_jsonl_shuffle_mode_change(tmp_path) -> None:
+    path = write_jsonl_file(tmp_path, build_records(count=3))
+    dataset = Dataset.from_source("jsonl", shards=path, context=RuntimeContext(seed=31))
+    state = iter(dataset).state_dict()
+    changed_pipeline = Dataset.from_source(
+        "jsonl",
+        shards=path,
+        context=RuntimeContext(seed=31),
+        shuffle_mode="none",
+    )
+
+    with pytest.raises(ResumeStateError, match=r"\[ResumePipelineMismatch\]"):
+        changed_pipeline.load_state_dict(state)
 
 
 @pytest.mark.parametrize("checkpoint_after", [0, 1, 4, 7])

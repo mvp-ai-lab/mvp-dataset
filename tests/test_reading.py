@@ -80,6 +80,59 @@ def test_source_datasets_are_picklable(tmp_path, source_kind: str, requires_lanc
     pickle.dumps(dataset)
 
 
+def test_jsonl_dataset_shards_across_ranks(tmp_path, monkeypatch) -> None:
+    records = build_records(count=8)
+    path = write_jsonl_file(tmp_path, records)
+    context = RuntimeContext(world_size=2, seed=17)
+    rank0 = Dataset.from_source("jsonl", shards=path, context=context)
+    rank1 = Dataset.from_source("jsonl", shards=path, context=context)
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "0")
+    observed_rank0 = [normalize_sample(sample) for sample in rank0]
+    monkeypatch.setenv("RANK", "1")
+    observed_rank1 = [normalize_sample(sample) for sample in rank1]
+    combined = sorted(observed_rank0 + observed_rank1, key=lambda sample: sample["value"])
+
+    assert combined == records
+    assert {sample["id"] for sample in observed_rank0}.isdisjoint({sample["id"] for sample in observed_rank1})
+
+
+def test_jsonl_dataset_default_shuffle_mode_is_shard_aware(tmp_path) -> None:
+    records = build_records(count=8)
+    path = write_jsonl_file(tmp_path, records)
+    context = RuntimeContext(seed=19)
+
+    explicit = Dataset.from_source("jsonl", shards=path, context=context, shuffle_mode="shard_aware")
+    default = Dataset.from_source("jsonl", shards=path, context=context)
+
+    assert [sample["__index_in_file__"] for sample in default] == [sample["__index_in_file__"] for sample in explicit]
+
+
+def test_jsonl_dataset_none_shuffle_preserves_slot_stride(tmp_path, monkeypatch) -> None:
+    records = build_records(count=8)
+    path = write_jsonl_file(tmp_path, records)
+    context = RuntimeContext(world_size=2, seed=17)
+    rank0 = Dataset.from_source("jsonl", shards=path, context=context, shuffle_mode="none")
+    rank1 = Dataset.from_source("jsonl", shards=path, context=context, shuffle_mode="none")
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "0")
+    observed_rank0 = [normalize_sample(sample) for sample in rank0]
+    monkeypatch.setenv("RANK", "1")
+    observed_rank1 = [normalize_sample(sample) for sample in rank1]
+
+    assert observed_rank0 == records[:4]
+    assert observed_rank1 == records[4:]
+
+
+def test_jsonl_dataset_global_shuffle_is_not_supported(tmp_path) -> None:
+    path = write_jsonl_file(tmp_path, build_records())
+
+    with pytest.raises(ValueError, match=r"\[UnsupportedJsonlShuffleMode\]"):
+        Dataset.from_source("jsonl", shards=path, shuffle_mode="global")
+
+
 def test_list_parquet_fragments_groups_by_row_group_count(tmp_path) -> None:
     records = build_records(count=6)
     path = write_parquet_file(tmp_path, records, row_group_size=2)
