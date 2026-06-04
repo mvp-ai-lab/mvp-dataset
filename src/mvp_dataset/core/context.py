@@ -10,6 +10,7 @@ from dataclasses import replace as dataclass_replace
 
 from .mesh import DataLoadMesh, resolve_data_load_mesh
 from .resume import stable_fingerprint
+from .torch_compat import get_worker_info
 
 
 def _read_torch_runtime_values() -> tuple[int | None, int | None, int | None, int | None]:
@@ -28,14 +29,10 @@ def _read_torch_runtime_values() -> tuple[int | None, int | None, int | None, in
     except ModuleNotFoundError:
         pass
 
-    try:
-        torch_utils_data = importlib.import_module("torch.utils.data")
-        worker_info = torch_utils_data.get_worker_info()
-        if worker_info is not None:
-            worker_id = int(worker_info.id)
-            num_workers = int(worker_info.num_workers)
-    except ModuleNotFoundError:
-        pass
+    worker_info = get_worker_info()
+    if worker_info is not None:
+        worker_id = int(worker_info.id)
+        num_workers = int(worker_info.num_workers)
 
     return rank, world_size, worker_id, num_workers
 

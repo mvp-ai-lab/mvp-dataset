@@ -2,33 +2,14 @@
 
 from __future__ import annotations
 
-import importlib
 import random
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
-from types import ModuleType
 
 from ..pipeline.ops import map_samples, select_samples
 from .context import RuntimeContext
 from .resume import ResumeStateError, UnsupportedResume, stable_fingerprint
 from .types import Assembler, StatefulAssembler
-
-
-def torch_iterabledataset_class(
-    import_module: Callable[[str], ModuleType] = importlib.import_module,
-) -> type:
-    """Resolve ``torch.utils.data.IterableDataset`` with a no-torch fallback."""
-
-    try:
-        torch_utils_data = import_module("torch.utils.data")
-    except ModuleNotFoundError:
-
-        class _IterableDatasetFallback:
-            """Fallback IterableDataset shim when torch is unavailable."""
-
-        return _IterableDatasetFallback
-
-    return torch_utils_data.IterableDataset
 
 
 @dataclass(frozen=True, slots=True)

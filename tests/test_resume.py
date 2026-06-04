@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import importlib.util
+
 import pytest
 
-from mvp_dataset import Dataset, ResumeStateError, RuntimeContext, UnsupportedResume
+from mvp_dataset import (
+    Dataset,
+    ResumeStateError,
+    RuntimeContext,
+    TorchLoader,
+    UnsupportedResume,
+)
 from mvp_dataset.core.resume import RESUME_STATE_VERSION
 
 from .helpers import (
@@ -41,6 +49,53 @@ def _normalize_stage_sample(sample: dict[str, object]) -> dict[str, object]:
 
 def _normalize_batch(batch: list[dict[str, object]]) -> list[dict[str, object]]:
     return [normalize_sample(sample) for sample in batch]
+
+
+def _decode_value(value: object) -> object:
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8")
+    return value
+
+
+def _as_list(value: object) -> list[object]:
+    if hasattr(value, "tolist"):
+        converted = value.tolist()
+        return converted if isinstance(converted, list) else [converted]
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
+def _normalize_loader_output(output: object) -> object:
+    if isinstance(output, dict) and isinstance(output.get("id"), (list, tuple)):
+        ids = _as_list(output["id"])
+        texts = _as_list(output["text"])
+        values = _as_list(output["value"])
+        return [
+            {
+                "id": _decode_value(sample_id),
+                "text": _decode_value(text),
+                "value": int(_decode_value(value)),
+            }
+            for sample_id, text, value in zip(ids, texts, values, strict=True)
+        ]
+    if isinstance(output, list):
+        if output and isinstance(output[0], dict):
+            return [normalize_sample(sample) for sample in output]
+        return [_decode_value(item) for item in output]
+    if isinstance(output, dict):
+        return normalize_sample(output)
+    return output
+
+
+def _consume_loader_outputs(stream, count: int) -> list[object]:
+    return [_normalize_loader_output(next(stream)) for _ in range(count)]
+
+
+def _resume_torch_loader(dataset: Dataset, **kwargs) -> TorchLoader:
+    if kwargs.get("num_workers", 0) > 0:
+        kwargs.setdefault("multiprocessing_context", "forkserver")
+    return TorchLoader(dataset, **kwargs)
 
 
 def _collate_ids(batch: list[dict[str, object]]) -> list[object]:
@@ -328,6 +383,415 @@ def test_tar_source_resume_matches_continued_iterator(tmp_path, checkpoint_after
     assert "sample_index" in state["source"]["state"]
     assert consumed + continued == expected
     assert resumed == continued
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
+def test_torch_loader_plain_iterable_iteration_does_not_require_resume_state() -> None:
+    assert list(TorchLoader([1, 2, 3], num_workers=0)) == [1, 2, 3]
+
+    iterator = iter(TorchLoader([1, 2, 3], num_workers=0))
+    assert next(iterator) == 1
+    with pytest.raises(UnsupportedResume, match=r"\[UnsupportedResume\] TorchLoader dataset iterator"):
+        iterator.state_dict()
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
+def test_torch_loader_multi_worker_resume_matches_continued_iterator(tmp_path) -> None:
+    num_workers = 2
+    prefetch_factor = 2
+    records = build_records(count=8)
+    shards = write_tar_shards(tmp_path, records, num_shards=4)
+    context = RuntimeContext(seed=43)
+    dataset = Dataset.from_source("tars", shards=shards, context=context)
+    loader = _resume_torch_loader(dataset, num_workers=num_workers, batch_size=None, prefetch_factor=prefetch_factor)
+    iterator = iter(loader)
+
+    consumed = _consume_loader_outputs(iterator, 1)
+    state = iterator.state_dict()
+    continued = [_normalize_loader_output(sample) for sample in iterator]
+
+    resumed_dataset = Dataset.from_source("tars", shards=shards, context=context)
+    with pytest.warns(UserWarning, match="TorchLoader.load_state_dict"):
+        resumed_loader = _resume_torch_loader(
+            resumed_dataset,
+            num_workers=num_workers,
+            batch_size=None,
+            prefetch_factor=prefetch_factor,
+        ).load_state_dict(state)
+    resumed = [_normalize_loader_output(sample) for sample in resumed_loader]
+
+    assert set(state["workers"]).issubset({str(worker_id) for worker_id in range(max(1, num_workers))})
+    assert "pending_outputs" in state
+    assert resumed == continued
+    assert len(consumed) == 1
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
+def test_torch_loader_single_process_resume_matches_continued_iterator(tmp_path) -> None:
+    records = build_records(count=8)
+    shards = write_tar_shards(tmp_path, records, num_shards=4)
+    context = RuntimeContext(seed=45)
+    dataset = Dataset.from_source("tars", shards=shards, context=context)
+    loader = _resume_torch_loader(dataset, num_workers=0, batch_size=None)
+    iterator = iter(loader)
+
+    consumed = _consume_loader_outputs(iterator, 1)
+    state = iterator.state_dict()
+    continued = [_normalize_loader_output(sample) for sample in iterator]
+
+    resumed_dataset = Dataset.from_source("tars", shards=shards, context=context)
+    with pytest.warns(UserWarning, match="TorchLoader.load_state_dict"):
+        resumed_loader = _resume_torch_loader(resumed_dataset, num_workers=0).load_state_dict(state)
+    resumed = [_normalize_loader_output(sample) for sample in resumed_loader]
+
+    assert resumed == continued
+    assert len(consumed) == 1
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
+def test_torch_loader_prefetch_factor_one_resume_matches_continued_iterator(tmp_path) -> None:
+    records = build_records(count=8)
+    shards = write_tar_shards(tmp_path, records, num_shards=4)
+    context = RuntimeContext(seed=46)
+    dataset = Dataset.from_source("tars", shards=shards, context=context)
+    loader = _resume_torch_loader(dataset, num_workers=2, batch_size=None, prefetch_factor=1)
+    iterator = iter(loader)
+
+    consumed = _consume_loader_outputs(iterator, 1)
+    state = iterator.state_dict()
+    continued = [_normalize_loader_output(sample) for sample in iterator]
+
+    resumed_dataset = Dataset.from_source("tars", shards=shards, context=context)
+    with pytest.warns(UserWarning, match="TorchLoader.load_state_dict"):
+        resumed_loader = _resume_torch_loader(
+            resumed_dataset,
+            num_workers=2,
+            batch_size=None,
+            prefetch_factor=1,
+        ).load_state_dict(state)
+    resumed = [_normalize_loader_output(sample) for sample in resumed_loader]
+
+    assert resumed == continued
+    assert len(consumed) == 1
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
+@pytest.mark.parametrize("collate_fn", [None, _normalize_batch])
+def test_torch_loader_batch_resume_matches_continued_iterator(tmp_path, collate_fn) -> None:
+    records = build_records(count=8)
+    shards = write_tar_shards(tmp_path, records, num_shards=4)
+    context = RuntimeContext(seed=47)
+    dataset = Dataset.from_source("tars", shards=shards, context=context)
+    loader = _resume_torch_loader(
+        dataset,
+        num_workers=2,
+        batch_size=2,
+        collate_fn=collate_fn,
+        prefetch_factor=2,
+    )
+    iterator = iter(loader)
+
+    consumed = _consume_loader_outputs(iterator, 1)
+    state = iterator.state_dict()
+    continued = [_normalize_loader_output(batch) for batch in iterator]
+
+    resumed_dataset = Dataset.from_source("tars", shards=shards, context=context)
+    with pytest.warns(UserWarning, match="TorchLoader.load_state_dict"):
+        resumed_loader = _resume_torch_loader(
+            resumed_dataset,
+            num_workers=2,
+            batch_size=2,
+            collate_fn=collate_fn,
+            prefetch_factor=2,
+        ).load_state_dict(state)
+    resumed = [_normalize_loader_output(batch) for batch in resumed_loader]
+
+    assert resumed == continued
+    assert len(consumed) == 1
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
+def test_torch_loader_custom_collate_resume_matches_continued_iterator(tmp_path) -> None:
+    shards = write_tar_shards(tmp_path, build_records(count=8), num_shards=4)
+    context = RuntimeContext(seed=49)
+    dataset = Dataset.from_source("tars", shards=shards, context=context)
+    loader = _resume_torch_loader(dataset, num_workers=2, batch_size=2, collate_fn=_collate_ids, prefetch_factor=2)
+    iterator = iter(loader)
+
+    consumed = _consume_loader_outputs(iterator, 1)
+    state = iterator.state_dict()
+    continued = [_normalize_loader_output(batch) for batch in iterator]
+
+    resumed_dataset = Dataset.from_source("tars", shards=shards, context=context)
+    with pytest.warns(UserWarning, match="TorchLoader.load_state_dict"):
+        resumed_loader = _resume_torch_loader(
+            resumed_dataset,
+            num_workers=2,
+            batch_size=2,
+            collate_fn=_collate_ids,
+            prefetch_factor=2,
+        ).load_state_dict(state)
+    resumed = [_normalize_loader_output(batch) for batch in resumed_loader]
+
+    assert resumed == continued
+    assert len(consumed) == 1
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
+def test_torch_loader_batch_resume_respects_drop_last(tmp_path) -> None:
+    records = build_records(count=10)
+    shards = write_tar_shards(tmp_path, records, num_shards=4)
+    context = RuntimeContext(seed=51)
+    dataset = Dataset.from_source("tars", shards=shards, context=context)
+    loader = _resume_torch_loader(dataset, num_workers=2, batch_size=3, drop_last=True, collate_fn=_normalize_batch)
+    iterator = iter(loader)
+
+    consumed = _consume_loader_outputs(iterator, 1)
+    state = iterator.state_dict()
+    continued = [_normalize_loader_output(batch) for batch in iterator]
+
+    resumed_dataset = Dataset.from_source("tars", shards=shards, context=context)
+    with pytest.warns(UserWarning, match="TorchLoader.load_state_dict"):
+        resumed_loader = _resume_torch_loader(
+            resumed_dataset,
+            num_workers=2,
+            batch_size=3,
+            drop_last=True,
+            collate_fn=_normalize_batch,
+        ).load_state_dict(state)
+    resumed = [_normalize_loader_output(batch) for batch in resumed_loader]
+
+    assert resumed == continued
+    assert len(consumed) == 1
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
+def test_torch_loader_resume_supports_persistent_workers_and_pin_memory(tmp_path) -> None:
+    records = build_records(count=8)
+    shards = write_tar_shards(tmp_path, records, num_shards=4)
+    context = RuntimeContext(seed=52)
+    dataset = Dataset.from_source("tars", shards=shards, context=context)
+    loader = _resume_torch_loader(
+        dataset,
+        num_workers=2,
+        batch_size=2,
+        collate_fn=_normalize_batch,
+        prefetch_factor=2,
+        persistent_workers=True,
+        pin_memory=True,
+    )
+    iterator = iter(loader)
+
+    consumed = _consume_loader_outputs(iterator, 1)
+    state = iterator.state_dict()
+    continued = [_normalize_loader_output(batch) for batch in iterator]
+
+    resumed_dataset = Dataset.from_source("tars", shards=shards, context=context)
+    with pytest.warns(UserWarning, match="TorchLoader.load_state_dict"):
+        resumed_loader = _resume_torch_loader(
+            resumed_dataset,
+            num_workers=2,
+            batch_size=2,
+            collate_fn=_normalize_batch,
+            prefetch_factor=2,
+            persistent_workers=True,
+            pin_memory=True,
+        ).load_state_dict(state)
+    resumed = [_normalize_loader_output(batch) for batch in resumed_loader]
+
+    assert resumed == continued
+    assert len(consumed) == 1
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
+def test_torch_loader_state_dict_returns_initial_state(tmp_path) -> None:
+    shards = write_tar_shards(tmp_path, build_records(count=4), num_shards=2)
+    dataset = Dataset.from_source("tars", shards=shards, context=RuntimeContext(seed=53))
+    loader = _resume_torch_loader(dataset, num_workers=2, batch_size=2, collate_fn=_normalize_batch)
+
+    with pytest.warns(UserWarning, match="TorchLoader.state_dict"):
+        state = loader.state_dict()
+    with pytest.warns(UserWarning, match="TorchLoader.load_state_dict"):
+        resumed_loader = _resume_torch_loader(
+            dataset,
+            num_workers=2,
+            batch_size=2,
+            collate_fn=_normalize_batch,
+        ).load_state_dict(state)
+
+    assert state["workers"] == {}
+    assert state["pending_outputs"] == {}
+    assert [_normalize_loader_output(batch) for batch in resumed_loader] == [
+        _normalize_loader_output(batch) for batch in loader
+    ]
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
+def test_torch_loader_state_dict_does_not_track_active_iterator(tmp_path) -> None:
+    shards = write_tar_shards(tmp_path, build_records(count=4), num_shards=2)
+    dataset = Dataset.from_source("tars", shards=shards, context=RuntimeContext(seed=54))
+    loader = _resume_torch_loader(dataset, num_workers=0, batch_size=None)
+    iterator = iter(loader)
+
+    next(iterator)
+    iterator_state = iterator.state_dict()
+    with pytest.warns(UserWarning, match="TorchLoader.state_dict"):
+        loader_state = loader.state_dict()
+
+    assert iterator_state["num_yielded"] == 1
+    assert loader_state["num_yielded"] == 0
+    assert loader_state["workers"] == {}
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
+@pytest.mark.parametrize(
+    "changed_kwargs",
+    [
+        {"num_workers": 1},
+        {"batch_size": 3},
+        {"prefetch_factor": 2},
+        {"collate_fn": _collate_ids},
+    ],
+)
+def test_torch_loader_resume_rejects_loader_fingerprint_mismatch(tmp_path, changed_kwargs: dict[str, object]) -> None:
+    shards = write_tar_shards(tmp_path, build_records(count=4), num_shards=2)
+    dataset = Dataset.from_source("tars", shards=shards, context=RuntimeContext(seed=55))
+    kwargs = {"num_workers": 2, "batch_size": 2, "collate_fn": _normalize_batch, "prefetch_factor": 1}
+    with pytest.warns(UserWarning, match="TorchLoader.state_dict"):
+        state = _resume_torch_loader(dataset, **kwargs).state_dict()
+    kwargs.update(changed_kwargs)
+    changed_loader = _resume_torch_loader(dataset, **kwargs)
+
+    with pytest.raises(ResumeStateError, match=r"\[ResumeLoaderMismatch\]"):
+        changed_loader.load_state_dict(state)
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
+def test_torch_loader_side_batch_resume_matches_continued_iterator(tmp_path) -> None:
+    shards = write_tar_shards(tmp_path, build_records(count=8), num_shards=4)
+    context = RuntimeContext(seed=57)
+    dataset = Dataset.from_source("tars", shards=shards, context=context)
+    loader = _resume_torch_loader(dataset, num_workers=0, batch_size=None).batch(3, collate_fn=_normalize_batch)
+    iterator = iter(loader)
+
+    consumed = [_normalize_loader_output(next(iterator))]
+    state = iterator.state_dict()
+    continued = [_normalize_loader_output(batch) for batch in iterator]
+
+    resumed_dataset = Dataset.from_source("tars", shards=shards, context=context)
+    with pytest.warns(UserWarning, match="TorchLoader.load_state_dict"):
+        resumed_loader = (
+            _resume_torch_loader(resumed_dataset, num_workers=0, batch_size=None)
+            .batch(3, collate_fn=_normalize_batch)
+            .load_state_dict(state)
+        )
+    resumed = [_normalize_loader_output(batch) for batch in resumed_loader]
+
+    assert state["stages"][0]["kind"] == "batch"
+    assert resumed == continued
+    assert len(consumed) == 1
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
+def test_torch_loader_side_unbatch_resume_matches_continued_iterator(tmp_path) -> None:
+    shards = write_tar_shards(tmp_path, build_records(count=8), num_shards=4)
+    context = RuntimeContext(seed=58)
+    dataset = Dataset.from_source("tars", shards=shards, context=context)
+    loader = _resume_torch_loader(dataset, num_workers=0, batch_size=2, collate_fn=_collate_columns).unbatch()
+    iterator = iter(loader)
+
+    consumed = _consume_loader_outputs(iterator, 3)
+    state = iterator.state_dict()
+    continued = [_normalize_loader_output(sample) for sample in iterator]
+
+    resumed_dataset = Dataset.from_source("tars", shards=shards, context=context)
+    with pytest.warns(UserWarning, match="TorchLoader.load_state_dict"):
+        resumed_loader = (
+            _resume_torch_loader(resumed_dataset, num_workers=0, batch_size=2, collate_fn=_collate_columns)
+            .unbatch()
+            .load_state_dict(state)
+        )
+    resumed = [_normalize_loader_output(sample) for sample in resumed_loader]
+
+    assert state["stages"][0]["kind"] == "unbatch"
+    assert resumed == continued
+    assert len(consumed) == 3
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
+def test_torch_loader_side_shuffle_resume_matches_continued_iterator(tmp_path) -> None:
+    shards = write_tar_shards(tmp_path, build_records(count=8), num_shards=4)
+    context = RuntimeContext(seed=59)
+    dataset = Dataset.from_source("tars", shards=shards, context=context)
+    loader = _resume_torch_loader(dataset, num_workers=0, batch_size=None).shuffle(buffer_size=3, initial=2)
+    iterator = iter(loader)
+
+    consumed = _consume_loader_outputs(iterator, 2)
+    state = iterator.state_dict()
+    continued = [_normalize_loader_output(sample) for sample in iterator]
+
+    resumed_dataset = Dataset.from_source("tars", shards=shards, context=context)
+    with pytest.warns(UserWarning, match="TorchLoader.load_state_dict"):
+        resumed_loader = (
+            _resume_torch_loader(resumed_dataset, num_workers=0, batch_size=None)
+            .shuffle(buffer_size=3, initial=2)
+            .load_state_dict(state)
+        )
+    resumed = [_normalize_loader_output(sample) for sample in resumed_loader]
+
+    assert state["stages"][0]["kind"] == "shuffle"
+    assert resumed == continued
+    assert len(consumed) == 2
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
+def test_torch_loader_side_assemble_resume_matches_continued_iterator(tmp_path) -> None:
+    shards = write_tar_shards(tmp_path, build_records(count=8), num_shards=4)
+    context = RuntimeContext(seed=60)
+    dataset = Dataset.from_source("tars", shards=shards, context=context)
+    loader = _resume_torch_loader(dataset, num_workers=0, batch_size=None).assemble(_build_pair_output_assembler)
+    iterator = iter(loader)
+
+    consumed = [next(iterator)]
+    state = iterator.state_dict()
+    continued = list(iterator)
+
+    resumed_dataset = Dataset.from_source("tars", shards=shards, context=context)
+    with pytest.warns(UserWarning, match="TorchLoader.load_state_dict"):
+        resumed_loader = (
+            _resume_torch_loader(resumed_dataset, num_workers=0, batch_size=None)
+            .assemble(_build_pair_output_assembler)
+            .load_state_dict(state)
+        )
+    resumed = list(resumed_loader)
+
+    assert state["stages"][0]["kind"] == "assemble"
+    assert resumed == continued
+    assert len(consumed) == 1
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
+def test_torch_loader_resume_rejects_loader_side_stage_config_mismatch(tmp_path) -> None:
+    shards = write_tar_shards(tmp_path, build_records(count=8), num_shards=4)
+    dataset = Dataset.from_source("tars", shards=shards, context=RuntimeContext(seed=61))
+    iterator = iter(_resume_torch_loader(dataset, num_workers=0, batch_size=None).shuffle(buffer_size=3))
+
+    next(iterator)
+    state = iterator.state_dict()
+    changed_loader = _resume_torch_loader(dataset, num_workers=0, batch_size=None).shuffle(buffer_size=4)
+
+    with pytest.raises(ResumeStateError, match=r"\[ResumeLoaderMismatch\]"):
+        changed_loader.load_state_dict(state)
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
+def test_torch_loader_side_assemble_rejects_non_stateful_assembler(tmp_path) -> None:
+    shards = write_tar_shards(tmp_path, build_records(count=4), num_shards=2)
+    dataset = Dataset.from_source("tars", shards=shards, context=RuntimeContext(seed=62))
+    loader = _resume_torch_loader(dataset, num_workers=0, batch_size=None).assemble(_build_non_stateful_assembler)
+
+    with pytest.raises(UnsupportedResume, match=r"\[UnsupportedResume\] loader stage kind='assemble'"):
+        iter(loader)
 
 
 def test_tar_source_resume_supports_resample_across_rounds(tmp_path) -> None:

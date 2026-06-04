@@ -24,8 +24,8 @@ from .stages import (
     _SelectStage,
     _ShuffleStage,
     _UnbatchStage,
-    torch_iterabledataset_class,
 )
+from .torch_compat import TorchIterableDataset
 from .types import Assembler, SourceKind, SourceStore, StageSpec
 
 
@@ -143,7 +143,7 @@ class DatasetIterator:
 
 
 @dataclass(frozen=True, slots=True)
-class Dataset(torch_iterabledataset_class()):
+class Dataset(TorchIterableDataset):
     """Chainable iterable dataset built from local shard sources.
 
     A :class:`Dataset` is immutable: every transformation returns a new dataset

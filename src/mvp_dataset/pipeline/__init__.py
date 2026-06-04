@@ -1,6 +1,7 @@
-"""Pipeline abstractions and transformation operations."""
+"""Pipeline transformation operations."""
 
-from ..core.dataset import Dataset
+from __future__ import annotations
+
 from .ops import (
     assemble_samples,
     batch_samples,
@@ -11,7 +12,6 @@ from .ops import (
 )
 
 __all__ = [
-    "Dataset",
     "assemble_samples",
     "batch_samples",
     "map_samples",
