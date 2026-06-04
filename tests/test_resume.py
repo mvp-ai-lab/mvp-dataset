@@ -16,17 +16,6 @@ from .helpers import (
 )
 
 
-def _source_path(tmp_path, source_kind: str) -> str | list[str]:
-    records = build_records()
-    if source_kind == "jsonl":
-        return write_jsonl_file(tmp_path, records)
-    if source_kind == "parquet":
-        return write_parquet_file(tmp_path, records)
-    if source_kind == "tars":
-        return write_tar_shards(tmp_path, records, num_shards=1)
-    raise AssertionError(f"unexpected source_kind={source_kind!r}")
-
-
 def _jsonl_dataset(tmp_path, *, seed: int = 0) -> Dataset:
     path = write_jsonl_file(tmp_path, build_records())
     return Dataset.from_source("jsonl", shards=path, context=RuntimeContext(seed=seed))
@@ -135,15 +124,6 @@ def _compatible_state(dataset: Dataset) -> dict[str, object]:
     }
 
 
-@pytest.mark.parametrize("source_kind", ["tars"])
-def test_state_dict_rejects_unsupported_sources(tmp_path, source_kind: str) -> None:
-    dataset = Dataset.from_source(source_kind, shards=_source_path(tmp_path, source_kind))
-
-    with pytest.warns(UserWarning, match="Dataset.state_dict"):
-        with pytest.raises(UnsupportedResume, match=rf"\[UnsupportedResume\] source kind='{source_kind}'"):
-            dataset.state_dict()
-
-
 def test_iter_rejects_unsupported_assemble_stage_with_clear_error(tmp_path) -> None:
     pytest.importorskip("lance")
 
@@ -195,11 +175,10 @@ def test_load_state_dict_attaches_validated_state_to_new_dataset(tmp_path) -> No
     assert dataset._resume_state is None
 
 
-def test_iterating_non_stateful_source_is_rejected(tmp_path) -> None:
-    dataset = Dataset.from_source("tars", shards=_source_path(tmp_path, "tars"))
+def test_tar_source_is_stateful(tmp_path) -> None:
+    dataset = Dataset.from_source("tars", shards=write_tar_shards(tmp_path, build_records(), num_shards=1))
 
-    with pytest.raises(UnsupportedResume, match=r"\[UnsupportedResume\] source kind='tars'"):
-        list(dataset)
+    assert [normalize_sample(sample) for sample in dataset] == build_records()
 
 
 def test_runtime_context_fingerprint_is_stable_and_seed_sensitive() -> None:
@@ -323,6 +302,70 @@ def test_lance_source_resume_matches_continued_iterator(
 
     assert consumed + continued == expected
     assert resumed == continued
+
+
+@pytest.mark.parametrize("checkpoint_after", [0, 1, 4, 9])
+def test_tar_source_resume_matches_continued_iterator(tmp_path, checkpoint_after: int) -> None:
+    records = build_records(count=9)
+    shards = write_tar_shards(tmp_path, records, num_shards=3)
+    dataset = Dataset.from_source("tars", shards=shards, context=RuntimeContext(seed=23))
+    iterator = iter(dataset)
+
+    consumed = _consume(iterator, checkpoint_after)
+    state = iterator.state_dict()
+    continued = [normalize_sample(sample) for sample in iterator]
+    expected = [normalize_sample(sample) for sample in dataset]
+
+    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
+        resumed_dataset = Dataset.from_source(
+            "tars",
+            shards=shards,
+            context=RuntimeContext(seed=23),
+        ).load_state_dict(state)
+    resumed = [normalize_sample(sample) for sample in resumed_dataset]
+
+    assert state["source"]["kind"] == "tars"
+    assert "sample_index" in state["source"]["state"]
+    assert consumed + continued == expected
+    assert resumed == continued
+
+
+def test_tar_source_resume_supports_resample_across_rounds(tmp_path) -> None:
+    records = build_records(count=4)
+    shards = write_tar_shards(tmp_path, records, num_shards=2)
+    dataset = Dataset.from_source("tars", shards=shards, context=RuntimeContext(seed=29), resample=True)
+    iterator = iter(dataset)
+
+    _consume(iterator, 6)
+    state = iterator.state_dict()
+    continued = _consume(iterator, 5)
+
+    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
+        resumed_dataset = Dataset.from_source(
+            "tars",
+            shards=shards,
+            context=RuntimeContext(seed=29),
+            resample=True,
+        ).load_state_dict(state)
+    resumed = _consume(iter(resumed_dataset), 5)
+
+    assert state["source"]["state"]["round_index"] >= 0
+    assert resumed == continued
+
+
+def test_load_state_dict_rejects_tar_shuffle_mode_change(tmp_path) -> None:
+    shards = write_tar_shards(tmp_path, build_records(count=4), num_shards=2)
+    dataset = Dataset.from_source("tars", shards=shards, context=RuntimeContext(seed=31))
+    state = iter(dataset).state_dict()
+    changed_pipeline = Dataset.from_source(
+        "tars",
+        shards=shards,
+        context=RuntimeContext(seed=31),
+        shuffle_mode="none",
+    )
+
+    with pytest.raises(ResumeStateError, match=r"\[ResumePipelineMismatch\]"):
+        changed_pipeline.load_state_dict(state)
 
 
 @pytest.mark.parametrize("checkpoint_after", [0, 1, 3, 6])
