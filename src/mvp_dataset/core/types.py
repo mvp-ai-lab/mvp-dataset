@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 
 # ---------------------------------------------------------------------------
 # Shared aliases
@@ -60,6 +60,21 @@ class Assembler[T, U](Protocol):
 
     def finish(self, *, drop_last: bool = False) -> Iterable[U]:
         """Flush remaining state at end of stream."""
+
+
+@runtime_checkable
+class StatefulAssembler(Protocol):
+    """Assembler that can persist and restore its internal state."""
+
+    def push(self, sample: object) -> Iterable[object]: ...
+
+    def finish(self, *, drop_last: bool = False) -> Iterable[object]: ...
+
+    def state_dict(self) -> dict[str, object]: ...
+
+    def load_state_dict(self, state: dict[str, object]) -> None: ...
+
+    def fingerprint(self) -> str: ...
 
 
 SourceKind = Literal["jsonl", "tars", "parquet", "lance"]

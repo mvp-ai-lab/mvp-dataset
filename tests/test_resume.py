@@ -58,6 +58,60 @@ def _collate_ids(batch: list[dict[str, object]]) -> list[object]:
     return [sample["id"] for sample in batch]
 
 
+_ASSEMBLER_FINGERPRINT_VERSION = "v1"
+
+
+class _PairOutputAssembler:
+    def __init__(self) -> None:
+        self.pending: list[str] = []
+
+    def push(self, sample: dict[str, object]) -> list[dict[str, object]]:
+        sample_id = sample["id"]
+        if isinstance(sample_id, (bytes, bytearray)):
+            sample_id = sample_id.decode("utf-8")
+        self.pending.append(str(sample_id))
+        if len(self.pending) < 2:
+            return []
+        left, right = self.pending
+        self.pending = []
+        pair = f"{left}+{right}"
+        return [{"pair": pair, "slot": 0}, {"pair": pair, "slot": 1}]
+
+    def finish(self, *, drop_last: bool = False) -> list[dict[str, object]]:
+        if drop_last or not self.pending:
+            return []
+        tail = self.pending.pop()
+        return [{"pair": tail, "slot": 0}]
+
+    def state_dict(self) -> dict[str, object]:
+        return {"pending": list(self.pending)}
+
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        pending = state.get("pending")
+        if not isinstance(pending, list):
+            raise ResumeStateError("[InvalidResumeState] assembler pending must be a list")
+        self.pending = [str(item) for item in pending]
+
+    def fingerprint(self) -> str:
+        return f"pair-output-assembler:{_ASSEMBLER_FINGERPRINT_VERSION}"
+
+
+class _NonStatefulAssembler:
+    def push(self, sample: dict[str, object]) -> list[dict[str, object]]:
+        return [sample]
+
+    def finish(self, *, drop_last: bool = False) -> list[dict[str, object]]:
+        return []
+
+
+def _build_pair_output_assembler(_context: RuntimeContext) -> _PairOutputAssembler:
+    return _PairOutputAssembler()
+
+
+def _build_non_stateful_assembler(_context: RuntimeContext) -> _NonStatefulAssembler:
+    return _NonStatefulAssembler()
+
+
 def _compatible_state(dataset: Dataset) -> dict[str, object]:
     return {
         "version": RESUME_STATE_VERSION,
@@ -436,6 +490,68 @@ def test_load_state_dict_rejects_batch_stage_config_change(tmp_path, changed_dat
 
     with pytest.raises(ResumeStateError, match=r"\[ResumePipelineMismatch\]"):
         changed_dataset(path).load_state_dict(state)
+
+
+@pytest.mark.parametrize("checkpoint_after", [0, 1, 2, 4, 5])
+def test_lance_assemble_resume_matches_continued_iterator(tmp_path, checkpoint_after: int) -> None:
+    pytest.importorskip("lance")
+
+    records = build_records(count=5)
+    path = write_lance_dataset(tmp_path, records, max_rows_per_file=2)
+    dataset = Dataset.from_source("lance", shards=path, batch_size=2).assemble(_build_pair_output_assembler)
+    iterator = iter(dataset)
+
+    consumed = [next(iterator) for _ in range(checkpoint_after)]
+    state = iterator.state_dict()
+    continued = list(iterator)
+    expected = list(dataset)
+
+    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
+        resumed_dataset = (
+            Dataset.from_source("lance", shards=path, batch_size=2)
+            .assemble(_build_pair_output_assembler)
+            .load_state_dict(state)
+        )
+    resumed = list(resumed_dataset)
+
+    assert state["stages"][0]["kind"] == "assemble"
+    if checkpoint_after == 1:
+        assert state["stages"][0]["state"]["pending_outputs"] == [{"pair": "sample-0+sample-1", "slot": 1}]
+    assert consumed + continued == expected
+    assert resumed == continued
+
+
+def test_lance_assemble_resume_rejects_non_stateful_assembler(tmp_path) -> None:
+    pytest.importorskip("lance")
+
+    path = write_lance_dataset(tmp_path, build_records())
+    dataset = Dataset.from_source("lance", shards=path).assemble(_build_non_stateful_assembler)
+
+    with pytest.raises(UnsupportedResume, match=r"\[UnsupportedResume\] stage kind='assemble'"):
+        iter(dataset)
+
+
+def test_lance_assemble_resume_rejects_assembler_fingerprint_change(tmp_path) -> None:
+    pytest.importorskip("lance")
+
+    global _ASSEMBLER_FINGERPRINT_VERSION
+
+    path = write_lance_dataset(tmp_path, build_records())
+    dataset = Dataset.from_source("lance", shards=path).assemble(_build_pair_output_assembler)
+    iterator = iter(dataset)
+    next(iterator)
+    state = iterator.state_dict()
+
+    _ASSEMBLER_FINGERPRINT_VERSION = "v2"
+    try:
+        with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
+            resumed_dataset = (
+                Dataset.from_source("lance", shards=path).assemble(_build_pair_output_assembler).load_state_dict(state)
+            )
+        with pytest.raises(ResumeStateError, match=r"\[ResumeStageMismatch\]"):
+            list(resumed_dataset)
+    finally:
+        _ASSEMBLER_FINGERPRINT_VERSION = "v1"
 
 
 @pytest.mark.parametrize("shuffle_mode", ["none", "global", "fragment_aware"])
