@@ -12,7 +12,7 @@ from mvp_dataset import (
     TorchLoader,
     UnsupportedResume,
 )
-from mvp_dataset.core.resume import RESUME_STATE_VERSION
+from mvp_dataset.core.resume import RESUME_STATE_VERSION, callable_fingerprint
 
 from .helpers import (
     build_records,
@@ -45,6 +45,20 @@ def _remaining(stream) -> list[object]:
 
 def _add_marker(sample: dict[str, object]) -> dict[str, object]:
     return {**sample, "marker": f"marked-{_normalize(sample['id'])}"}
+
+
+def _add_marker_v2(sample: dict[str, object]) -> dict[str, object]:
+    return {**sample, "marker": f"changed-{_normalize(sample['id'])}"}
+
+
+class _CallablePlusOne:
+    def __call__(self, value: int) -> int:
+        return value + 1
+
+
+class _CallablePlusTwo:
+    def __call__(self, value: int) -> int:
+        return value + 2
 
 
 def _normalize_batch(batch: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -237,6 +251,18 @@ def _assert_loader_resume_matches_continued(
     assert consumed + continued == expected
     assert resumed == continued
     return state
+
+
+def test_callable_fingerprint_includes_function_and_callable_class_code() -> None:
+    first_fn = callable_fingerprint(_add_marker)
+    second_fn = callable_fingerprint(_add_marker_v2)
+    first_callable = callable_fingerprint(_CallablePlusOne())
+    second_callable = callable_fingerprint(_CallablePlusTwo())
+
+    assert first_fn != second_fn
+    assert first_callable != second_callable
+    assert first_fn["source_hash"] is not None
+    assert first_callable["source_hash"] is not None
 
 
 def test_load_state_dict_rejects_unknown_schema_version(tmp_path) -> None:
@@ -474,10 +500,8 @@ def test_assemble_rejects_assembler_fingerprint_change(tmp_path) -> None:
 
     _ASSEMBLER_FINGERPRINT_VERSION = "v2"
     try:
-        with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
-            resumed_dataset = build_source().assemble(_build_pair_output_assembler).load_state_dict(state)
-        with pytest.raises(ResumeStateError, match=r"\[ResumeStageMismatch\]"):
-            list(resumed_dataset)
+        with pytest.raises(ResumeStateError, match=r"\[ResumePipelineMismatch\]"):
+            build_source().assemble(_build_pair_output_assembler).load_state_dict(state)
     finally:
         _ASSEMBLER_FINGERPRINT_VERSION = "v1"
 

@@ -6,7 +6,11 @@ from typing import Literal
 
 from mvp_dataset.core.context import RuntimeContext
 from mvp_dataset.core.dataset import Dataset
-from mvp_dataset.core.resume import ResumeStateError, stable_fingerprint
+from mvp_dataset.core.resume import (
+    ResumeStateError,
+    callable_fingerprint,
+    stable_fingerprint,
+)
 from mvp_dataset.core.types import ShardInput, SidecarSpec
 from mvp_dataset.utils.url import normalize_paths
 
@@ -166,8 +170,7 @@ def _sidecar_fingerprint(sidecars: tuple[SidecarSpec, ...], shards: Sequence[str
     return [
         {
             "name": name,
-            "resolver_class": f"{resolver.__class__.__module__}.{resolver.__class__.__qualname__}",
-            "resolver_config": repr(resolver),
+            "resolver": callable_fingerprint(resolver),
             "shards": [
                 {
                     "path": sidecar_path,

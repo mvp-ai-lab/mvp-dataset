@@ -8,7 +8,12 @@ from dataclasses import dataclass
 
 from ..pipeline.ops import map_samples, select_samples
 from .context import RuntimeContext
-from .resume import ResumeStateError, UnsupportedResume, stable_fingerprint
+from .resume import (
+    ResumeStateError,
+    UnsupportedResume,
+    callable_fingerprint,
+    stable_fingerprint,
+)
 from .types import Assembler, StatefulAssembler
 
 
@@ -28,14 +33,7 @@ class _MapStage:
             raise ResumeStateError(msg)
 
     def fingerprint(self) -> str:
-        fn_type = type(self.fn)
-        return stable_fingerprint(
-            {
-                "kind": "map",
-                "fn_class": f"{fn_type.__module__}.{fn_type.__qualname__}",
-                "fn_config": repr(self.fn),
-            }
-        )
+        return stable_fingerprint({"kind": "map", "fn": callable_fingerprint(self.fn)})
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +49,15 @@ class _ShuffleStage:
             buffer_size=self.buffer_size,
             initial=self.initial,
             rng=random.Random(runtime_context.sample_shuffle_seed),
+        )
+
+    def fingerprint(self) -> str:
+        return stable_fingerprint(
+            {
+                "kind": "shuffle",
+                "buffer_size": self.buffer_size,
+                "initial": self.initial,
+            }
         )
 
 
@@ -178,6 +185,16 @@ class _BatchStage:
             collate_fn=self.collate_fn,
         )
 
+    def fingerprint(self) -> str:
+        return stable_fingerprint(
+            {
+                "kind": "batch",
+                "batch_size": self.batch_size,
+                "drop_last": self.drop_last,
+                "collate_fn": callable_fingerprint(self.collate_fn),
+            }
+        )
+
 
 class _BatchStageIterator:
     def __init__(
@@ -239,16 +256,12 @@ class _BatchStageIterator:
         self.emitted = emitted
 
     def fingerprint(self) -> str:
-        collate_type = type(self.collate_fn) if self.collate_fn is not None else None
         return stable_fingerprint(
             {
                 "kind": "batch",
                 "batch_size": self.batch_size,
                 "drop_last": self.drop_last,
-                "collate_fn_class": None
-                if collate_type is None
-                else f"{collate_type.__module__}.{collate_type.__qualname__}",
-                "collate_fn_config": None if self.collate_fn is None else repr(self.collate_fn),
+                "collate_fn": callable_fingerprint(self.collate_fn),
             }
         )
 
@@ -270,6 +283,21 @@ class _AssembleStage:
             assembler=assembler,
             factory=self.factory,
             drop_last=self.drop_last,
+        )
+
+    def fingerprint(self) -> str:
+        runtime_context = RuntimeContext.from_runtime(base=self.context)
+        assembler = self.factory(runtime_context)
+        if not isinstance(assembler, StatefulAssembler):
+            msg = "[UnsupportedResume] stage kind='assemble' requires a stateful assembler"
+            raise UnsupportedResume(msg)
+        return stable_fingerprint(
+            {
+                "kind": "assemble",
+                "drop_last": self.drop_last,
+                "factory": callable_fingerprint(self.factory),
+                "assembler": assembler.fingerprint(),
+            }
         )
 
 
@@ -330,13 +358,11 @@ class _AssembleStageIterator:
         self.finished = finished
 
     def fingerprint(self) -> str:
-        factory_type = type(self.factory)
         return stable_fingerprint(
             {
                 "kind": "assemble",
                 "drop_last": self.drop_last,
-                "factory_class": f"{factory_type.__module__}.{factory_type.__qualname__}",
-                "factory_config": repr(self.factory),
+                "factory": callable_fingerprint(self.factory),
                 "assembler": self.assembler.fingerprint(),
             }
         )
@@ -346,6 +372,9 @@ class _AssembleStageIterator:
 class _UnbatchStage:
     def __call__(self, data: Iterable[object]) -> Iterable[object]:
         return _UnbatchStageIterator(upstream=data)
+
+    def fingerprint(self) -> str:
+        return stable_fingerprint({"kind": "unbatch"})
 
 
 class _UnbatchStageIterator:

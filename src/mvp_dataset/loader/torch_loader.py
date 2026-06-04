@@ -17,6 +17,7 @@ from ..core.resume import (
     ResumeStateError,
     StatefulStage,
     UnsupportedResume,
+    callable_fingerprint,
     stable_fingerprint,
 )
 from ..core.stages import (
@@ -155,13 +156,11 @@ class _LoaderAssembleStage:
         )
 
     def fingerprint(self) -> str:
-        factory_type = type(self.factory)
         return stable_fingerprint(
             {
                 "kind": self.kind,
                 "drop_last": self.drop_last,
-                "factory_class": f"{factory_type.__module__}.{factory_type.__qualname__}",
-                "factory_config": repr(self.factory),
+                "factory": callable_fingerprint(self.factory),
                 "assembler": self._build_assembler().fingerprint(),
             }
         )
@@ -198,16 +197,12 @@ class _LoaderBatchStage:
         )
 
     def fingerprint(self) -> str:
-        collate_type = type(self.collate_fn) if self.collate_fn is not None else None
         return stable_fingerprint(
             {
                 "kind": self.kind,
                 "batch_size": self.batch_size,
                 "drop_last": self.drop_last,
-                "collate_fn_class": None
-                if collate_type is None
-                else f"{collate_type.__module__}.{collate_type.__qualname__}",
-                "collate_fn_config": None if self.collate_fn is None else repr(self.collate_fn),
+                "collate_fn": callable_fingerprint(self.collate_fn),
             }
         )
 
@@ -677,7 +672,6 @@ class TorchLoader:
         return [stage.fingerprint() for stage in self._stages]
 
     def _loader_fingerprint(self) -> str:
-        collate_type = type(self._collate_fn) if self._collate_fn is not None else None
         payload = {
             "num_workers": self._num_workers,
             "batch_size": self._batch_size,
@@ -685,10 +679,7 @@ class TorchLoader:
             "persistent_workers": self._persistent_workers,
             "prefetch_factor": self._prefetch_factor,
             "multiprocessing_context": self._multiprocessing_context,
-            "collate_fn_class": None
-            if collate_type is None
-            else f"{collate_type.__module__}.{collate_type.__qualname__}",
-            "collate_fn_config": repr(self._collate_fn),
+            "collate_fn": callable_fingerprint(self._collate_fn),
             "drop_last": self._drop_last,
             "loader_kwargs": repr(sorted(self._loader_kwargs.items())),
             "stages": self._stages_fingerprint(),

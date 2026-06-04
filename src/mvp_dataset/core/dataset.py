@@ -182,14 +182,20 @@ class Dataset(TorchIterableDataset):
         }
 
     def _stages_fingerprint(self) -> list[dict[str, object]]:
-        return [
-            {
-                "kind": spec.kind,
-                "apply_class": f"{spec.apply.__class__.__module__}.{spec.apply.__class__.__qualname__}",
-                "apply_config": repr(spec.apply),
-            }
-            for spec in self._stages
-        ]
+        result: list[dict[str, object]] = []
+        for spec in self._stages:
+            fingerprint = getattr(spec.apply, "fingerprint", None)
+            if callable(fingerprint):
+                result.append({"kind": spec.kind, "fingerprint": fingerprint()})
+            else:
+                result.append(
+                    {
+                        "kind": spec.kind,
+                        "apply_class": f"{spec.apply.__class__.__module__}.{spec.apply.__class__.__qualname__}",
+                        "apply_config": repr(spec.apply),
+                    }
+                )
+        return result
 
     def _pipeline_fingerprint(self) -> str:
         payload = {
