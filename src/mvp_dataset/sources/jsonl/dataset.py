@@ -264,7 +264,7 @@ class JsonlDataset(Dataset):
             _resample=resample,
             _source_kind="jsonl",
             _stages=(),
-            _iter_source_stream=None,
+            _source_stream_factory=None,
             _ref_fields=ref_fields_tuple,
             _shuffle_mode=shuffle_mode,
         )

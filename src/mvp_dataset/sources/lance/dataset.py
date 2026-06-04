@@ -215,7 +215,7 @@ class LanceDataset(Dataset):
             _resample=resample,
             _source_kind="lance",
             _stages=(),
-            _iter_source_stream=None,
+            _source_stream_factory=None,
             _shuffle_mode=shuffle_mode,
             _columns=tuple(columns) if columns is not None else None,
             _batch_size=batch_size,

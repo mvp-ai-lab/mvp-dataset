@@ -254,7 +254,7 @@ class ParquetDataset(Dataset):
             _resample=resample,
             _source_kind="parquet",
             _stages=(),
-            _iter_source_stream=None,
+            _source_stream_factory=None,
             _columns=tuple(columns) if columns is not None else None,
             _use_threads=use_threads,
             _shuffle_mode=shuffle_mode,

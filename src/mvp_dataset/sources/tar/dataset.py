@@ -246,7 +246,7 @@ class TarDataset(Dataset):
             _resample=resample,
             _source_kind="tars",
             _stages=(),
-            _iter_source_stream=None,
+            _source_stream_factory=None,
             _sidecar_specs=sidecar_specs,
             _shuffle_mode=shuffle_mode,
         )

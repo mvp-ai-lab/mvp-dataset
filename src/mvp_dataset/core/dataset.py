@@ -158,14 +158,13 @@ class Dataset(TorchIterableDataset):
     _source: SourceStore
     _stages: tuple[StageSpec, ...]
     _resample: bool
-    # TODO: rename it as factory?
-    _iter_source_stream: Callable | None
+    _source_stream_factory: Callable | None
     _resume_state: dict[str, object] | None = None
 
     def _build_source_stream(self, *, context: RuntimeContext) -> Iterable[object]:
-        assert self._iter_source_stream is not None, "source stream factory is required"
+        assert self._source_stream_factory is not None, "source stream factory is required"
         source_shard_stream = assign_items(self._source, context=context, resample=self._resample)
-        return self._iter_source_stream(source_shard_stream)
+        return self._source_stream_factory(source_shard_stream)
 
     def _append_stage(self, spec: StageSpec) -> Dataset:
         return dataclass_replace(self, _stages=self._stages + (spec,), _resume_state=None)
@@ -175,9 +174,9 @@ class Dataset(TorchIterableDataset):
             "kind": self._source_kind,
             "resample": self._resample,
             "iter_class": (
-                f"{self._iter_source_stream.__class__.__module__}.{self._iter_source_stream.__class__.__qualname__}"
+                f"{self._source_stream_factory.__class__.__module__}.{self._source_stream_factory.__class__.__qualname__}"
             ),
-            "iter_config": repr(self._iter_source_stream),
+            "iter_config": repr(self._source_stream_factory),
             "store": repr(self._source),
         }
 
