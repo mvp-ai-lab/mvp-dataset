@@ -140,10 +140,10 @@ def test_state_dict_rejects_unsupported_stage_with_clear_error(tmp_path) -> None
     pytest.importorskip("lance")
 
     path = write_lance_dataset(tmp_path, build_records())
-    dataset = Dataset.from_source("lance", shards=path).shuffle(2)
+    dataset = Dataset.from_source("lance", shards=path).unbatch()
 
     with pytest.warns(UserWarning, match="Dataset.state_dict"):
-        with pytest.raises(UnsupportedResume, match=r"\[UnsupportedResume\] stage kind='shuffle' index=0"):
+        with pytest.raises(UnsupportedResume, match=r"\[UnsupportedResume\] stage kind='unbatch' index=0"):
             dataset.state_dict()
 
 
@@ -394,6 +394,69 @@ def test_load_state_dict_rejects_stateless_stage_pipeline_change(tmp_path) -> No
 
     with pytest.raises(ResumeStateError, match=r"\[ResumePipelineMismatch\]"):
         changed_pipeline.load_state_dict(state)
+
+
+@pytest.mark.parametrize("initial", [None, 2])
+@pytest.mark.parametrize("checkpoint_after", [0, 1, 4, 9])
+def test_lance_dataset_shuffle_resume_matches_continued_iterator(
+    tmp_path,
+    initial: int | None,
+    checkpoint_after: int,
+) -> None:
+    pytest.importorskip("lance")
+
+    records = build_records(count=9)
+    path = write_lance_dataset(tmp_path, records, max_rows_per_file=2)
+    dataset = Dataset.from_source(
+        "lance",
+        shards=path,
+        context=RuntimeContext(seed=37),
+        batch_size=2,
+        shuffle_mode="none",
+    ).shuffle(buffer_size=3, initial=initial)
+    iterator = iter(dataset)
+
+    consumed = _consume(iterator, checkpoint_after)
+    state = iterator.state_dict()
+    continued = [normalize_sample(sample) for sample in iterator]
+    expected = [normalize_sample(sample) for sample in dataset]
+
+    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
+        resumed_dataset = (
+            Dataset.from_source(
+                "lance",
+                shards=path,
+                context=RuntimeContext(seed=37),
+                batch_size=2,
+                shuffle_mode="none",
+            )
+            .shuffle(buffer_size=3, initial=initial)
+            .load_state_dict(state)
+        )
+    resumed = [normalize_sample(sample) for sample in resumed_dataset]
+
+    assert state["stages"][0]["kind"] == "shuffle"
+    assert set(state["stages"][0]["state"]) == {"buffer", "rng_state", "upstream_exhausted"}
+    assert consumed + continued == expected
+    assert resumed == continued
+
+
+@pytest.mark.parametrize(
+    "changed_dataset",
+    [
+        lambda path: Dataset.from_source("lance", shards=path).shuffle(buffer_size=4),
+        lambda path: Dataset.from_source("lance", shards=path).shuffle(buffer_size=3, initial=2),
+    ],
+)
+def test_load_state_dict_rejects_dataset_shuffle_config_change(tmp_path, changed_dataset) -> None:
+    pytest.importorskip("lance")
+
+    path = write_lance_dataset(tmp_path, build_records())
+    dataset = Dataset.from_source("lance", shards=path).shuffle(buffer_size=3)
+    state = iter(dataset).state_dict()
+
+    with pytest.raises(ResumeStateError, match=r"\[ResumePipelineMismatch\]"):
+        changed_dataset(path).load_state_dict(state)
 
 
 @pytest.mark.parametrize("shuffle_mode", ["none", "global", "fragment_aware"])
