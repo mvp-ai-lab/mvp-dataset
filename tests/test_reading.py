@@ -135,6 +135,39 @@ def test_parquet_dataset_from_source_accepts_min_row_groups_per_fragment(tmp_pat
     assert [fragment.row_groups for fragment in dataset._source] == [(0, 1), (2,)]
 
 
+def test_parquet_dataset_default_shuffle_mode_is_fragment_aware(tmp_path) -> None:
+    records = build_records(count=8)
+    path = write_parquet_file(tmp_path, records, row_group_size=1)
+    context = RuntimeContext(seed=13)
+
+    explicit = Dataset.from_source("parquet", shards=path, context=context, shuffle_mode="fragment_aware")
+    default = Dataset.from_source("parquet", shards=path, context=context)
+
+    assert [sample["__index_in_file__"] for sample in default] == [sample["__index_in_file__"] for sample in explicit]
+
+
+def test_parquet_dataset_none_shuffle_preserves_slot_stride(tmp_path, monkeypatch) -> None:
+    records = build_records(count=8)
+    path = write_parquet_file(tmp_path, records, row_group_size=1)
+    dataset = Dataset.from_source("parquet", shards=path, context=RuntimeContext(seed=9), shuffle_mode="none")
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "0")
+    observed_rank0 = [normalize_sample(sample) for sample in dataset]
+    monkeypatch.setenv("RANK", "1")
+    observed_rank1 = [normalize_sample(sample) for sample in dataset]
+
+    assert observed_rank0 == records[0::2]
+    assert observed_rank1 == records[1::2]
+
+
+def test_parquet_dataset_global_shuffle_is_not_supported(tmp_path) -> None:
+    path = write_parquet_file(tmp_path, build_records())
+
+    with pytest.raises(ValueError, match=r"\[UnsupportedParquetShuffleMode\]"):
+        Dataset.from_source("parquet", shards=path, shuffle_mode="global")
+
+
 def test_resolve_parquet_batch_size_reads_env(monkeypatch) -> None:
     monkeypatch.setenv("MVP_DATASET_PARQUET_BATCH_SIZE", "1234")
 

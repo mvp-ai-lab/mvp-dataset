@@ -135,7 +135,7 @@ def _compatible_state(dataset: Dataset) -> dict[str, object]:
     }
 
 
-@pytest.mark.parametrize("source_kind", ["jsonl", "parquet", "tars"])
+@pytest.mark.parametrize("source_kind", ["jsonl", "tars"])
 def test_state_dict_rejects_unsupported_sources(tmp_path, source_kind: str) -> None:
     dataset = Dataset.from_source(source_kind, shards=_source_path(tmp_path, source_kind))
 
@@ -323,6 +323,85 @@ def test_lance_source_resume_matches_continued_iterator(
 
     assert consumed + continued == expected
     assert resumed == continued
+
+
+@pytest.mark.parametrize("checkpoint_after", [0, 1, 4, 7])
+def test_parquet_source_resume_matches_continued_iterator(tmp_path, checkpoint_after: int) -> None:
+    records = build_records(count=7)
+    path = write_parquet_file(tmp_path, records, row_group_size=2)
+    dataset = Dataset.from_source(
+        "parquet",
+        shards=path,
+        context=RuntimeContext(seed=31),
+        min_row_groups_per_fragment=2,
+    )
+    iterator = iter(dataset)
+
+    consumed = _consume(iterator, checkpoint_after)
+    state = iterator.state_dict()
+    continued = [normalize_sample(sample) for sample in iterator]
+    expected = [normalize_sample(sample) for sample in dataset]
+
+    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
+        resumed_dataset = Dataset.from_source(
+            "parquet",
+            shards=path,
+            context=RuntimeContext(seed=31),
+            min_row_groups_per_fragment=2,
+        ).load_state_dict(state)
+    resumed = [normalize_sample(sample) for sample in resumed_dataset]
+
+    assert state["source"]["kind"] == "parquet"
+    assert "row_index" not in state["source"]["state"]
+    assert "row_group_index" in state["source"]["state"]
+    assert "row_in_row_group" in state["source"]["state"]
+    assert consumed + continued == expected
+    assert resumed == continued
+
+
+def test_parquet_source_resume_supports_resample_across_rounds(tmp_path) -> None:
+    records = build_records(count=4)
+    path = write_parquet_file(tmp_path, records, row_group_size=2)
+    dataset = Dataset.from_source(
+        "parquet",
+        shards=path,
+        context=RuntimeContext(seed=37),
+        min_row_groups_per_fragment=1,
+        resample=True,
+    )
+    iterator = iter(dataset)
+
+    _consume(iterator, 6)
+    state = iterator.state_dict()
+    continued = _consume(iterator, 5)
+
+    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
+        resumed_dataset = Dataset.from_source(
+            "parquet",
+            shards=path,
+            context=RuntimeContext(seed=37),
+            min_row_groups_per_fragment=1,
+            resample=True,
+        ).load_state_dict(state)
+    resumed = _consume(iter(resumed_dataset), 5)
+
+    assert state["source"]["state"]["round_index"] >= 0
+    assert resumed == continued
+
+
+def test_load_state_dict_rejects_parquet_shuffle_mode_change(tmp_path) -> None:
+    path = write_parquet_file(tmp_path, build_records(), row_group_size=2)
+    dataset = Dataset.from_source("parquet", shards=path, context=RuntimeContext(seed=41))
+    state = iter(dataset).state_dict()
+    changed_pipeline = Dataset.from_source(
+        "parquet",
+        shards=path,
+        context=RuntimeContext(seed=41),
+        shuffle_mode="none",
+    )
+
+    with pytest.raises(ResumeStateError, match=r"\[ResumePipelineMismatch\]"):
+        changed_pipeline.load_state_dict(state)
 
 
 @pytest.mark.parametrize("shuffle_mode", ["none", "global", "fragment_aware"])

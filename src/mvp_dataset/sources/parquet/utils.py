@@ -26,6 +26,8 @@ class ParquetFragment:
     row_groups: tuple[int, ...]
     row_offset: int
     num_rows: int
+    row_group_offsets: tuple[int, ...]
+    row_group_num_rows: tuple[int, ...]
 
 
 def list_parquet_fragments(
@@ -109,11 +111,15 @@ def _collect_parquet_fragments_for_shard(
     fragments: list[ParquetFragment] = []
     row_offset = 0
     pending_groups: list[int] = []
+    pending_group_offsets: list[int] = []
+    pending_group_num_rows: list[int] = []
     pending_rows = 0
 
     for row_group in range(metadata.num_row_groups):
         num_rows = metadata.row_group(row_group).num_rows
         pending_groups.append(row_group)
+        pending_group_offsets.append(row_offset + pending_rows)
+        pending_group_num_rows.append(num_rows)
         pending_rows += num_rows
         if len(pending_groups) >= min_row_groups_per_fragment:
             fragments.append(
@@ -122,10 +128,14 @@ def _collect_parquet_fragments_for_shard(
                     row_groups=tuple(pending_groups),
                     row_offset=row_offset,
                     num_rows=pending_rows,
+                    row_group_offsets=tuple(pending_group_offsets),
+                    row_group_num_rows=tuple(pending_group_num_rows),
                 )
             )
             row_offset += pending_rows
             pending_groups = []
+            pending_group_offsets = []
+            pending_group_num_rows = []
             pending_rows = 0
 
     if pending_groups:
@@ -135,6 +145,8 @@ def _collect_parquet_fragments_for_shard(
                 row_groups=tuple(pending_groups),
                 row_offset=row_offset,
                 num_rows=pending_rows,
+                row_group_offsets=tuple(pending_group_offsets),
+                row_group_num_rows=tuple(pending_group_num_rows),
             )
         )
 
@@ -147,16 +159,21 @@ def iter_parquet(
     columns: Sequence[str] | None = None,
     batch_size: int | None = None,
     use_threads: bool = True,
+    row_group_index: int | None = None,
 ) -> Iterator[Sample]:
     """Iterate one parquet row-group fragment and yield one sample dict per row."""
 
     resolved_batch_size = resolve_parquet_batch_size(batch_size)
     parquet_file = pq.ParquetFile(fragment.path)
+    row_groups = list(fragment.row_groups)
     index_in_file = fragment.row_offset
+    if row_group_index is not None:
+        row_groups = [fragment.row_groups[row_group_index]]
+        index_in_file = fragment.row_group_offsets[row_group_index]
 
     for record_batch in parquet_file.iter_batches(
         batch_size=resolved_batch_size,
-        row_groups=list(fragment.row_groups),
+        row_groups=row_groups,
         columns=columns,
         use_threads=use_threads,
     ):
