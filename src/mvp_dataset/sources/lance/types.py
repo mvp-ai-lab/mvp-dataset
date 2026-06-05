@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 LanceShuffleMode = Literal["none", "global", "fragment_aware"]
+LanceRefIndexScope = Literal["shared", "node_local", "process"]
 
 
 @dataclass(frozen=True, slots=True)

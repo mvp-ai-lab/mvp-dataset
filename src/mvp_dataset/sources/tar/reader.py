@@ -1,4 +1,4 @@
-"""Tar shard source implementation for streaming sample iteration."""
+"""TAR shard readers."""
 
 from __future__ import annotations
 
@@ -120,11 +120,11 @@ def _require_sample_key(sample: Sample, *, shard_path: PathLikeStr, source_name:
     return key
 
 
-def iter_tars(
+def iter_tar_shards(
     shard_paths: Iterator[PathLikeStr],
     sidecars: Sequence[SidecarSpec] | None = None,
 ) -> Iterator[Sample]:
-    """Iterate multiple tar shards, optionally merging sidecar tars.
+    """Iterate multiple TAR shards, optionally merging sidecar archives.
 
     Args:
         shard_paths: Iterator of paths to the main tar shards.
@@ -157,7 +157,7 @@ def iter_tars(
             if any(s is _SENTINEL for s in group):
                 msg = (
                     f"[SidecarLengthMismatch] main shard and one or more sidecar "
-                    f"tars have different numbers of samples in shard {shard_path!r}"
+                    f"TAR archives have different numbers of samples in shard {shard_path!r}"
                 )
                 raise ValueError(msg)
 

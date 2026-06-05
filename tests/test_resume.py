@@ -145,11 +145,11 @@ def _source_factory(
 
         return build
 
-    if source == "tars":
+    if source == "tar":
         shards = write_tar_shards(tmp_path, records, num_shards=3)
 
         def build() -> Dataset:
-            return Dataset.from_source("tars", shards=shards, context=context, resample=resample)
+            return Dataset.from_source("tar", shards=shards, context=context, resample=resample)
 
         return build
 
@@ -311,7 +311,7 @@ def test_runtime_context_fingerprint_is_stable_and_seed_sensitive() -> None:
 def test_lance_global_shuffle_permute_index_is_bijective(total_rows: int) -> None:
     pytest.importorskip("lance")
 
-    from mvp_dataset.sources.lance.utils.shuffle import permute_index
+    from mvp_dataset.sources.lance.shuffle import permute_index
 
     observed = [permute_index(position, total_rows=total_rows, seed=41) for position in range(total_rows)]
 
@@ -322,7 +322,7 @@ def test_lance_global_shuffle_permute_index_is_bijective(total_rows: int) -> Non
     ("source", "lance_shuffle_mode"),
     [
         ("jsonl", "none"),
-        ("tars", "none"),
+        ("tar", "none"),
         ("parquet", "none"),
         ("lance", "none"),
         ("lance", "global"),
@@ -357,7 +357,7 @@ def test_dataset_resume_full_pipeline_with_distributed_context(tmp_path, rank: i
     ("source", "lance_shuffle_mode"),
     [
         ("jsonl", "none"),
-        ("tars", "none"),
+        ("tar", "none"),
         ("parquet", "none"),
         ("lance", "global"),
     ],
@@ -509,7 +509,7 @@ def test_assemble_rejects_assembler_fingerprint_change(tmp_path) -> None:
 @pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
 @pytest.mark.parametrize("num_workers", [0, 2])
 def test_torch_loader_resume_full_pipeline_matches_continued_stream(tmp_path, num_workers: int) -> None:
-    build_dataset = _source_factory(tmp_path, "tars", seed=41)
+    build_dataset = _source_factory(tmp_path, "tar", seed=41)
 
     def build_loader() -> TorchLoader:
         loader = _resume_torch_loader(

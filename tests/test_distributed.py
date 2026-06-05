@@ -64,7 +64,7 @@ def _distributed_reader_worker(
         world_size=world_size,
     )
     try:
-        dataset = Dataset.from_source("tars", shards=shards)
+        dataset = Dataset.from_source("tar", shards=shards)
         ids = [sample["id"].decode("utf-8") for sample in dataset]
         output_path = Path(output_dir) / f"rank_{rank}.json"
         output_path.write_text(json.dumps(ids), encoding="utf-8")
@@ -98,7 +98,7 @@ def _tp_group_reader_worker(
     try:
         mesh = FakeDeviceMesh(dp_size=2, tp_size=2, rank=rank)
         context = RuntimeContext.from_runtime(device_mesh=mesh, dp_dims=("dp",))
-        dataset = Dataset.from_source("tars", shards=shards, context=context)
+        dataset = Dataset.from_source("tar", shards=shards, context=context)
         ids = [sample["id"].decode("utf-8") for sample in dataset]
         output_path = Path(output_dir) / f"rank_{rank}.json"
         output_path.write_text(json.dumps(ids), encoding="utf-8")
@@ -128,7 +128,7 @@ def _tp_group_loader_shuffle_reader_worker(
     try:
         mesh = FakeDeviceMesh(dp_size=2, tp_size=2, rank=rank)
         context = RuntimeContext.from_runtime(device_mesh=mesh, dp_dims=("dp",), seed=23)
-        dataset = Dataset.from_source("tars", shards=shards, context=context)
+        dataset = Dataset.from_source("tar", shards=shards, context=context)
         loader = (
             TorchLoader(
                 dataset,
@@ -168,7 +168,7 @@ def _tp_group_multiworker_reader_worker(
     try:
         mesh = FakeDeviceMesh(dp_size=2, tp_size=2, rank=rank)
         context = RuntimeContext.from_runtime(device_mesh=mesh, dp_dims=("dp",), seed=31)
-        dataset = Dataset.from_source("tars", shards=shards, context=context).shuffle(buffer_size=2)
+        dataset = Dataset.from_source("tar", shards=shards, context=context).shuffle(buffer_size=2)
         loader = TorchLoader(dataset, num_workers=2, batch_size=None)
         ids = [sample["id"].decode("utf-8") for sample in loader]
         output_path = Path(output_dir) / f"rank_{rank}.json"
@@ -199,7 +199,7 @@ def _tp_group_shuffle_reader_worker(
     try:
         mesh = FakeDeviceMesh(dp_size=2, tp_size=2, rank=rank)
         context = RuntimeContext.from_runtime(device_mesh=mesh, dp_dims=("dp",), seed=17)
-        dataset = Dataset.from_source("tars", shards=shards, context=context).shuffle(buffer_size=3)
+        dataset = Dataset.from_source("tar", shards=shards, context=context).shuffle(buffer_size=3)
         ids = [sample["id"].decode("utf-8") for sample in dataset]
         output_path = Path(output_dir) / f"rank_{rank}.json"
         output_path.write_text(json.dumps(ids), encoding="utf-8")

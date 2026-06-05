@@ -7,10 +7,10 @@ from .types import (
     Assembler,
     GroupedSample,
     PathLikeStr,
-    RefFieldSpec,
     Sample,
     SidecarSpec,
     Stage,
+    TarUriRefFieldSpec,
 )
 
 __all__ = [
@@ -18,7 +18,7 @@ __all__ = [
     "DataLoadMesh",
     "GroupedSample",
     "PathLikeStr",
-    "RefFieldSpec",
+    "TarUriRefFieldSpec",
     "ResumeStateError",
     "RuntimeContext",
     "Sample",

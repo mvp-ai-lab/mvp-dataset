@@ -6,10 +6,8 @@ import pytest
 
 from mvp_dataset import Dataset
 from mvp_dataset.core.context import RuntimeContext
-from mvp_dataset.sources.parquet.utils import (
-    list_parquet_fragments,
-    resolve_parquet_batch_size,
-)
+from mvp_dataset.sources.parquet.fragments import list_parquet_fragments
+from mvp_dataset.sources.parquet.reader import resolve_parquet_batch_size
 
 from .helpers import (
     build_records,
@@ -22,7 +20,7 @@ from .helpers import (
 
 
 def _build_source(tmp_path, source_kind: str, records: list[dict[str, object]]) -> str | list[str]:
-    if source_kind == "tars":
+    if source_kind == "tar":
         return write_tar_shards(tmp_path, records, num_shards=3)
     if source_kind == "jsonl":
         return write_jsonl_file(tmp_path, records)
@@ -34,7 +32,7 @@ def _build_source(tmp_path, source_kind: str, records: list[dict[str, object]]) 
     raise AssertionError(f"unexpected source_kind={source_kind!r}")
 
 
-_SOURCE_CASES = ["tars", "jsonl", "parquet", "lance"]
+_SOURCE_CASES = ["tar", "jsonl", "parquet", "lance"]
 
 
 @pytest.mark.parametrize("source_kind", _SOURCE_CASES)
@@ -77,7 +75,7 @@ def test_sources_shard_across_ranks(tmp_path, monkeypatch, source_kind: str) -> 
     ("source_kind", "explicit_mode", "metadata_key"),
     [
         ("jsonl", "shard_aware", "__index_in_file__"),
-        ("tars", "shard_aware", "__key__"),
+        ("tar", "shard_aware", "__key__"),
         ("parquet", "fragment_aware", "__index_in_file__"),
     ],
 )
@@ -100,7 +98,7 @@ def test_default_shuffle_mode_matches_explicit_mode(
     ("source_kind", "pattern"),
     [
         ("jsonl", r"\[UnsupportedJsonlShuffleMode\]"),
-        ("tars", r"\[UnsupportedTarShuffleMode\]"),
+        ("tar", r"\[UnsupportedTarShuffleMode\]"),
         ("parquet", r"\[UnsupportedParquetShuffleMode\]"),
     ],
 )

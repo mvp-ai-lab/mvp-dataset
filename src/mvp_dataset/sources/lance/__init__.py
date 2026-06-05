@@ -1,7 +1,5 @@
-from .utils import LanceDatasetSpec, LanceSourceSpec, list_lance_sources
+"""Lance source."""
 
-__all__ = [
-    "LanceDatasetSpec",
-    "LanceSourceSpec",
-    "list_lance_sources",
-]
+from .dataset import LanceDataset
+
+__all__ = ["LanceDataset"]

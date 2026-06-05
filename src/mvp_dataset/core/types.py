@@ -29,8 +29,8 @@ PathResolver = Callable[[PathLikeStr], PathLikeStr]
 SidecarSpec = tuple[str, PathResolver]
 """Sidecar join specification as ``(name, path_resolver)``."""
 
-RefFieldSpec = tuple[str, PathLikeStr]
-"""Reference resolver spec as ``(field_name, base_dir)``."""
+TarUriRefFieldSpec = tuple[str, PathLikeStr]
+"""JSONL tar-reference resolver spec as ``(field_name, base_dir)``."""
 
 Stage = Callable[[Iterable[object]], Iterable[object]]
 """One lazy transformation stage in the iterator pipeline."""
@@ -77,5 +77,4 @@ class StatefulAssembler(Protocol):
     def fingerprint(self) -> str: ...
 
 
-SourceKind = Literal["jsonl", "tars", "parquet", "lance"]
-SourceStore = list[str] | list[object]
+SourceKind = Literal["jsonl", "tar", "parquet", "lance"]
