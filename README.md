@@ -1,6 +1,22 @@
-# MVP Dataset
+<p align="center">
+  <img src="doc/assets/logo.svg" alt="MVP Dataset logo" width="112">
+</p>
 
-`mvp-dataset` is a small, resume-aware data loading library for multimodal training. It provides a chainable `Dataset` abstraction, deterministic distributed sharding, resumable iterators, and optional PyTorch `DataLoader` integration through `TorchLoader`.
+<h1 align="center">MVP Dataset</h1>
+
+<p align="center">
+  <a href="https://github.com/mvp-ai-lab/mvp-dataset/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/mvp-ai-lab/mvp-dataset?style=flat-square"></a>
+  <img alt="Version" src="https://img.shields.io/badge/version-0.1.0-111827?style=flat-square">
+  <img alt="Python" src="https://img.shields.io/badge/python-3.12-3776AB?style=flat-square&logo=python&logoColor=white">
+  <img alt="Sources" src="https://img.shields.io/badge/sources-tar%20%7C%20jsonl%20%7C%20parquet%20%7C%20lance-F5C86B?style=flat-square">
+</p>
+
+<p align="center">
+  <b>Unified data loading for multimodal training.</b><br>
+  Chain immutable datasets, shard deterministically, checkpoint iterator state, and scale through PyTorch workers when needed.
+</p>
+
+`mvp-dataset` provides a chainable `Dataset` abstraction, deterministic distributed sharding, resumable iterators, and optional PyTorch `DataLoader` integration through `TorchLoader`.
 
 The project is designed for training code that needs predictable data order, checkpointable input pipelines, and local source formats commonly used in large-scale multimodal datasets.
 
@@ -23,7 +39,7 @@ uv pip install "git+https://github.com/mvp-ai-lab/mvp-dataset.git"
 uv pip install -e .
 ```
 
-Python `>=3.12,<3.13` is required.
+Python `>=3.12` is required.
 
 ## Quick Start
 
@@ -52,64 +68,6 @@ loader = TorchLoader(
 for batch in loader:
     train_step(batch)
 ```
-
-## Public API
-
-Top-level exports:
-
-- `Dataset`
-- `TorchLoader`
-- `RuntimeContext`
-- `DataLoadMesh`
-- `UnsupportedResume`
-- `ResumeStateError`
-- logging helpers: `set_logger`, `get_logger`, `reset_logger`, `set_log_level`, `get_log_level`, `reset_log_level`
-
-Construct datasets through one entrypoint:
-
-```python
-Dataset.from_source(source_kind, ...)
-```
-
-Supported `source_kind` values:
-
-- `"tar"`
-- `"jsonl"`
-- `"parquet"`
-- `"lance"`
-
-Dataset stages:
-
-- `.map(fn)`
-- `.select(fields)`
-- `.shuffle(buffer_size, initial=None)`
-- `.assemble(factory, drop_last=False)`
-- `.batch(batch_size, drop_last=False, collate_fn=None)`
-- `.unbatch()`
-
-TorchLoader stages:
-
-- `.unbatch()`
-- `.shuffle(buffer_size, initial=None, seed=None)`
-- `.assemble(factory, drop_last=False)`
-- `.batch(batch_size, drop_last=False, collate_fn=None)`
-
-## Resume
-
-Checkpoint the active iterator, not the dataset object itself:
-
-```python
-dataset = Dataset.from_source("lance", "/data/train.lance")
-it = iter(dataset)
-
-sample = next(it)
-state = it.state_dict()
-
-resumed_dataset = Dataset.from_source("lance", "/data/train.lance").load_state_dict(state)
-resumed_it = iter(resumed_dataset)
-```
-
-`Dataset.state_dict()` and `TorchLoader.state_dict()` exist only as initial-state convenience APIs. For in-progress training, call `state_dict()` on the iterator returned by `iter(dataset)` or `iter(loader)`.
 
 ## Documentation
 
