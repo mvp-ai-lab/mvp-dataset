@@ -2,14 +2,15 @@
 
 from .context import RuntimeContext
 from .mesh import DataLoadMesh
+from .resume import ResumeStateError, UnsupportedResume
 from .types import (
     Assembler,
     GroupedSample,
     PathLikeStr,
-    RefFieldSpec,
     Sample,
     SidecarSpec,
     Stage,
+    TarUriRefFieldSpec,
 )
 
 __all__ = [
@@ -17,9 +18,11 @@ __all__ = [
     "DataLoadMesh",
     "GroupedSample",
     "PathLikeStr",
-    "RefFieldSpec",
+    "TarUriRefFieldSpec",
+    "ResumeStateError",
     "RuntimeContext",
     "Sample",
     "SidecarSpec",
     "Stage",
+    "UnsupportedResume",
 ]

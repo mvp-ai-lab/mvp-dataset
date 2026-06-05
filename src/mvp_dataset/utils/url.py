@@ -54,11 +54,11 @@ def _expand_single_spec(spec: str) -> list[str]:
 def normalize_paths(inputs: ShardInput | Sequence[ShardInput]) -> list[str]:
     """Normalize shard input specs into a flat list of file-system paths.
 
-    Supported syntax:
-    - ``a::b``: concatenate multiple specs
-    - ``*.tar``: glob expansion
-    - ``shard_{000..127}.tar``: numeric brace range expansion
-    """
+    Args:
+        inputs: Single path or sequence of paths to normalize.
+
+    Returns:
+        Normalized path strings."""
 
     if isinstance(inputs, (str, os.PathLike)):
         specs = [str(inputs)]

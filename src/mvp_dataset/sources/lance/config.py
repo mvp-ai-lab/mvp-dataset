@@ -11,6 +11,7 @@ from mvp_dataset.utils.url import normalize_paths
 
 
 def _resolve_config_uri(uri: object, *, base_dir: Path) -> str:
+    """Resolve one Lance config URI entry."""
     if not isinstance(uri, str) or not uri:
         msg = f"[InvalidLanceConfig] expected a non-empty URI string, got {uri!r}"
         raise ValueError(msg)
@@ -20,6 +21,7 @@ def _resolve_config_uri(uri: object, *, base_dir: Path) -> str:
 
 
 def _resolve_config_uri_or_list(uri: object, *, base_dir: Path) -> str | list[str]:
+    """Resolve a Lance config URI or list of URIs."""
     if isinstance(uri, list):
         if not uri:
             msg = "[InvalidLanceConfig] expected a non-empty URI list"
@@ -29,6 +31,7 @@ def _resolve_config_uri_or_list(uri: object, *, base_dir: Path) -> str | list[st
 
 
 def _load_lance_source_config(config_path: Path) -> tuple[list[str], dict[str, dict[str, object]] | None]:
+    """Load a Lance source configuration from disk."""
     if not config_path.exists():
         msg = f"[MissingLanceConfig] Lance source config was not found: {config_path}"
         raise FileNotFoundError(msg)
@@ -91,6 +94,14 @@ def resolve_lance_source_config(
     shards: ShardInput | Sequence[ShardInput],
     ref_columns: dict[str, dict[str, object]] | None,
 ) -> tuple[list[str], dict[str, dict[str, object]] | None]:
+    """Resolve Lance source inputs into normalized configuration.
+
+    Args:
+        shards: Input shard path or paths.
+        ref_columns: Lance reference column configuration.
+
+    Returns:
+        Normalized Lance shard URIs and reference column configuration."""
     normalized_shards = normalize_paths(shards)
     json_config_paths = [Path(path) for path in normalized_shards if Path(path).suffix.lower() == ".json"]
     if not json_config_paths:
