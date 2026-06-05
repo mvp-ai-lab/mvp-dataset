@@ -6,7 +6,13 @@ from ..types import LanceRefSpec, LanceSourceSpec
 
 
 def parse_lance_ref_columns(ref_columns: object) -> tuple[LanceRefSpec, ...]:
-    """Parse the public ref_columns mapping into immutable ref specs."""
+    """Parse the public ref_columns mapping into immutable ref specs.
+
+    Args:
+        ref_columns: Lance reference column configuration.
+
+    Returns:
+        Normalized Lance reference specifications."""
 
     if ref_columns is None:
         return ()
@@ -53,4 +59,12 @@ def parse_lance_ref_columns(ref_columns: object) -> tuple[LanceRefSpec, ...]:
 
 
 def attach_lance_ref_columns(source: LanceSourceSpec, ref_columns: object) -> LanceSourceSpec:
+    """Attach Lance reference resolution stages to a dataset.
+
+    Args:
+        source: Lance source specification.
+        ref_columns: Lance reference column configuration.
+
+    Returns:
+        A Lance source specification with reference metadata attached."""
     return LanceSourceSpec(datasets=source.datasets, ref_columns=parse_lance_ref_columns(ref_columns))

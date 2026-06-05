@@ -28,9 +28,12 @@ def _wc_lines(path: str) -> int:
 def split_jsonl_files(paths: list[str], min_chunks: int) -> list[str]:
     """Split JSONL files into at least *min_chunks* pieces using ``split``.
 
-    If there are already enough files, returns them as-is.
-    Split files are written next to the originals with a ``._chunk_`` suffix.
-    """
+    Args:
+        paths: Input JSONL file paths.
+        min_chunks: Minimum number of output chunks to produce.
+
+    Returns:
+        Materialized shard file paths."""
     if len(paths) >= min_chunks:
         return paths
 
@@ -80,7 +83,18 @@ def materialize_jsonl_shards(
     spill_buckets: int,
     output_dir: PathLikeStr | None,
 ) -> list[str]:
-    """Spill raw JSONL rows into balanced local shard files."""
+    """Spill raw JSONL rows into balanced local shard files.
+
+    Args:
+        files: Input JSONL files to materialize.
+        group_key: Optional sample field used to keep related rows in the same shard.
+        num_shards: Explicit number of output shards.
+        target_samples_per_shard: Target number of samples per output shard.
+        spill_buckets: Number of temporary hash buckets used while sharding.
+        output_dir: Directory where materialized shards are written.
+
+    Returns:
+        Materialized shard file paths."""
 
     if spill_buckets <= 0:
         msg = f"[InvalidSpillBucketCount] spill_buckets must be > 0, got={spill_buckets}"
@@ -177,6 +191,7 @@ def materialize_jsonl_shards(
 
 
 def _bucket_id_for_sample(sample: Sample, *, group_key: str | None, spill_buckets: int) -> int:
+    """Return the deterministic shard bucket id for a sample key."""
     if group_key is None:
         key = str(sample["__key__"])
     else:
@@ -206,6 +221,7 @@ def _jsonl_shard_plan_fingerprint(
     target_samples_per_shard: int | None,
     spill_buckets: int,
 ) -> str:
+    """Return a fingerprint for the JSONL shard assignment plan."""
     payload = {
         "files": [(file, s.st_mtime_ns, s.st_size) for file in files for s in (Path(file).stat(),)],
         "group_key": group_key,
@@ -223,6 +239,7 @@ def _resolve_final_shard_count(
     num_shards: int | None,
     target_samples_per_shard: int | None,
 ) -> int:
+    """Resolve the output shard count after distributed sharding."""
     if num_shards is not None:
         return num_shards
     if target_samples_per_shard is None:

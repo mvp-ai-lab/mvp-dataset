@@ -14,6 +14,7 @@ except ModuleNotFoundError:
         """Fallback DataLoader used when PyTorch is not installed."""
 
         def __init__(self, *args: object, **kwargs: object) -> None:
+            """Initialize the object."""
             msg = "[TorchUnavailable] install torch to use TorchLoader"
             raise RuntimeError(msg)
 
@@ -21,13 +22,16 @@ except ModuleNotFoundError:
         """Fallback base class used when PyTorch is not installed."""
 
     def default_collate(samples: list[object]) -> object:
+        """Collate a batch with PyTorch when it is available."""
         msg = "[TorchUnavailable] install torch to use default_collate"
         raise RuntimeError(msg)
 
     def get_worker_info() -> object | None:
+        """Return PyTorch worker information when running in a DataLoader worker."""
         return None
 
     def pin_memory_item(item: object) -> object:
+        """Pin an item in memory when PyTorch pinning is available."""
         return item
 else:
     TORCH_AVAILABLE = True

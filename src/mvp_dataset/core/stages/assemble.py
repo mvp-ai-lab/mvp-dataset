@@ -17,11 +17,14 @@ from ..types import Assembler, StatefulAssembler
 
 @dataclass(frozen=True, slots=True)
 class _AssembleStage:
+    """Stage configuration that builds a stateful sample assembler."""
+
     factory: Callable[[RuntimeContext], Assembler[object, object]]
     context: RuntimeContext
     drop_last: bool = False
 
     def __call__(self, data: Iterable[object]) -> Iterable[object]:
+        """Apply this callable object."""
         runtime_context = RuntimeContext.from_runtime(base=self.context)
         assembler = self.factory(runtime_context)
         if not isinstance(assembler, StatefulAssembler):
@@ -35,6 +38,7 @@ class _AssembleStage:
         )
 
     def fingerprint(self) -> str:
+        """Return a stable fingerprint for resume compatibility checks."""
         runtime_context = RuntimeContext.from_runtime(base=self.context)
         assembler = self.factory(runtime_context)
         if not isinstance(assembler, StatefulAssembler):
@@ -51,6 +55,8 @@ class _AssembleStage:
 
 
 class _AssembleStageIterator:
+    """Iterator that runs a stateful assembler over upstream samples."""
+
     def __init__(
         self,
         *,
@@ -59,6 +65,7 @@ class _AssembleStageIterator:
         factory: Callable[[RuntimeContext], Assembler[object, object]],
         drop_last: bool,
     ) -> None:
+        """Initialize the object."""
         self.upstream = iter(upstream)
         self.assembler = assembler
         self.factory = factory
@@ -67,9 +74,11 @@ class _AssembleStageIterator:
         self.finished = False
 
     def __iter__(self) -> Iterator[object]:
+        """Return the iterator object."""
         return self
 
     def __next__(self) -> object:
+        """Return the next output item."""
         while not self.pending_outputs:
             if self.finished:
                 raise StopIteration
@@ -82,6 +91,7 @@ class _AssembleStageIterator:
         return self.pending_outputs.pop(0)
 
     def state_dict(self) -> dict[str, object]:
+        """Return the resumable state for this object."""
         return {
             "assembler_state": self.assembler.state_dict(),
             "pending_outputs": list(self.pending_outputs),
@@ -89,6 +99,7 @@ class _AssembleStageIterator:
         }
 
     def load_state_dict(self, state: dict[str, object]) -> None:
+        """Restore this object from a resumable state dictionary."""
         assembler_state = state.get("assembler_state")
         if not isinstance(assembler_state, dict):
             msg = "[InvalidResumeState] assemble stage assembler_state must be a dict"
@@ -107,6 +118,7 @@ class _AssembleStageIterator:
         self.finished = finished
 
     def fingerprint(self) -> str:
+        """Return a stable fingerprint for resume compatibility checks."""
         return stable_fingerprint(
             {
                 "kind": "assemble",

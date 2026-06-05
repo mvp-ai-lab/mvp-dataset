@@ -17,16 +17,22 @@ from ..core.types import Assembler, StatefulAssembler
 
 
 class _LoaderUnbatchStage:
+    """TorchLoader stage configuration for unbatching outputs."""
+
     kind = "unbatch"
 
     def __call__(self, data: Iterable[object]) -> Iterable[object]:
+        """Apply this callable object."""
         return _UnbatchStageIterator(upstream=data)
 
     def fingerprint(self) -> str:
+        """Return a stable fingerprint for resume compatibility checks."""
         return stable_fingerprint({"kind": self.kind})
 
 
 class _LoaderShuffleStageIterator(_ShuffleStageIterator):
+    """TorchLoader shuffle iterator with loader-specific fingerprinting."""
+
     def __init__(
         self,
         *,
@@ -35,6 +41,7 @@ class _LoaderShuffleStageIterator(_ShuffleStageIterator):
         initial: int | None,
         seed: int,
     ) -> None:
+        """Initialize the object."""
         self.seed = seed
         super().__init__(
             upstream=upstream,
@@ -44,6 +51,7 @@ class _LoaderShuffleStageIterator(_ShuffleStageIterator):
         )
 
     def fingerprint(self) -> str:
+        """Return a stable fingerprint for resume compatibility checks."""
         return stable_fingerprint(
             {
                 "kind": "shuffle",
@@ -55,14 +63,18 @@ class _LoaderShuffleStageIterator(_ShuffleStageIterator):
 
 
 class _LoaderShuffleStage:
+    """TorchLoader stage configuration for output shuffling."""
+
     kind = "shuffle"
 
     def __init__(self, *, buffer_size: int, initial: int | None, seed: int) -> None:
+        """Initialize the object."""
         self.buffer_size = buffer_size
         self.initial = initial
         self.seed = seed
 
     def __call__(self, data: Iterable[object]) -> Iterable[object]:
+        """Apply this callable object."""
         return _LoaderShuffleStageIterator(
             upstream=data,
             buffer_size=self.buffer_size,
@@ -71,6 +83,7 @@ class _LoaderShuffleStage:
         )
 
     def fingerprint(self) -> str:
+        """Return a stable fingerprint for resume compatibility checks."""
         return stable_fingerprint(
             {
                 "kind": self.kind,
@@ -82,6 +95,8 @@ class _LoaderShuffleStage:
 
 
 class _LoaderAssembleStage:
+    """TorchLoader stage configuration for stateful output assembly."""
+
     kind = "assemble"
 
     def __init__(
@@ -91,11 +106,13 @@ class _LoaderAssembleStage:
         base_context: RuntimeContext | None,
         drop_last: bool,
     ) -> None:
+        """Initialize the object."""
         self.factory = factory
         self.base_context = base_context
         self.drop_last = drop_last
 
     def __call__(self, data: Iterable[object]) -> Iterable[object]:
+        """Apply this callable object."""
         assembler = self._build_assembler()
         return _AssembleStageIterator(
             upstream=data,
@@ -105,6 +122,7 @@ class _LoaderAssembleStage:
         )
 
     def fingerprint(self) -> str:
+        """Return a stable fingerprint for resume compatibility checks."""
         return stable_fingerprint(
             {
                 "kind": self.kind,
@@ -115,6 +133,7 @@ class _LoaderAssembleStage:
         )
 
     def _build_assembler(self) -> StatefulAssembler:
+        """Build a stateful assembler for the loader stage."""
         runtime_context = RuntimeContext.from_runtime(base=self.base_context)
         assembler = self.factory(runtime_context)
         if not isinstance(assembler, StatefulAssembler):
@@ -124,6 +143,8 @@ class _LoaderAssembleStage:
 
 
 class _LoaderBatchStage:
+    """TorchLoader stage configuration for output batching."""
+
     kind = "batch"
 
     def __init__(
@@ -133,11 +154,13 @@ class _LoaderBatchStage:
         drop_last: bool,
         collate_fn: Callable[[list[object]], object] | None,
     ) -> None:
+        """Initialize the object."""
         self.batch_size = batch_size
         self.drop_last = drop_last
         self.collate_fn = collate_fn
 
     def __call__(self, data: Iterable[object]) -> Iterable[object]:
+        """Apply this callable object."""
         return _BatchStageIterator(
             upstream=data,
             batch_size=self.batch_size,
@@ -146,6 +169,7 @@ class _LoaderBatchStage:
         )
 
     def fingerprint(self) -> str:
+        """Return a stable fingerprint for resume compatibility checks."""
         return stable_fingerprint(
             {
                 "kind": self.kind,

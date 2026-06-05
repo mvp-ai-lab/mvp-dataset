@@ -1,3 +1,5 @@
+"""JSONL dataset source configuration."""
+
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +17,8 @@ from .types import JsonlShuffleMode
 
 @dataclass(frozen=True, slots=True)
 class JsonlDataset(Dataset):
+    """Dataset configuration for JSONL shards."""
+
     _ref_fields: tuple[TarUriRefFieldSpec, ...] = ()
     _shuffle_mode: JsonlShuffleMode = "shard_aware"
 
@@ -30,21 +34,14 @@ class JsonlDataset(Dataset):
         """Build a dataset from local JSONL shard paths.
 
         Args:
-            shards: One or more file paths, glob specs, or brace-expansion specs.
-            context: Optional execution context. If omitted, inferred from runtime.
-            resample: Whether to loop shards indefinitely across rounds.
-            ref_fields: Optional sequence of ``(field_name, base_dir)`` pairs for
-                resolving tar-referenced fields in JSONL rows.
-            shuffle_mode: ``"shard_aware"`` shuffles shard order by round;
-                ``"none"`` reads shards in original order. ``"global"`` is not
-                supported for JSONL row access.
+            shards: Input shard path or paths.
+            context: Runtime context used for sharding and deterministic randomness.
+            resample: Whether to repeat the source indefinitely across rounds.
+            ref_fields: JSONL reference field specifications to resolve from tar URIs.
+            shuffle_mode: Source-level shuffle mode.
 
         Returns:
-            A dataset whose source is the normalized JSONL shard path list.
-
-        Raises:
-            ValueError: If any input path does not end with ``.jsonl``.
-        """
+            A dataset configured for the requested source."""
         runtime_context = RuntimeContext.from_runtime() if context is None else context
         if shuffle_mode == "global":
             msg = "[UnsupportedJsonlShuffleMode] shuffle_mode='global'"
@@ -72,6 +69,7 @@ class JsonlDataset(Dataset):
         )
 
     def _build_source_stream(self, *, context: RuntimeContext) -> Iterable[object]:
+        """Build the source iterator for a runtime context."""
         return _JsonlSourceIterator(
             shards=self._source,
             context=context,
@@ -82,6 +80,7 @@ class JsonlDataset(Dataset):
         )
 
     def _source_fingerprint(self) -> dict[str, object]:
+        """Return the source portion of the pipeline fingerprint."""
         return {
             "kind": "jsonl",
             "resample": self._resample,

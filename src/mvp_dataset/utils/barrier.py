@@ -1,3 +1,5 @@
+"""File-based synchronization barrier utilities."""
+
 import os
 import shutil
 import time
@@ -5,6 +7,8 @@ from pathlib import Path
 
 
 class FileBarrierTimeout(TimeoutError):
+    """Raised when a file barrier wait exceeds its timeout."""
+
     pass
 
 
@@ -22,6 +26,7 @@ class FileBarrier:
         rank: int,
         poll_interval: float = 0.2,
     ):
+        """Initialize the object."""
         if world_size <= 0:
             raise ValueError("world_size must be > 0")
         if not (0 <= rank < world_size):
@@ -36,6 +41,7 @@ class FileBarrier:
 
     @staticmethod
     def _atomic_touch(path: Path) -> bool:
+        """Create a marker file atomically."""
         flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
         try:
             fd = os.open(str(path), flags)
@@ -45,6 +51,13 @@ class FileBarrier:
         return True
 
     def wait(self, timeout: float | None = None):
+        """Wait until all expected barrier participants arrive.
+
+        Args:
+            timeout: Maximum seconds to wait before raising a timeout error.
+
+        Returns:
+            None."""
         arrive_file = self.root / f"arrive_{self.rank}"
         release_file = self.root / "release"
         done_file = self.root / f"done_{self.rank}"

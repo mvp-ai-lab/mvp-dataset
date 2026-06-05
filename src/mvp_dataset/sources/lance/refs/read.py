@@ -18,6 +18,7 @@ def _read_table_rows(
     *,
     columns: Sequence[str] | None = None,
 ) -> list[Sample]:
+    """Read specific rows from an Arrow table-like object."""
     take_indices = pa.array(row_indices, type=pa.int64())
     if isinstance(dataset_handle, pa.Table):
         table = dataset_handle
@@ -37,6 +38,7 @@ def _iter_table_record_batches(
     columns: Sequence[str],
     batch_size: int = REF_INDEX_BUILD_BATCH_SIZE,
 ) -> Iterable[pa.RecordBatch]:
+    """Yield record batches from an Arrow table-like object."""
     if isinstance(dataset_handle, pa.Table):
         table = dataset_handle.select(columns)
         yield from table.to_batches(max_chunksize=batch_size)

@@ -16,6 +16,8 @@ from .types import TarShuffleMode
 
 @dataclass(slots=True)
 class _TarSourceIterator:
+    """Stateful iterator over tar shard members."""
+
     shards: Sequence[str]
     context: RuntimeContext
     resample: bool
@@ -31,14 +33,17 @@ class _TarSourceIterator:
     _round_shards_round: int | None = None
 
     def __post_init__(self) -> None:
+        """Validate dataclass configuration after initialization."""
         if not self.shards:
             msg = f"[InsufficientItemsForSlot] items=0 total_slots={self.context.total_slots} slot={self.context.slot}"
             raise ValueError(msg)
 
     def __iter__(self):
+        """Return the iterator object."""
         return self
 
     def __next__(self) -> object:
+        """Return the next output item."""
         while True:
             shard = self._current_shard_path()
             if shard is None:
@@ -59,9 +64,11 @@ class _TarSourceIterator:
             return sample
 
     def __del__(self) -> None:
+        """Release open resources when the iterator is garbage-collected."""
         self._close_iterator()
 
     def state_dict(self) -> dict[str, object]:
+        """Return the resumable state for this object."""
         return {
             "kind": "tar",
             "shuffle_mode": self.shuffle_mode,
@@ -71,6 +78,7 @@ class _TarSourceIterator:
         }
 
     def load_state_dict(self, state: dict[str, object]) -> None:
+        """Restore this object from a resumable state dictionary."""
         if state.get("kind") != "tar":
             msg = f"[InvalidResumeState] expected source kind='tar', got={state.get('kind')!r}"
             raise ResumeStateError(msg)
@@ -109,9 +117,11 @@ class _TarSourceIterator:
         self._close_iterator()
 
     def fingerprint(self) -> str:
+        """Return a stable fingerprint for resume compatibility checks."""
         return self.source_fingerprint
 
     def _current_shard_path(self) -> str | None:
+        """Return the path for the currently active shard."""
         while True:
             round_shards = self._round_shards(self.round_index)
             if self.shard_index < len(round_shards):
@@ -124,6 +134,7 @@ class _TarSourceIterator:
             self._close_iterator()
 
     def _round_shards(self, round_index: int) -> list[str]:
+        """Return the shard order for one resampling round."""
         if self._round_shards_round == round_index:
             return self._round_shards_cache
 
@@ -143,6 +154,7 @@ class _TarSourceIterator:
         return self._round_shards_cache
 
     def _open_shard(self, shard: str) -> None:
+        """Open the current shard for reading."""
         self._close_iterator()
         self._sample_iter = iter_tar_shards(iter([shard]), sidecars=self.sidecars or None)
         for _ in range(self.sample_index):
@@ -150,11 +162,13 @@ class _TarSourceIterator:
         self._current_shard = shard
 
     def _advance_shard(self) -> None:
+        """Advance the iterator to the next shard."""
         self.shard_index += 1
         self.sample_index = 0
         self._close_iterator()
 
     def _close_iterator(self) -> None:
+        """Close the current tar member iterator if one is open."""
         if self._sample_iter is not None:
             close = getattr(self._sample_iter, "close", None)
             if close is not None:

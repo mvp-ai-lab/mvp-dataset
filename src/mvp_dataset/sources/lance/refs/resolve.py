@@ -24,6 +24,7 @@ def _read_ref_value_rows(
     *,
     columns: Sequence[str],
 ) -> list[Sample]:
+    """Read referenced values for a batch of keys."""
     if not row_indices:
         return []
 
@@ -55,6 +56,7 @@ def _read_ref_value_rows(
 
 
 def _looks_like_lance_index_items(value: object) -> bool:
+    """Return whether values look like serialized Lance index items."""
     if value is None:
         return False
     if not isinstance(value, Sequence) or isinstance(value, str):
@@ -170,6 +172,14 @@ def _apply_ref_columns(
 
 
 def validate_ref_names(source: LanceSourceSpec, ref_names: Sequence[str]) -> tuple[str, ...]:
+    """Validate that reference fields do not collide with sample fields.
+
+    Args:
+        source: Lance source specification.
+        ref_names: Reference column names to resolve.
+
+    Returns:
+        Validated reference names."""
     if isinstance(ref_names, str):
         raw_ref_names = (ref_names,)
     else:
@@ -201,7 +211,18 @@ def iter_lance_ref_resolver(
     context: RuntimeContext | None = None,
     ref_index_scope: LanceRefIndexScope | None = None,
 ):
-    """Resolve configured Lance reference columns for already-read samples."""
+    """Resolve configured Lance reference columns for already-read samples.
+
+    Args:
+        source: Lance source specification.
+        sample_stream: Stream of samples whose references should be resolved.
+        ref_names: Reference column names to resolve.
+        batch_size: Number of samples to group into each batch.
+        context: Runtime context used for sharding and deterministic randomness.
+        ref_index_scope: Scope that controls where Lance reference indexes are stored.
+
+    Returns:
+        An iterator over samples with resolved Lance references."""
 
     assembler = LanceRefResolverAssembler(
         source=source,
@@ -217,12 +238,15 @@ def iter_lance_ref_resolver(
 
 @dataclass(frozen=True, slots=True)
 class LanceResolveRefFactory:
+    """Factory that creates Lance reference resolver assemblers."""
+
     source: LanceSourceSpec
     ref_names: tuple[str, ...]
     batch_size: int = 1024
     ref_index_scope: LanceRefIndexScope | None = None
 
     def __call__(self, context: RuntimeContext) -> LanceRefResolverAssembler:
+        """Apply this callable object."""
         return LanceRefResolverAssembler(
             source=self.source,
             ref_names=self.ref_names,
@@ -233,6 +257,8 @@ class LanceResolveRefFactory:
 
 
 class LanceRefResolverAssembler:
+    """Assembler that resolves Lance reference values in batches."""
+
     def __init__(
         self,
         *,
@@ -242,6 +268,7 @@ class LanceRefResolverAssembler:
         context: RuntimeContext | None = None,
         ref_index_scope: LanceRefIndexScope | None = None,
     ) -> None:
+        """Initialize the object."""
         if batch_size <= 0:
             msg = f"[InvalidLanceRefBatchSize] batch_size must be > 0, got {batch_size}"
             raise ValueError(msg)
@@ -258,6 +285,7 @@ class LanceRefResolverAssembler:
         self.queue_size = 0
 
     def _flush(self) -> Iterable[object]:
+        """Resolve and emit pending reference samples."""
         if not self.batch:
             return ()
 
@@ -278,6 +306,13 @@ class LanceRefResolverAssembler:
         return flushed_batch
 
     def push(self, sample: object) -> Iterable[object]:
+        """Handle push for pipeline execution.
+
+        Args:
+            sample: Input sample consumed by the assembler.
+
+        Returns:
+            Completed outputs produced after consuming the sample."""
         if not isinstance(sample, (dict, list)):
             msg = f"[InvalidLanceSample] expected dict or list sample, got {type(sample).__name__}"
             raise TypeError(msg)
@@ -291,6 +326,13 @@ class LanceRefResolverAssembler:
         return ()
 
     def finish(self, *, drop_last: bool = False) -> Iterable[object]:
+        """Handle finish for pipeline execution.
+
+        Args:
+            drop_last: Whether to discard the final incomplete batch.
+
+        Returns:
+            Remaining outputs produced during final flush."""
         if drop_last:
             self.batch.clear()
             self.queue_size = 0

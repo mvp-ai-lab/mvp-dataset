@@ -31,16 +31,21 @@ class DataLoadMesh:
     dp_dims: tuple[str, ...]
 
     def __eq__(self, other: object) -> bool:
+        """Return whether two mesh values describe the same topology."""
         if not isinstance(other, DataLoadMesh):
             return NotImplemented
         return self.device_mesh is other.device_mesh and self.dp_dims == other.dp_dims
 
     def __hash__(self) -> int:
+        """Return a stable hash for this immutable value."""
         return hash((id(self.device_mesh), self.dp_dims))
 
     @property
     def dp_rank(self) -> int:
-        """Flattened rank across all data-parallel dimensions."""
+        """Flattened rank across all data-parallel dimensions.
+
+        Returns:
+            The result of the operation."""
 
         sizes = [self.device_mesh.size(dim) for dim in self.dp_dims]
         local_ranks = [self.device_mesh.get_local_rank(dim) for dim in self.dp_dims]
@@ -54,7 +59,10 @@ class DataLoadMesh:
 
     @property
     def dp_size(self) -> int:
-        """Product of all data-parallel dimension sizes."""
+        """Product of all data-parallel dimension sizes.
+
+        Returns:
+            The result of the operation."""
 
         size = 1
         for dim in self.dp_dims:
@@ -65,10 +73,8 @@ class DataLoadMesh:
     def is_dp_leader(self) -> bool:
         """Return whether the local rank is the designated writer for its DP slot.
 
-        The leader is defined as the rank whose non-data-parallel mesh
-        coordinates are all zero. This selects exactly one representative from
-        each model-parallel replica group.
-        """
+        Returns:
+            The result of the operation."""
 
         dim_names = getattr(self.device_mesh, "mesh_dim_names", None)
         if dim_names is None:
@@ -94,7 +100,15 @@ def resolve_data_load_mesh(
     device_mesh: object | None = None,
     dp_dims: str | Sequence[str] | None = None,
 ) -> DataLoadMesh | None:
-    """Resolve a mesh specification into a :class:`DataLoadMesh`."""
+    """Resolve a mesh specification into a :class:`DataLoadMesh`.
+
+    Args:
+        mesh: Explicit data-load mesh override.
+        device_mesh: Optional torch device mesh used to derive data-parallel layout.
+        dp_dims: Device mesh dimension name or names that form the data-parallel axis.
+
+    Returns:
+        The result of the operation."""
 
     if mesh is not None and (device_mesh is not None or dp_dims is not None):
         msg = "pass either mesh or device_mesh/dp_dims, not both"

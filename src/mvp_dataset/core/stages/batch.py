@@ -10,11 +10,14 @@ from ..resume import ResumeStateError, callable_fingerprint, stable_fingerprint
 
 @dataclass(frozen=True, slots=True)
 class _BatchStage:
+    """Stage configuration that groups upstream samples into batches."""
+
     batch_size: int
     drop_last: bool = False
     collate_fn: Callable[[list[object]], object] | None = None
 
     def __call__(self, data: Iterable[object]) -> Iterable[object]:
+        """Apply this callable object."""
         return _BatchStageIterator(
             upstream=data,
             batch_size=self.batch_size,
@@ -23,6 +26,7 @@ class _BatchStage:
         )
 
     def fingerprint(self) -> str:
+        """Return a stable fingerprint for resume compatibility checks."""
         return stable_fingerprint(
             {
                 "kind": "batch",
@@ -34,6 +38,8 @@ class _BatchStage:
 
 
 class _BatchStageIterator:
+    """Iterator that builds resumable batches from upstream samples."""
+
     def __init__(
         self,
         *,
@@ -42,6 +48,7 @@ class _BatchStageIterator:
         drop_last: bool,
         collate_fn: Callable[[list[object]], object] | None,
     ) -> None:
+        """Initialize the object."""
         if batch_size <= 0:
             msg = f"batch_size must be > 0, got {batch_size}"
             raise ValueError(msg)
@@ -53,9 +60,11 @@ class _BatchStageIterator:
         self.emitted = 0
 
     def __iter__(self) -> Iterator[object]:
+        """Return the iterator object."""
         return self
 
     def __next__(self) -> object:
+        """Return the next output item."""
         while len(self.pending) < self.batch_size:
             try:
                 self.pending.append(next(self.upstream))
@@ -72,12 +81,14 @@ class _BatchStageIterator:
         return output
 
     def state_dict(self) -> dict[str, object]:
+        """Return the resumable state for this object."""
         return {
             "pending": list(self.pending),
             "emitted": self.emitted,
         }
 
     def load_state_dict(self, state: dict[str, object]) -> None:
+        """Restore this object from a resumable state dictionary."""
         pending = state.get("pending")
         if not isinstance(pending, list):
             msg = "[InvalidResumeState] batch stage pending must be a list"
@@ -93,6 +104,7 @@ class _BatchStageIterator:
         self.emitted = emitted
 
     def fingerprint(self) -> str:
+        """Return a stable fingerprint for resume compatibility checks."""
         return stable_fingerprint(
             {
                 "kind": "batch",

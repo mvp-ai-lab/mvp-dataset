@@ -19,12 +19,15 @@ _MAX_CYCLE_WALK_ATTEMPTS = 1024
 
 @dataclass(frozen=True, slots=True)
 class _FragmentRowSpan:
+    """Contiguous row span for a Lance fragment."""
+
     dataset_i: int
     local_row_offset: int
     num_rows: int
 
 
 def _mix64(value: int) -> int:
+    """Mix a 64-bit integer for deterministic pseudo-random indexing."""
     value = (value + 0x9E3779B97F4A7C15) & _MASK64
     value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
     value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & _MASK64
@@ -32,6 +35,7 @@ def _mix64(value: int) -> int:
 
 
 def _feistel(value: int, *, bits: int, seed: int) -> int:
+    """Permute a bounded integer with a Feistel network."""
     left_bits = bits // 2
     right_bits = bits - left_bits
     left_mask = (1 << left_bits) - 1
@@ -50,6 +54,15 @@ def _feistel(value: int, *, bits: int, seed: int) -> int:
 
 
 def permute_index(position: int, *, total_rows: int, seed: int) -> int:
+    """Return a deterministic permutation value for one index.
+
+    Args:
+        position: Logical position to permute.
+        total_rows: Total number of rows in the permutation domain.
+        seed: Base random seed.
+
+    Returns:
+        The permuted index."""
     if total_rows <= 0:
         msg = "total_rows must be positive"
         raise ValueError(msg)
@@ -76,6 +89,16 @@ def lance_round_size(
     shuffle_mode: LanceShuffleMode,
     fragment_order: list[LanceIndexItem],
 ) -> int:
+    """Return the number of items assigned to one runtime slot.
+
+    Args:
+        source: Lance source specification.
+        context: Runtime context used for sharding and deterministic randomness.
+        shuffle_mode: Source-level shuffle mode.
+        fragment_order: Precomputed fragment-aware Lance row order.
+
+    Returns:
+        Number of items assigned to the current runtime slot."""
     if shuffle_mode in ("none", "global"):
         if context.slot >= source.total_rows:
             return 0
@@ -95,6 +118,18 @@ def lance_index_at(
     position_in_round: int,
     fragment_order: list[LanceIndexItem],
 ) -> LanceIndexItem:
+    """Return the Lance row location for one logical slot position.
+
+    Args:
+        source: Lance source specification.
+        context: Runtime context used for sharding and deterministic randomness.
+        shuffle_mode: Source-level shuffle mode.
+        round_index: Resampling round index.
+        position_in_round: Position within the current source round.
+        fragment_order: Precomputed fragment-aware Lance row order.
+
+    Returns:
+        The physical Lance row location for the logical position."""
     global_position = context.slot + position_in_round * context.total_slots
     if shuffle_mode == "none":
         return _index_item(source, global_position)
@@ -113,6 +148,15 @@ def fragment_aware_index_order(
     context: RuntimeContext,
     round_index: int,
 ) -> list[LanceIndexItem]:
+    """Return deterministic fragment-aware row order for one slot.
+
+    Args:
+        source: Lance source specification.
+        context: Runtime context used for sharding and deterministic randomness.
+        round_index: Resampling round index.
+
+    Returns:
+        A deterministic row order for the current runtime slot."""
     spans = _fragment_spans(source)
     if not spans:
         return []
@@ -158,6 +202,7 @@ def fragment_aware_index_order(
 
 
 def _fragment_spans(source: LanceSourceSpec) -> list[_FragmentRowSpan]:
+    """Return row spans for all Lance fragments."""
     spans: list[_FragmentRowSpan] = []
     for dataset_i, dataset in enumerate(source.datasets):
         local_row_offset = 0
@@ -176,6 +221,7 @@ def _fragment_spans(source: LanceSourceSpec) -> list[_FragmentRowSpan]:
 
 
 def _split_spans_for_slots(spans: list[_FragmentRowSpan], total_slots: int) -> list[_FragmentRowSpan]:
+    """Split fragment spans across runtime slots."""
     split_spans: list[_FragmentRowSpan] = []
     base_parts, extra_parts = divmod(total_slots, len(spans))
     for span_i, span in enumerate(spans):
@@ -196,6 +242,7 @@ def _split_spans_for_slots(spans: list[_FragmentRowSpan], total_slots: int) -> l
 
 
 def _index_item(source: LanceSourceSpec, global_index: int) -> LanceIndexItem:
+    """Return a Lance index item for one global row index."""
     dataset_i = bisect.bisect_right([dataset.row_offset for dataset in source.datasets], global_index) - 1
     dataset = source.datasets[dataset_i]
     local_index = int(global_index - dataset.row_offset)

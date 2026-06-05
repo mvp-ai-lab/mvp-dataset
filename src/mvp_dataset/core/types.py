@@ -56,25 +56,71 @@ class Assembler[T, U](Protocol):
     """Stateful stream assembler that may emit outputs after consuming inputs."""
 
     def push(self, sample: T) -> Iterable[U]:
-        """Consume one upstream sample and yield any completed outputs."""
+        """Consume one upstream sample and yield any completed outputs.
+
+        Args:
+            sample: Input sample consumed by the assembler.
+
+        Returns:
+            Completed outputs produced after consuming the sample."""
 
     def finish(self, *, drop_last: bool = False) -> Iterable[U]:
-        """Flush remaining state at end of stream."""
+        """Flush remaining state at end of stream.
+
+        Args:
+            drop_last: Whether to discard the final incomplete batch.
+
+        Returns:
+            Remaining outputs produced during final flush."""
 
 
 @runtime_checkable
 class StatefulAssembler(Protocol):
     """Assembler that can persist and restore its internal state."""
 
-    def push(self, sample: object) -> Iterable[object]: ...
+    def push(self, sample: object) -> Iterable[object]:
+        """Consume one upstream sample and return completed outputs.
 
-    def finish(self, *, drop_last: bool = False) -> Iterable[object]: ...
+        Args:
+            sample: Input sample consumed by the assembler.
 
-    def state_dict(self) -> dict[str, object]: ...
+        Returns:
+            Completed outputs produced after consuming the sample."""
+        ...
 
-    def load_state_dict(self, state: dict[str, object]) -> None: ...
+    def finish(self, *, drop_last: bool = False) -> Iterable[object]:
+        """Flush pending assembler state at end of input.
 
-    def fingerprint(self) -> str: ...
+        Args:
+            drop_last: Whether to discard the final incomplete batch.
+
+        Returns:
+            Remaining outputs produced during final flush."""
+        ...
+
+    def state_dict(self) -> dict[str, object]:
+        """Return the resumable assembler state.
+
+        Returns:
+            A dictionary that can be passed to load_state_dict()."""
+        ...
+
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        """Restore the assembler from a resumable state dictionary.
+
+        Args:
+            state: Resume state dictionary to validate and load.
+
+        Returns:
+            None."""
+        ...
+
+    def fingerprint(self) -> str:
+        """Return a stable fingerprint for resume compatibility checks.
+
+        Returns:
+            A stable fingerprint string."""
+        ...
 
 
 SourceKind = Literal["jsonl", "tar", "parquet", "lance"]

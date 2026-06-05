@@ -41,17 +41,21 @@ class Dataset(TorchIterableDataset):
     _resume_state: dict[str, object] | None = None
 
     def _build_source_stream(self, *, context: RuntimeContext) -> Iterable[object]:
+        """Build the source iterator for a runtime context."""
         msg = f"[UnsupportedSourceKind] source kind {self._source_kind!r} does not implement iteration"
         raise NotImplementedError(msg)
 
     def _append_stage(self, spec: StageSpec) -> Dataset:
+        """Return a new dataset with one additional stage."""
         return dataclass_replace(self, _stages=self._stages + (spec,), _resume_state=None)
 
     def _source_fingerprint(self) -> dict[str, object]:
+        """Return the source portion of the pipeline fingerprint."""
         msg = f"[UnsupportedSourceKind] source kind {self._source_kind!r} does not implement fingerprinting"
         raise NotImplementedError(msg)
 
     def _stages_fingerprint(self) -> list[dict[str, object]]:
+        """Return the stage portion of the pipeline fingerprint."""
         result: list[dict[str, object]] = []
         for spec in self._stages:
             fingerprint = getattr(spec.apply, "fingerprint", None)
@@ -68,6 +72,7 @@ class Dataset(TorchIterableDataset):
         return result
 
     def _pipeline_fingerprint(self) -> str:
+        """Return the combined source and stage fingerprint."""
         payload = {
             "source": self._source_fingerprint(),
             "stages": self._stages_fingerprint(),
@@ -75,7 +80,10 @@ class Dataset(TorchIterableDataset):
         return stable_fingerprint(payload)
 
     def state_dict(self) -> dict[str, object]:
-        """Return the resumable state for future pipeline outputs."""
+        """Return the resumable state for future pipeline outputs.
+
+        Returns:
+            A dictionary that can be passed to load_state_dict()."""
         warnings.warn(
             "Dataset.state_dict() creates a fresh initial iterator state. "
             "Use iterator.state_dict() to checkpoint an in-progress iteration.",
@@ -85,7 +93,13 @@ class Dataset(TorchIterableDataset):
         return DatasetIterator(self).state_dict()
 
     def load_state_dict(self, state: dict[str, object]) -> Dataset:
-        """Return a dataset with validated resume state attached."""
+        """Return a dataset with validated resume state attached.
+
+        Args:
+            state: Resume state dictionary to validate and load.
+
+        Returns:
+            None."""
 
         if not isinstance(state, dict):
             msg = "[InvalidResumeState] state must be a dict"
@@ -132,11 +146,10 @@ class Dataset(TorchIterableDataset):
         """Append a lazy map stage.
 
         Args:
-            fn: Callable applied to each sample yielded by the upstream stage.
+            fn: Callable applied to each upstream sample.
 
         Returns:
-            A new dataset that applies ``fn`` lazily during iteration.
-        """
+            A new dataset with the map stage appended."""
 
         spec = StageSpec(kind="map", apply=_MapStage(fn))
         return self._append_stage(spec)
@@ -145,14 +158,11 @@ class Dataset(TorchIterableDataset):
         """Append a deterministic sample-level shuffle stage.
 
         Args:
-            buffer_size: Maximum number of samples to keep in the randomization
-                buffer.
-            initial: Minimum number of buffered samples before the stage starts
-                yielding values. Defaults to ``buffer_size``.
+            buffer_size: Maximum number of items kept in the shuffle buffer.
+            initial: Minimum buffered item count before shuffle starts yielding.
 
         Returns:
-            A new dataset with bounded-memory shuffling applied lazily.
-        """
+            A new object with the shuffle stage appended."""
 
         spec = StageSpec(
             kind="shuffle",
@@ -163,9 +173,11 @@ class Dataset(TorchIterableDataset):
     def select(self, fields: list[str] | tuple[str, ...]) -> Dataset:
         """Append a lazy field projection stage.
 
-        The stage keeps requested user fields and preserves internal metadata
-        keys such as ``__key__``.
-        """
+        Args:
+            fields: Field names to keep in each dictionary sample.
+
+        Returns:
+            A new dataset with the select stage appended."""
 
         selected_fields = tuple(fields)
 
@@ -184,14 +196,12 @@ class Dataset(TorchIterableDataset):
         """Append a batching stage.
 
         Args:
-            batch_size: Number of samples per yielded batch.
-            drop_last: Whether to drop the final incomplete batch.
-            collate_fn: Optional callable that transforms each list of samples
-                into a user-defined batch object.
+            batch_size: Number of samples to group into each batch.
+            drop_last: Whether to discard the final incomplete batch.
+            collate_fn: Optional callable used to convert a list of samples into one batch.
 
         Returns:
-            A new dataset that yields batches instead of individual samples.
-        """
+            A new object with the batch stage appended."""
 
         spec = StageSpec(
             kind="batch",
@@ -212,15 +222,11 @@ class Dataset(TorchIterableDataset):
         """Append a stateful assembly stage.
 
         Args:
-            factory: Callable that builds one fresh assembler for each iterator
-                execution. The assembler may consume multiple upstream samples
-                before yielding one or more downstream outputs.
-            drop_last: Whether to discard unfinished tail state instead of
-                delegating it to the assembler's final flush.
+            factory: Callable that builds a fresh assembler for the runtime context.
+            drop_last: Whether to discard the final incomplete batch.
 
         Returns:
-            A new dataset that assembles the upstream sample stream lazily.
-        """
+            A new object with the assemble stage appended."""
 
         spec = StageSpec(
             kind="assemble",
@@ -232,9 +238,7 @@ class Dataset(TorchIterableDataset):
         """Append an unbatching stage.
 
         Returns:
-            A new dataset that expands list, tuple, or dict-style batches back
-            into individual samples during iteration.
-        """
+            A new object with the unbatch stage appended."""
 
         spec = StageSpec(
             kind="unbatch",
@@ -250,8 +254,13 @@ class Dataset(TorchIterableDataset):
     def from_source(cls, source_kind: SourceKind, *args, **kwargs) -> Dataset:
         """Construct a dataset from a supported source type.
 
-        See the relevant source-specific classmethod constructors for details.
-        """
+        Args:
+            source_kind: Source backend name.
+            args: Positional arguments forwarded to the source constructor.
+            kwargs: Keyword arguments forwarded to the source constructor.
+
+        Returns:
+            A dataset configured for the requested source."""
         if source_kind == "tar":
             from ..sources.tar.dataset import TarDataset
 

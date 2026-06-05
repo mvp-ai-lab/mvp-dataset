@@ -1,3 +1,5 @@
+"""Tar dataset source configuration."""
+
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +17,8 @@ from .types import TarShuffleMode
 
 @dataclass(frozen=True, slots=True)
 class TarDataset(Dataset):
+    """Dataset configuration for tar shards."""
+
     _sidecar_specs: tuple[SidecarSpec, ...] = ()
     _shuffle_mode: TarShuffleMode = "shard_aware"
 
@@ -30,22 +34,14 @@ class TarDataset(Dataset):
         """Build a dataset from local tar shard paths.
 
         Args:
-            shards: One or more file paths, glob specs, or brace-expansion specs.
-            context: Optional execution context. If omitted, inferred from runtime.
-            resample: Whether to loop shards indefinitely across rounds.
-            sidecars: Optional sequence of ``(name, path_resolver)`` pairs for
-                shard-level sidecar merges. Each ``path_resolver`` receives a main
-                tar shard path and must return the matching sidecar tar shard path.
-            shuffle_mode: ``"shard_aware"`` shuffles shard order by round;
-                ``"none"`` reads shards in original order. ``"global"`` is not
-                supported for tar sample access.
+            shards: Input shard path or paths.
+            context: Runtime context used for sharding and deterministic randomness.
+            resample: Whether to repeat the source indefinitely across rounds.
+            sidecars: Sidecar tar specifications joined to main samples.
+            shuffle_mode: Source-level shuffle mode.
 
         Returns:
-            A dataset whose source is the normalized tar shard path list.
-
-        Raises:
-            ValueError: If any input path does not end with ``.tar``.
-        """
+            A dataset configured for the requested source."""
         runtime_context = RuntimeContext.from_runtime() if context is None else context
         if shuffle_mode == "global":
             msg = "[UnsupportedTarShuffleMode] shuffle_mode='global'"
@@ -78,6 +74,7 @@ class TarDataset(Dataset):
         )
 
     def _build_source_stream(self, *, context: RuntimeContext) -> Iterable[object]:
+        """Build the source iterator for a runtime context."""
         return _TarSourceIterator(
             shards=self._source,
             context=context,
@@ -88,6 +85,7 @@ class TarDataset(Dataset):
         )
 
     def _source_fingerprint(self) -> dict[str, object]:
+        """Return the source portion of the pipeline fingerprint."""
         return {
             "kind": "tar",
             "resample": self._resample,

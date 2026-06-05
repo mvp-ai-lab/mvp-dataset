@@ -16,6 +16,13 @@ _BATCH_SIZE_ENV_VAR: Final[str] = "MVP_DATASET_PARQUET_BATCH_SIZE"
 
 
 def resolve_parquet_batch_size(batch_size: int | None = None) -> int:
+    """Return a valid Parquet batch size.
+
+    Args:
+        batch_size: Number of samples to group into each batch.
+
+    Returns:
+        A positive Parquet batch size."""
     if batch_size is None:
         raw_value = os.environ.get(_BATCH_SIZE_ENV_VAR)
         if raw_value is None:
@@ -40,7 +47,17 @@ def iter_parquet(
     use_threads: bool = True,
     row_group_index: int | None = None,
 ) -> Iterator[Sample]:
-    """Iterate one parquet row-group fragment and yield one sample dict per row."""
+    """Iterate one parquet row-group fragment and yield one sample dict per row.
+
+    Args:
+        fragment: Parquet fragment to read.
+        columns: Column names to read from the source.
+        batch_size: Number of samples to group into each batch.
+        use_threads: Whether the reader may use threaded decoding.
+        row_group_index: Optional row group index to read within the fragment.
+
+    Returns:
+        An iterator over sample dictionaries from one Parquet fragment."""
 
     resolved_batch_size = resolve_parquet_batch_size(batch_size)
     parquet_file = pq.ParquetFile(fragment.path)
@@ -77,7 +94,16 @@ def iter_parquets(
     batch_size: int | None = None,
     use_threads: bool = True,
 ) -> Iterator[Sample]:
-    """Iterate parquet row-group fragments in order and yield row samples."""
+    """Iterate parquet row-group fragments in order and yield row samples.
+
+    Args:
+        fragments: Parquet fragments to read.
+        columns: Column names to read from the source.
+        batch_size: Number of samples to group into each batch.
+        use_threads: Whether the reader may use threaded decoding.
+
+    Returns:
+        An iterator over sample dictionaries from all fragments."""
 
     for fragment in fragments:
         yield from iter_parquet(

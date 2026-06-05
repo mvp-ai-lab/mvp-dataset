@@ -14,11 +14,19 @@ def iter_jsonls(
     shard_paths: Iterator[PathLikeStr],
     ref_fields: tuple[TarUriRefFieldSpec, ...],
 ) -> Iterator[Sample]:
-    """Resolve tar data references while streaming JSONL shard files."""
+    """Resolve tar data references while streaming JSONL shard files.
+
+    Args:
+        shard_paths: Shard paths to read.
+        ref_fields: JSONL reference field specifications to resolve from tar URIs.
+
+    Returns:
+        An iterator over JSONL sample dictionaries."""
     key_dot_level = int(os.environ.get("MVP_DATASET_TAR_KEY_DOT_LEVEL", "1"))
     max_open_tar_files = int(os.environ.get("MVP_DATASET_TAR_MAX_OPEN_FILES", "8"))
 
     def _resolve_one(sample: Sample, manager: TarManager) -> Sample:
+        """Resolve one JSONL reference field."""
         resolved = dict(sample)
         for field, base_dir in ref_fields:
             if field not in sample:
@@ -47,6 +55,7 @@ def _parse_jsonl_line(
     *,
     allow_preannotated: bool = False,
 ) -> Sample:
+    """Parse one JSONL line into a sample dictionary."""
     try:
         parsed = json.loads(line)
     except json.JSONDecodeError as exc:
@@ -67,6 +76,7 @@ def _parse_jsonl_line(
 
 
 def _has_jsonl_metadata(sample: Sample) -> bool:
+    """Return whether a sample already carries JSONL metadata."""
     return (
         isinstance(sample.get("__index_in_file__"), int)
         and isinstance(sample.get("__file__"), str)

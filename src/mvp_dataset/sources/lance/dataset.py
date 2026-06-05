@@ -1,3 +1,5 @@
+"""Lance dataset source configuration."""
+
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
@@ -16,6 +18,8 @@ from .types import LanceRefIndexScope, LanceShuffleMode
 
 @dataclass(frozen=True, slots=True)
 class LanceDataset(Dataset):
+    """Dataset configuration for Lance datasets."""
+
     _shuffle_mode: LanceShuffleMode = "none"
     _columns: tuple[str, ...] | None = None
     _batch_size: int = 1024
@@ -36,25 +40,17 @@ class LanceDataset(Dataset):
         """Build a dataset from local Lance dataset paths.
 
         Args:
-            shards: One or more Lance dataset URIs or directory paths. A single
-                    JSON file may also be provided; it must contain ``main_uri``
-                    (or ``shards``/``uri``) and optional ``ref_columns``.
-            context: Optional execution context. If omitted, inferred from runtime.
-            resample: Whether to loop shards indefinitely across rounds.
-            columns: Optional list of column names to read.
-            batch_size: Number of rows per Arrow batch during iteration.
-            shuffle_mode: One of ``"none"``, ``"global"``, or ``"fragment_aware"``.
-            ref_columns: Optional mapping of source column names to explicit Lance
-                         reference configs containing uri, key_column, and value_column.
-                         Use ``resolve_ref(...)`` later in the pipeline to read
-                         and replace these referenced values.
-            ref_index_scope: Reference-index build scope. ``node_local`` builds once
-                             per node, ``shared`` builds once on global rank 0, and
-                             ``process`` lets each process attempt to publish. Defaults
-                             to ``MVP_LANCE_REF_INDEX_SCOPE`` or ``shared``.
+            shards: Input shard path or paths.
+            context: Runtime context used for sharding and deterministic randomness.
+            resample: Whether to repeat the source indefinitely across rounds.
+            columns: Column names to read from the source.
+            batch_size: Number of samples to group into each batch.
+            shuffle_mode: Source-level shuffle mode.
+            ref_columns: Lance reference column configuration.
+            ref_index_scope: Scope that controls where Lance reference indexes are stored.
+
         Returns:
-            A lance dataset.
-        """
+            A dataset configured for the requested source."""
         if batch_size <= 0:
             msg = "[InvalidLanceBatchSize] batch_size must be a positive integer"
             raise ValueError(msg)
@@ -82,6 +78,7 @@ class LanceDataset(Dataset):
         )
 
     def _build_source_stream(self, *, context: RuntimeContext) -> Iterable[object]:
+        """Build the source iterator for a runtime context."""
         if len(self._source) != 1:
             msg = "[InvalidLanceSource] exactly one merged Lance source is required"
             raise RuntimeError(msg)
@@ -96,6 +93,7 @@ class LanceDataset(Dataset):
         )
 
     def _source_fingerprint(self) -> dict[str, object]:
+        """Return the source portion of the pipeline fingerprint."""
         source = self._source[0]
         return {
             "kind": "lance",
@@ -138,7 +136,16 @@ class LanceDataset(Dataset):
         context: RuntimeContext | None = None,
         ref_index_scope: LanceRefIndexScope | None = None,
     ) -> Dataset:
-        """Append a lazy stage that resolves configured Lance reference columns."""
+        """Append a lazy stage that resolves configured Lance reference columns.
+
+        Args:
+            ref_names: Reference column names to resolve.
+            batch_size: Number of samples to group into each batch.
+            context: Runtime context used for sharding and deterministic randomness.
+            ref_index_scope: Scope that controls where Lance reference indexes are stored.
+
+        Returns:
+            A dataset that resolves the requested Lance reference columns."""
         if batch_size <= 0:
             msg = "[InvalidLanceRefBatchSize] batch_size must be a positive integer"
             raise ValueError(msg)

@@ -14,7 +14,13 @@ from .types import LanceDatasetSpec, LanceIndexItem, LanceSourceSpec
 
 
 def list_lance_sources(dataset_uris: Sequence[PathLikeStr]) -> list[LanceSourceSpec]:
-    """Resolve Lance dataset URIs into one slot-aware source configuration."""
+    """Resolve Lance dataset URIs into one slot-aware source configuration.
+
+    Args:
+        dataset_uris: Lance dataset URIs to inspect.
+
+    Returns:
+        Lance source metadata for each dataset URI."""
 
     datasets: list[LanceDatasetSpec] = []
     row_offset = 0
@@ -48,6 +54,7 @@ def _read_batch(
     *,
     columns: Sequence[str] | None = None,
 ):
+    """Read a batch of rows from Lance datasets."""
     if not batch_indexes:
         return []
 

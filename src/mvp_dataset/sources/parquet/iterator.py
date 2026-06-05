@@ -16,6 +16,8 @@ from .types import ParquetShuffleMode
 
 @dataclass(slots=True)
 class _ParquetSourceIterator:
+    """Stateful iterator over Parquet fragments and row groups."""
+
     fragments: Sequence[ParquetFragment]
     context: RuntimeContext
     resample: bool
@@ -32,14 +34,17 @@ class _ParquetSourceIterator:
     _round_fragments_round: int | None = None
 
     def __post_init__(self) -> None:
+        """Validate dataclass configuration after initialization."""
         if not self.fragments:
             msg = f"[InsufficientItemsForSlot] items=0 total_slots={self.context.total_slots} slot={self.context.slot}"
             raise ValueError(msg)
 
     def __iter__(self):
+        """Return the iterator object."""
         return self
 
     def __next__(self) -> object:
+        """Return the next output item."""
         while True:
             fragment = self._current_fragment()
             if fragment is None:
@@ -69,6 +74,7 @@ class _ParquetSourceIterator:
             return sample
 
     def state_dict(self) -> dict[str, object]:
+        """Return the resumable state for this object."""
         return {
             "kind": "parquet",
             "shuffle_mode": self.shuffle_mode,
@@ -79,6 +85,7 @@ class _ParquetSourceIterator:
         }
 
     def load_state_dict(self, state: dict[str, object]) -> None:
+        """Restore this object from a resumable state dictionary."""
         if state.get("kind") != "parquet":
             msg = f"[InvalidResumeState] expected source kind='parquet', got={state.get('kind')!r}"
             raise ResumeStateError(msg)
@@ -137,9 +144,11 @@ class _ParquetSourceIterator:
         self._row_group_iter = None
 
     def fingerprint(self) -> str:
+        """Return a stable fingerprint for resume compatibility checks."""
         return self.source_fingerprint
 
     def _current_fragment(self) -> ParquetFragment | None:
+        """Return the currently active Parquet fragment."""
         while True:
             round_fragments = self._round_fragments(self.round_index)
             if self.fragment_index < len(round_fragments):
@@ -153,17 +162,20 @@ class _ParquetSourceIterator:
             self._row_group_iter = None
 
     def _advance_fragment(self) -> None:
+        """Advance to the next Parquet fragment."""
         self.fragment_index += 1
         self.row_group_index = 0
         self.row_in_row_group = 0
         self._row_group_iter = None
 
     def _advance_row_group(self) -> None:
+        """Advance to the next row group within the current fragment."""
         self.row_group_index += 1
         self.row_in_row_group = 0
         self._row_group_iter = None
 
     def _round_fragments(self, round_index: int) -> list[ParquetFragment]:
+        """Handle round fragments for pipeline execution."""
         if self._round_fragments_round == round_index:
             return self._round_fragments_cache
 

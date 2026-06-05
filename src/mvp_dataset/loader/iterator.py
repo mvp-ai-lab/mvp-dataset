@@ -19,6 +19,8 @@ if TYPE_CHECKING:
 
 
 class _ResumeMergeIterator:
+    """Iterator that merges resumed worker streams in deterministic order."""
+
     def __init__(
         self,
         stream: Iterable[object],
@@ -29,6 +31,7 @@ class _ResumeMergeIterator:
         pending_outputs: dict[str, list[object]],
         snapshot_event: object,
     ) -> None:
+        """Initialize the object."""
         self.stream = iter(stream)
         self.num_workers = num_workers
         self.worker_states = dict(worker_states)
@@ -40,9 +43,11 @@ class _ResumeMergeIterator:
         self.done: set[int] = set()
 
     def __iter__(self) -> _ResumeMergeIterator:
+        """Return the iterator object."""
         return self
 
     def __next__(self) -> object:
+        """Return the next output item."""
         while True:
             worker_id = self._next_worker_with_buffer()
             if worker_id is not None:
@@ -68,6 +73,7 @@ class _ResumeMergeIterator:
                 raise ResumeStateError(msg)
 
     def state_dict(self) -> dict[str, object]:
+        """Return the resumable state for this object."""
         self.snapshot_event.set()
         try:
             waiting_for = {worker_id for worker_id in range(self.num_workers) if worker_id not in self.done}
@@ -94,6 +100,7 @@ class _ResumeMergeIterator:
         }
 
     def _next_worker_with_buffer(self) -> int | None:
+        """Return the next worker id that has buffered outputs."""
         for offset in range(self.num_workers):
             worker_id = (self.next_worker + offset) % self.num_workers
             if self.buffers[worker_id]:
@@ -104,6 +111,7 @@ class _ResumeMergeIterator:
         return None
 
     def _advance_worker(self, worker_id: int) -> int:
+        """Read one control item from a worker stream."""
         for offset in range(1, self.num_workers + 1):
             candidate = (worker_id + offset) % self.num_workers
             if self.buffers[candidate] or candidate not in self.done:
@@ -112,7 +120,10 @@ class _ResumeMergeIterator:
 
 
 class _TorchLoaderIterator:
+    """Materialized iterator for one TorchLoader execution."""
+
     def __init__(self, loader: TorchLoader) -> None:
+        """Initialize the object."""
         self.loader = loader
         self.num_yielded = 0
         worker_states, next_worker, pending_outputs, stage_states = self._load_resume_state(loader._resume_state)
@@ -146,14 +157,17 @@ class _TorchLoaderIterator:
         self.stream = iter(stream)
 
     def __iter__(self) -> _TorchLoaderIterator:
+        """Return the iterator object."""
         return self
 
     def __next__(self) -> object:
+        """Return the next output item."""
         item = next(self.stream)
         self.num_yielded += 1
         return item
 
     def state_dict(self) -> dict[str, object]:
+        """Return the resumable state for this object."""
         merge_state = self.merge_stream.state_dict()
         return {
             "version": RESUME_STATE_VERSION,
@@ -167,6 +181,7 @@ class _TorchLoaderIterator:
         self,
         state: dict[str, object] | None,
     ) -> tuple[dict[str, dict[str, object]], int, dict[str, list[object]], list[object] | None]:
+        """Validate and load pending resume state."""
         if state is None:
             return {}, 0, {}, None
         self.loader._validate_resume_state(state)
@@ -225,6 +240,7 @@ class _TorchLoaderIterator:
         return worker_states, next_worker, parsed_pending, stages
 
     def _stage_state_dicts(self) -> list[dict[str, object]]:
+        """Collect resumable state from loader-side stages."""
         stage_states: list[dict[str, object]] = []
         for index, (stage_factory, stage) in enumerate(zip(self.loader._stages, self.stages, strict=True)):
             if not isinstance(stage, StatefulStage):
@@ -240,6 +256,7 @@ class _TorchLoaderIterator:
         return stage_states
 
     def _load_stage_resume_state(self, stages: list[object]) -> None:
+        """Load resumable state into materialized stages."""
         for index, (stage_factory, stage, stage_state) in enumerate(
             zip(self.loader._stages, self.stages, stages, strict=True)
         ):

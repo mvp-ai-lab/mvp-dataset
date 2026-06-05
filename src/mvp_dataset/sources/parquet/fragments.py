@@ -36,11 +36,13 @@ def list_parquet_fragments(
 ) -> list[ParquetFragment]:
     """Expand parquet files into schedulable row-group fragments.
 
-    Consecutive row groups are merged until each fragment contains at least
-    *min_row_groups_per_fragment* row groups. When the resulting fragment count
-    is below *min_fragments*, the threshold is lowered to 1 so that every row
-    group becomes its own fragment.
-    """
+    Args:
+        shard_paths: Shard paths to read.
+        min_row_groups_per_fragment: Minimum row groups combined into one Parquet fragment.
+        min_fragments: Minimum number of fragments to produce.
+
+    Returns:
+        Parquet fragments collected from the input shards."""
     min_row_groups_per_fragment = _validate_min_row_groups_per_fragment(min_row_groups_per_fragment)
     fragments = _collect_parquet_fragments(shard_paths, min_row_groups_per_fragment)
     if len(fragments) < min_fragments:
@@ -49,6 +51,7 @@ def list_parquet_fragments(
 
 
 def _validate_min_row_groups_per_fragment(value: int) -> int:
+    """Validate Parquet row-group fragmentation settings."""
     if value <= 0:
         msg = f"[InvalidParquetFragmentConfig] min_row_groups_per_fragment must be >= 1, got {value}"
         raise ValueError(msg)
@@ -59,6 +62,7 @@ def _collect_parquet_fragments(
     shard_paths: Sequence[PathLikeStr],
     min_row_groups_per_fragment: int,
 ) -> list[ParquetFragment]:
+    """Collect Parquet fragments for all shards."""
     shards = [str(shard_path) for shard_path in shard_paths]
     if not shards:
         return []
@@ -81,6 +85,7 @@ def _collect_parquet_fragments(
 
 
 def _metadata_num_workers(num_shards: int) -> int:
+    """Return the worker count used for Parquet metadata reads."""
     return min(num_shards, max(1, min(_MAX_METADATA_WORKERS, os.cpu_count() or 1)))
 
 
@@ -88,6 +93,7 @@ def _collect_parquet_fragments_for_shard(
     shard: str,
     min_row_groups_per_fragment: int,
 ) -> list[ParquetFragment]:
+    """Collect Parquet fragments for one shard."""
     metadata = pq.read_metadata(shard)
     fragments: list[ParquetFragment] = []
     row_offset = 0

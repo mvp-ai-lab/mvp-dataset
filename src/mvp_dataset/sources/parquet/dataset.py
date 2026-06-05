@@ -1,3 +1,5 @@
+"""Parquet dataset source configuration."""
+
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
@@ -15,6 +17,8 @@ from .types import ParquetShuffleMode
 
 @dataclass(frozen=True, slots=True)
 class ParquetDataset(Dataset):
+    """Dataset configuration for Parquet shards."""
+
     _columns: tuple[str, ...] | None = None
     _use_threads: bool = True
     _shuffle_mode: ParquetShuffleMode = "fragment_aware"
@@ -33,28 +37,16 @@ class ParquetDataset(Dataset):
         """Build a dataset from local Parquet file paths.
 
         Args:
-            shards: One or more file paths, glob specs, or brace-expansion specs.
-            context: Optional execution context. If omitted, inferred from runtime.
-            resample: Whether to loop shards indefinitely across rounds.
-            min_row_groups_per_fragment: Minimum number of consecutive parquet
-                row groups to merge into one schedulable fragment. Defaults to
-                ``1``, which creates one fragment per row group unless
-                ``min_fragments`` fallback logic re-splits the source.
-            columns: Optional list of column names to read.
-            use_threads: Whether to use multi-threaded Arrow reads.
-            shuffle_mode: ``"fragment_aware"`` shuffles fragments by round,
-                ``"none"`` reads fragments in original order. ``"global"`` is
-                not supported for Parquet row access.
-
-        Arrow record batch size is controlled via the
-        ``MVP_DATASET_PARQUET_BATCH_SIZE`` environment variable.
+            shards: Input shard path or paths.
+            context: Runtime context used for sharding and deterministic randomness.
+            resample: Whether to repeat the source indefinitely across rounds.
+            min_row_groups_per_fragment: Minimum row groups combined into one Parquet fragment.
+            columns: Column names to read from the source.
+            use_threads: Whether the reader may use threaded decoding.
+            shuffle_mode: Source-level shuffle mode.
 
         Returns:
-            A dataset whose source is the list of parquet fragments.
-
-        Raises:
-            ValueError: If any input path does not end with ``.parquet``.
-        """
+            A dataset configured for the requested source."""
         runtime_context = RuntimeContext.from_runtime() if context is None else context
         if shuffle_mode == "global":
             msg = "[UnsupportedParquetShuffleMode] shuffle_mode='global'"
@@ -85,6 +77,7 @@ class ParquetDataset(Dataset):
         )
 
     def _build_source_stream(self, *, context: RuntimeContext) -> Iterable[object]:
+        """Build the source iterator for a runtime context."""
         return _ParquetSourceIterator(
             fragments=self._source,
             context=context,
@@ -96,6 +89,7 @@ class ParquetDataset(Dataset):
         )
 
     def _source_fingerprint(self) -> dict[str, object]:
+        """Return the source portion of the pipeline fingerprint."""
         return {
             "kind": "parquet",
             "resample": self._resample,

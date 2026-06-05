@@ -31,6 +31,7 @@ REF_INDEX_WAIT_TIMEOUT_SECONDS = 30 * 60
 
 
 def _iter_ref_keys(value: Any) -> tuple[Any, ...]:
+    """Yield reference keys from source rows."""
     if value is None:
         return ()
     if isinstance(value, np.ndarray):
@@ -41,6 +42,7 @@ def _iter_ref_keys(value: Any) -> tuple[Any, ...]:
 
 
 def _dataset_manifest_fingerprint(uri: str) -> dict[str, Any]:
+    """Return a fingerprint for a Lance dataset manifest."""
     dataset = lance.dataset(uri)
     version = getattr(dataset, "version", None)
     if callable(version):
@@ -69,10 +71,12 @@ def _dataset_manifest_fingerprint(uri: str) -> dict[str, Any]:
 
 
 def _ref_uris(ref: LanceRefSpec) -> tuple[str, ...]:
+    """Return referenced Lance URIs for one reference field."""
     return (ref.uri,) if isinstance(ref.uri, str) else ref.uri
 
 
 def _ref_manifest_fingerprint(ref: LanceRefSpec) -> dict[str, Any]:
+    """Return a fingerprint for reference source manifests."""
     uris = _ref_uris(ref)
     if len(uris) == 1:
         return _dataset_manifest_fingerprint(uris[0])
@@ -85,6 +89,7 @@ def _ref_manifest_fingerprint(ref: LanceRefSpec) -> dict[str, Any]:
 
 
 def _open_ref_value_source(ref: LanceRefSpec) -> LanceSourceSpec:
+    """Open the value source for a Lance reference field."""
     source = list_lance_sources(_ref_uris(ref))[0]
     for dataset_i, dataset in enumerate(source.datasets):
         ds_handle: object = lance.dataset(dataset.uri)
@@ -105,6 +110,7 @@ def _ref_index_is_valid(
     ref_files: dict[str, dict[str, Any]],
     active_refs: Sequence[LanceRefSpec],
 ) -> bool:
+    """Return whether an existing reference index matches the manifest."""
     manifest_path = index_dir / REF_INDEX_MANIFEST
     if not index_dir.exists() or not manifest_path.exists():
         return False
@@ -126,6 +132,7 @@ def _acquire_ref_index_build_lock(
     ref_files: dict[str, dict[str, Any]],
     active_refs: Sequence[LanceRefSpec],
 ) -> bool:
+    """Try to acquire the file lock for building a reference index."""
     lock_dir.parent.mkdir(parents=True, exist_ok=True)
     while True:
         if _ref_index_is_valid(index_dir, manifest, ref_files, active_refs):
@@ -142,6 +149,7 @@ def _acquire_ref_index_build_lock(
 
 
 def _resolve_ref_index_scope(scope: LanceRefIndexScope | None) -> LanceRefIndexScope:
+    """Resolve where a reference index should be stored."""
     raw_scope = scope or os.environ.get("MVP_LANCE_REF_INDEX_SCOPE", "shared")
     if raw_scope not in ("shared", "node_local", "process"):
         msg = f"[InvalidLanceRefIndexScope] expected shared, node_local, or process, got {raw_scope!r}"
@@ -150,6 +158,7 @@ def _resolve_ref_index_scope(scope: LanceRefIndexScope | None) -> LanceRefIndexS
 
 
 def _is_ref_index_builder(context: RuntimeContext | None, scope: LanceRefIndexScope) -> bool:
+    """Return whether this worker should build the reference index."""
     if context is None or scope == "process":
         return True
     if scope == "shared":
@@ -168,6 +177,7 @@ def _wait_for_ref_index(
     *,
     timeout_seconds: float = REF_INDEX_WAIT_TIMEOUT_SECONDS,
 ) -> None:
+    """Wait for a reference index built by another worker."""
     deadline = time.monotonic() + timeout_seconds
     poll_seconds = REF_INDEX_LOCK_POLL_SECONDS
     while not _ref_index_is_valid(index_dir, manifest, ref_files, active_refs):
@@ -179,6 +189,7 @@ def _wait_for_ref_index(
 
 
 def _publish_ref_index(tmp_index_dir: Path, index_dir: Path) -> None:
+    """Publish reference index files atomically."""
     try:
         tmp_index_dir.replace(index_dir)
     except FileExistsError:
@@ -195,6 +206,7 @@ def _build_ref_index(
     active_refs: Sequence[LanceRefSpec],
     source: LanceSourceSpec,
 ) -> None:
+    """Build a lookup index for one Lance reference field."""
     manifest_path = index_dir / REF_INDEX_MANIFEST
     index_dir.mkdir(parents=True, exist_ok=False)
 
@@ -274,6 +286,16 @@ def prepare_ref_indexes(
     context: RuntimeContext | None = None,
     ref_index_scope: LanceRefIndexScope | None = None,
 ) -> LanceSourceSpec:
+    """Ensure all configured Lance reference indexes are available.
+
+    Args:
+        source: Lance source specification.
+        columns: Column names to read from the source.
+        context: Runtime context used for sharding and deterministic randomness.
+        ref_index_scope: Scope that controls where Lance reference indexes are stored.
+
+    Returns:
+        A Lance source specification whose reference indexes are ready."""
     if not source.ref_columns:
         return source
 

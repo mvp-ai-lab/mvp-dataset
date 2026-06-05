@@ -20,6 +20,8 @@ from .types import JsonlShuffleMode
 
 @dataclass(slots=True)
 class _JsonlSourceIterator:
+    """Stateful iterator over JSONL shards."""
+
     shards: Sequence[str]
     context: RuntimeContext
     resample: bool
@@ -37,6 +39,7 @@ class _JsonlSourceIterator:
     _round_shards_round: int | None = None
 
     def __post_init__(self) -> None:
+        """Validate dataclass configuration after initialization."""
         if not self.shards:
             msg = f"[InsufficientItemsForSlot] items=0 total_slots={self.context.total_slots} slot={self.context.slot}"
             raise ValueError(msg)
@@ -45,9 +48,11 @@ class _JsonlSourceIterator:
             self._tar_manager = TarManager(max_open_files=max_open_tar_files)
 
     def __iter__(self):
+        """Return the iterator object."""
         return self
 
     def __next__(self) -> object:
+        """Return the next output item."""
         while True:
             shard = self._current_shard_path()
             if shard is None:
@@ -71,9 +76,11 @@ class _JsonlSourceIterator:
             return sample
 
     def __del__(self) -> None:
+        """Release open resources when the iterator is garbage-collected."""
         self._close()
 
     def state_dict(self) -> dict[str, object]:
+        """Return the resumable state for this object."""
         return {
             "kind": "jsonl",
             "shuffle_mode": self.shuffle_mode,
@@ -84,6 +91,7 @@ class _JsonlSourceIterator:
         }
 
     def load_state_dict(self, state: dict[str, object]) -> None:
+        """Restore this object from a resumable state dictionary."""
         if state.get("kind") != "jsonl":
             msg = f"[InvalidResumeState] expected source kind='jsonl', got={state.get('kind')!r}"
             raise ResumeStateError(msg)
@@ -134,9 +142,11 @@ class _JsonlSourceIterator:
         self._close_handle()
 
     def fingerprint(self) -> str:
+        """Return a stable fingerprint for resume compatibility checks."""
         return self.source_fingerprint
 
     def _current_shard_path(self) -> str | None:
+        """Return the path for the currently active shard."""
         while True:
             round_shards = self._round_shards(self.round_index)
             if self.shard_index < len(round_shards):
@@ -150,6 +160,7 @@ class _JsonlSourceIterator:
             self._close_handle()
 
     def _round_shards(self, round_index: int) -> list[str]:
+        """Return the shard order for one resampling round."""
         if self._round_shards_round == round_index:
             return self._round_shards_cache
 
@@ -169,18 +180,21 @@ class _JsonlSourceIterator:
         return self._round_shards_cache
 
     def _open_shard(self, shard: str) -> None:
+        """Open the current shard for reading."""
         self._close_handle()
         self._handle = open(shard, "rb")
         self._handle.seek(self.byte_offset)
         self._current_shard = shard
 
     def _advance_shard(self) -> None:
+        """Advance the iterator to the next shard."""
         self.shard_index += 1
         self.byte_offset = 0
         self.line_index = 0
         self._close_handle()
 
     def _resolve_refs(self, sample: dict[str, object]) -> dict[str, object]:
+        """Resolve external references for one sample."""
         if not self.ref_fields:
             return sample
         if self._tar_manager is None:
@@ -200,12 +214,14 @@ class _JsonlSourceIterator:
         return resolved
 
     def _close_handle(self) -> None:
+        """Close the current file handle if one is open."""
         if self._handle is not None:
             self._handle.close()
             self._handle = None
             self._current_shard = None
 
     def _close(self) -> None:
+        """Close all resources owned by the iterator."""
         self._close_handle()
         if self._tar_manager is not None:
             self._tar_manager.close()

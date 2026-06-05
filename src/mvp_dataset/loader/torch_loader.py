@@ -167,24 +167,29 @@ class TorchLoader:
         return DataLoader(**kwargs)
 
     def _state_worker_count(self) -> int:
+        """Return the number of worker states expected for resume."""
         return max(1, self._num_workers)
 
     def _multiprocessing_event(self) -> object:
+        """Create an event using the loader multiprocessing context."""
         if self._multiprocessing_context is None:
             return mp.Event()
         return mp.get_context(self._multiprocessing_context).Event()
 
     def _check_resume_supported(self) -> None:
+        """Reject resume for unsupported loader configurations."""
         for index, stage in enumerate(self._stages):
             if not hasattr(stage, "kind") or not hasattr(stage, "fingerprint"):
                 msg = f"[UnsupportedResume] loader stage index={index} is not resumable"
                 raise UnsupportedResume(msg)
 
     def _stages_fingerprint(self) -> list[str]:
+        """Return the stage portion of the loader fingerprint."""
         self._check_resume_supported()
         return [stage.fingerprint() for stage in self._stages]
 
     def _loader_fingerprint(self) -> str:
+        """Return a fingerprint for DataLoader-layer configuration."""
         payload = {
             "num_workers": self._num_workers,
             "batch_size": self._batch_size,
@@ -200,7 +205,10 @@ class TorchLoader:
         return stable_fingerprint(payload)
 
     def state_dict(self) -> dict[str, object]:
-        """Return the initial resumable state without starting workers."""
+        """Return the initial resumable state without starting workers.
+
+        Returns:
+            A dictionary that can be passed to load_state_dict()."""
         warnings.warn(
             "TorchLoader.state_dict() creates a fresh initial loader state. "
             "Use iterator.state_dict() to checkpoint an in-progress iteration.",
@@ -218,6 +226,7 @@ class TorchLoader:
         }
 
     def _initial_stage_states(self) -> list[dict[str, object]]:
+        """Return initial empty states for loader-side stages."""
         stream: Iterable[object] = iter(())
         stage_states: list[dict[str, object]] = []
         for index, stage_factory in enumerate(self._stages):
@@ -236,6 +245,7 @@ class TorchLoader:
         return stage_states
 
     def _validate_resume_state(self, state: dict[str, object]) -> None:
+        """Validate loader resume state and configuration fingerprints."""
         self._check_resume_supported()
         if not isinstance(state, dict):
             msg = "[InvalidResumeState] state must be a dict"
@@ -260,7 +270,13 @@ class TorchLoader:
             raise ResumeStateError(msg)
 
     def load_state_dict(self, state: dict[str, object]) -> TorchLoader:
-        """Return a loader with validated resume state attached."""
+        """Return a loader with validated resume state attached.
+
+        Args:
+            state: Resume state dictionary to validate and load.
+
+        Returns:
+            None."""
         self._validate_resume_state(state)
         warnings.warn(
             "TorchLoader.load_state_dict() stores pending resume state. "
@@ -299,13 +315,8 @@ class TorchLoader:
     def unbatch(self) -> TorchLoader:
         """Append an unbatch stage at loader side (after worker merge).
 
-        This stage is typically used with worker micro-batches to reduce IPC overhead
-        while keeping downstream sample-level transforms unchanged.
-
         Returns:
-            A new loader that expands merged batches back into samples before
-            any later loader-side stages run.
-        """
+            A new object with the unbatch stage appended."""
         return self._append_stage(_LoaderUnbatchStage())
 
     def shuffle(
@@ -317,15 +328,12 @@ class TorchLoader:
         """Append a global (post-merge) sample-level shuffle stage.
 
         Args:
-            buffer_size: Maximum number of samples held in the shuffle buffer.
-            initial: Minimum buffered sample count before yielding values.
-            seed: Optional explicit shuffle seed. When omitted, a deterministic
-                seed is derived from the upstream dataset context.
+            buffer_size: Maximum number of items kept in the shuffle buffer.
+            initial: Minimum buffered item count before shuffle starts yielding.
+            seed: Base random seed.
 
         Returns:
-            A new loader that performs bounded-memory global shuffling after
-            worker output has been merged.
-        """
+            A new object with the shuffle stage appended."""
         resolved_seed = self._default_shuffle_seed() if seed is None else seed
         return self._append_stage(
             _LoaderShuffleStage(
@@ -344,15 +352,11 @@ class TorchLoader:
         """Append a global (post-merge) assembly stage.
 
         Args:
-            factory: Callable that builds one fresh assembler for each loader
-                iteration using the runtime-resolved context.
-            drop_last: Whether to discard unfinished tail state instead of
-                delegating it to the assembler's final flush.
+            factory: Callable that builds a fresh assembler for the runtime context.
+            drop_last: Whether to discard the final incomplete batch.
 
         Returns:
-            A new loader that assembles the merged sample stream in the main
-            process.
-        """
+            A new object with the assemble stage appended."""
         base_context = getattr(self._dataset, "context", None)
         return self._append_stage(
             _LoaderAssembleStage(
@@ -371,15 +375,12 @@ class TorchLoader:
         """Append a batch stage at loader side.
 
         Args:
-            batch_size: Number of post-merge samples per yielded batch.
-            drop_last: Whether to drop the final incomplete batch.
-            collate_fn: Optional callable that converts each list of samples into
-                a user-defined batch object.
+            batch_size: Number of samples to group into each batch.
+            drop_last: Whether to discard the final incomplete batch.
+            collate_fn: Optional callable used to convert a list of samples into one batch.
 
         Returns:
-            A new loader that batches the merged sample stream in the main
-            process.
-        """
+            A new object with the batch stage appended."""
         return self._append_stage(
             _LoaderBatchStage(
                 batch_size=batch_size,

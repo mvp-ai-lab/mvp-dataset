@@ -22,6 +22,7 @@ class DatasetIterator:
     """Materialized iterator for one Dataset pipeline execution."""
 
     def __init__(self, dataset: Dataset):
+        """Initialize the object."""
         self.dataset = dataset
         self.context = RuntimeContext.from_runtime(base=dataset.context)
         self.num_yielded = 0
@@ -45,14 +46,20 @@ class DatasetIterator:
         self.stream = iter(stream)
 
     def __iter__(self) -> DatasetIterator:
+        """Return the iterator object."""
         return self
 
     def __next__(self) -> object:
+        """Return the next output item."""
         item = next(self.stream)
         self.num_yielded += 1
         return item
 
     def state_dict(self) -> dict[str, object]:
+        """Return the resumable state for this object.
+
+        Returns:
+            A dictionary that can be passed to load_state_dict()."""
         stage_states: list[dict[str, object]] = []
         for index, (spec, stage) in enumerate(zip(self.dataset._stages, self.stages, strict=True)):
             if not isinstance(stage, StatefulStage):
@@ -80,6 +87,7 @@ class DatasetIterator:
         }
 
     def _load_resume_state(self, state: dict[str, object] | None) -> list[object] | None:
+        """Validate and load pending resume state."""
         if state is None:
             return None
 
@@ -111,6 +119,7 @@ class DatasetIterator:
         return stages
 
     def _load_stage_resume_state(self, stages: list[object]) -> None:
+        """Load resumable state into materialized stages."""
         for index, (spec, stage, stage_state) in enumerate(zip(self.dataset._stages, self.stages, stages, strict=True)):
             if not isinstance(stage_state, dict):
                 msg = "[InvalidResumeState] stage must be a dict"

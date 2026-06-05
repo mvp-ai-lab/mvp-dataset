@@ -10,16 +10,48 @@ class LoggerLike(Protocol):
     """Minimal logger interface accepted by the package."""
 
     def debug(self, msg: object, *args: object, **kwargs: object) -> object:
-        """Log a debug-level message."""
+        """Log a debug message.
+
+        Args:
+            msg: Message object passed to the logger.
+            args: Positional arguments forwarded to the source constructor.
+            kwargs: Keyword arguments forwarded to the source constructor.
+
+        Returns:
+            The result of the operation."""
 
     def info(self, msg: object, *args: object, **kwargs: object) -> object:
-        """Log an info-level message."""
+        """Log an info message.
+
+        Args:
+            msg: Message object passed to the logger.
+            args: Positional arguments forwarded to the source constructor.
+            kwargs: Keyword arguments forwarded to the source constructor.
+
+        Returns:
+            The result of the operation."""
 
     def warning(self, msg: object, *args: object, **kwargs: object) -> object:
-        """Log a warning-level message."""
+        """Log a warning message.
+
+        Args:
+            msg: Message object passed to the logger.
+            args: Positional arguments forwarded to the source constructor.
+            kwargs: Keyword arguments forwarded to the source constructor.
+
+        Returns:
+            The result of the operation."""
 
     def error(self, msg: object, *args: object, **kwargs: object) -> object:
-        """Log an error-level message."""
+        """Log an error message.
+
+        Args:
+            msg: Message object passed to the logger.
+            args: Positional arguments forwarded to the source constructor.
+            kwargs: Keyword arguments forwarded to the source constructor.
+
+        Returns:
+            The result of the operation."""
 
 
 _LOGGER_NAME = "mvp_dataset"
@@ -44,9 +76,11 @@ class _InjectedLoggerAdapter:
     """Normalize injected loggers to the stdlib logging call shape."""
 
     def __init__(self, logger: LoggerLike) -> None:
+        """Initialize the object."""
         self._logger = logger
 
     def _call(self, level: str, msg: object, *args: object, **kwargs: object) -> object:
+        """Forward a log record to the wrapped logger function."""
         method = getattr(self._logger, level)
         rendered = _format_message(msg, args)
         if kwargs:
@@ -108,12 +142,13 @@ def _default_logger() -> logging.Logger:
 
 
 def set_log_level(level: int | str) -> None:
-    """Set the log level used by the package default logger.
+    """Set the package log level.
 
-    This only affects the built-in ``mvp_dataset`` logger returned by
-    :func:`get_logger` when no custom logger has been injected with
-    :func:`set_logger`.
-    """
+    Args:
+        level: Log level name or numeric value.
+
+    Returns:
+        None."""
     global _default_log_level
 
     _default_log_level = _resolve_log_level(level)
@@ -121,17 +156,29 @@ def set_log_level(level: int | str) -> None:
 
 
 def get_log_level() -> int:
-    """Return the current log level of the package default logger."""
+    """Return the active package log level.
+
+    Returns:
+        The active numeric log level."""
     return _default_logger().getEffectiveLevel()
 
 
 def reset_log_level() -> None:
-    """Restore the package default logger level to ``INFO``."""
+    """Restore the default package log level.
+
+    Returns:
+        None."""
     set_log_level(_DEFAULT_LOG_LEVEL)
 
 
 def set_logger(logger: LoggerLike) -> None:
-    """Install a process-global logger used by package subsystems."""
+    """Replace the package logger.
+
+    Args:
+        logger: Logger-like object that receives log messages.
+
+    Returns:
+        None."""
     global _injected_logger
     if isinstance(logger, _InjectedLoggerAdapter):
         _injected_logger = logger
@@ -140,13 +187,19 @@ def set_logger(logger: LoggerLike) -> None:
 
 
 def reset_logger() -> None:
-    """Clear the injected logger and fall back to the package default logger."""
+    """Restore the default package logger.
+
+    Returns:
+        None."""
     global _injected_logger
     _injected_logger = None
 
 
 def get_logger() -> LoggerLike:
-    """Return the injected logger, or the package default logger."""
+    """Return the active package logger.
+
+    Returns:
+        The active logger-like object."""
     if _injected_logger is not None:
         return _injected_logger
     return _default_logger()

@@ -10,6 +10,7 @@ from mvp_dataset.core.types import SidecarSpec
 
 
 def _sidecar_fingerprint(sidecars: tuple[SidecarSpec, ...], shards: Sequence[str]) -> list[dict[str, object]]:
+    """Return a fingerprint for tar sidecar metadata files."""
     return [
         {
             "name": name,

@@ -30,7 +30,15 @@ def parse_tar_uri(
     base_dir: PathLikeStr,
     key_dot_level: int = 1,
 ) -> TarUriRef:
-    """Parse URI with grammar ``tar://<shard>#<key>.<field>`` or ``<shard>#<key>.<field>``."""
+    """Parse URI with grammar ``tar://<shard>#<key>.<field>`` or ``<shard>#<key>.<field>``.
+
+    Args:
+        uri: The uri argument.
+        base_dir: Base directory used to resolve relative tar paths.
+        key_dot_level: Number of dot-separated suffix components removed from tar member keys.
+
+    Returns:
+        A parsed tar URI reference."""
 
     body = uri[len(_TAR_URI_PREFIX) :] if uri.startswith(_TAR_URI_PREFIX) else uri
     if "#" not in body:
@@ -71,7 +79,14 @@ def parse_tar_uri(
 
 
 def iter_ref_field_uris(value: object, *, field: str) -> Iterator[str]:
-    """Yield one-or-many tar reference URIs from a JSONL field value."""
+    """Yield one-or-many tar reference URIs from a JSONL field value.
+
+    Args:
+        value: Reference value to inspect or resolve.
+        field: Reference field name.
+
+    Returns:
+        An iterator over tar URI strings found in the value."""
 
     if isinstance(value, str):
         yield value
@@ -98,7 +113,17 @@ def resolve_ref_field_value(
     key_dot_level: int,
     manager: TarManager,
 ) -> object:
-    """Resolve one JSONL reference field to bytes or a list of bytes."""
+    """Resolve one JSONL reference field to bytes or a list of bytes.
+
+    Args:
+        value: Reference value to inspect or resolve.
+        field: Reference field name.
+        base_dir: Base directory used to resolve relative tar paths.
+        key_dot_level: Number of dot-separated suffix components removed from tar member keys.
+        manager: Tar manager used to read referenced entries.
+
+    Returns:
+        The value with tar URI references replaced by bytes."""
 
     if isinstance(value, str):
         try:
@@ -124,6 +149,7 @@ class TarManager:
     """LRU reader for tar-referenced field payloads."""
 
     def __init__(self, max_open_files: int = 8) -> None:
+        """Initialize the object."""
         if max_open_files < 1:
             msg = f"[InvalidTarManagerSize] max_open_files must be >= 1, got={max_open_files}"
             raise ValueError(msg)
@@ -131,6 +157,7 @@ class TarManager:
         self._max_open_files = max_open_files
 
     def __enter__(self) -> TarManager:
+        """Enter the context manager and return this object."""
         return self
 
     def __exit__(
@@ -139,9 +166,14 @@ class TarManager:
         _exc: BaseException | None,
         _tb: TracebackType | None,
     ) -> None:
+        """Close resources when leaving the context manager."""
         self.close()
 
     def close(self) -> None:
+        """Close owned resources.
+
+        Returns:
+            None."""
         for tf, _member_index in self._entries.values():
             try:
                 tf.close()
@@ -153,6 +185,7 @@ class TarManager:
         self,
         shard_path: str,
     ) -> tuple[tarfile.TarFile, dict[str, tarfile.TarInfo]]:
+        """Return one tar member payload by name."""
         if shard_path in self._entries:
             self._entries.move_to_end(shard_path)
             return self._entries[shard_path]
@@ -172,7 +205,13 @@ class TarManager:
         return entry
 
     def read(self, tar_ref: TarUriRef) -> bytes:
-        """Read and return the raw bytes payload described by *tar_ref*."""
+        """Read and return the raw bytes payload described by *tar_ref*.
+
+        Args:
+            tar_ref: Parsed tar URI reference to read.
+
+        Returns:
+            Raw bytes for the referenced tar entry."""
 
         member_name = f"{tar_ref.key}.{tar_ref.field}"
         tf, member_index = self._get_tar_entry(tar_ref.shard_path)

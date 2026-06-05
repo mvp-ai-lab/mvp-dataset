@@ -15,6 +15,8 @@ from .types import LanceIndexItem, LanceShuffleMode, LanceSourceSpec
 
 @dataclass(slots=True)
 class _LanceSourceIterator:
+    """Stateful iterator over Lance rows with deterministic shuffling."""
+
     source: LanceSourceSpec
     context: RuntimeContext
     resample: bool
@@ -30,14 +32,17 @@ class _LanceSourceIterator:
     _index_order_round: int | None = None
 
     def __post_init__(self) -> None:
+        """Validate dataclass configuration after initialization."""
         if self.batch_size <= 0:
             msg = "[InvalidLanceBatchSize] batch_size must be a positive integer"
             raise ValueError(msg)
 
     def __iter__(self):
+        """Return the iterator object."""
         return self
 
     def __next__(self) -> object:
+        """Return the next output item."""
         if not self._pending_samples:
             self._fill_pending()
         if not self._pending_samples:
@@ -48,6 +53,7 @@ class _LanceSourceIterator:
         return sample
 
     def state_dict(self) -> dict[str, object]:
+        """Return the resumable state for this object."""
         return {
             "kind": "lance",
             "shuffle_mode": self.shuffle_mode,
@@ -56,6 +62,7 @@ class _LanceSourceIterator:
         }
 
     def load_state_dict(self, state: dict[str, object]) -> None:
+        """Restore this object from a resumable state dictionary."""
         if state.get("kind") != "lance":
             msg = f"[InvalidResumeState] expected source kind='lance', got={state.get('kind')!r}"
             raise ResumeStateError(msg)
@@ -85,9 +92,11 @@ class _LanceSourceIterator:
         self._pending_positions.clear()
 
     def fingerprint(self) -> str:
+        """Return a stable fingerprint for resume compatibility checks."""
         return self.source_fingerprint
 
     def _fill_pending(self) -> None:
+        """Fill the pending sample buffer from Lance rows."""
         batch_indexes: list[LanceIndexItem] = []
         batch_positions: list[tuple[int, int]] = []
         round_index = self.round_index
@@ -113,10 +122,12 @@ class _LanceSourceIterator:
         self._pending_positions.extend(batch_positions)
 
     def _round_size(self, round_index: int) -> int:
+        """Return the number of source items in one Lance round."""
         fragment_order = self._index_order_for_round(round_index) if self.shuffle_mode == "fragment_aware" else []
         return lance_round_size(self.source, self.context, self.shuffle_mode, fragment_order)
 
     def _index_item_at(self, round_index: int, position_in_round: int) -> LanceIndexItem:
+        """Return the physical Lance row location for a logical position."""
         fragment_order = self._index_order_for_round(round_index) if self.shuffle_mode == "fragment_aware" else []
         return lance_index_at(
             self.source,
@@ -128,6 +139,7 @@ class _LanceSourceIterator:
         )
 
     def _index_order_for_round(self, round_index: int) -> list[LanceIndexItem]:
+        """Return the deterministic fragment-aware order for one round."""
         if self._index_order_round == round_index:
             return self._index_order
 

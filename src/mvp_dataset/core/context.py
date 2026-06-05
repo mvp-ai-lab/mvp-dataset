@@ -65,6 +65,7 @@ class RuntimeContext:
     mesh: DataLoadMesh | None = None
 
     def __post_init__(self) -> None:
+        """Validate dataclass configuration after initialization."""
         if self.world_size <= 0:
             msg = f"world_size must be > 0, got {self.world_size}"
             raise ValueError(msg)
@@ -91,6 +92,7 @@ class RuntimeContext:
             raise ValueError(msg)
 
     def __hash__(self) -> int:
+        """Return a stable hash for this immutable value."""
         # Exclude mesh: DeviceMesh objects may not be hashable and the numeric
         # fields already uniquely identify the context for caching purposes.
         return hash(
@@ -112,10 +114,8 @@ class RuntimeContext:
     def slot(self) -> int:
         """Return the global worker slot used for data parallel sharding.
 
-        When a :class:`DataLoadMesh` is set, the slot is computed from the
-        mesh's ``dp_rank`` so that model-parallel co-members share the same slot
-        and therefore receive the same shards.
-        """
+        Returns:
+            The result of the operation."""
 
         dp_rank = self.mesh.dp_rank if self.mesh is not None else self.rank
         return dp_rank * self.num_workers + self.worker_id
@@ -124,21 +124,26 @@ class RuntimeContext:
     def total_slots(self) -> int:
         """Return the total number of global slots across all nodes/workers.
 
-        When a :class:`DataLoadMesh` is set, uses the mesh's ``dp_size`` instead
-        of the global ``world_size``.
-        """
+        Returns:
+            The result of the operation."""
 
         dp_size = self.mesh.dp_size if self.mesh is not None else self.world_size
         return dp_size * self.num_workers
 
     @property
     def sample_shuffle_seed(self) -> int:
-        """Return the deterministic seed for sample-level shuffle."""
+        """Return the deterministic seed for sample-level shuffle.
+
+        Returns:
+            The result of the operation."""
 
         return self.seed + self.slot
 
     def fingerprint(self) -> str:
-        """Return a stable fingerprint for this explicit runtime context."""
+        """Return a stable fingerprint for this explicit runtime context.
+
+        Returns:
+            A stable fingerprint string."""
 
         payload = {
             "rank": self.rank,
@@ -170,26 +175,17 @@ class RuntimeContext:
     ) -> RuntimeContext:
         """Build a context from runtime sources (torch > env > defaults).
 
-        When *base* is provided, ``seed``, ``epoch``, and ``mesh`` are
-        inherited from it unless explicitly overridden.  This replaces the
-        former ``resolve_current_process`` pattern: call
-        ``RuntimeContext.from_runtime(base=ctx)`` inside a worker process to
-        re-read live ``rank``/``world_size``/``worker_id``/``num_workers``
-        while preserving the caller's seed, epoch, and mesh.
-
         Args:
-            base: Optional existing context to inherit ``seed``, ``epoch``,
-                and ``mesh`` from.
-            seed: Base random seed. Ignored when *base* is provided.
-            env: Optional environment mapping to read launcher values from.
-            prefer_torch: Whether to prefer live PyTorch runtime values when
-                available.
-            mesh: Mesh override. Falls back to ``base.mesh`` when *base* is
-                set and no mesh arguments are given.
-            device_mesh: Optional PyTorch ``DeviceMesh`` to wrap as a
-                :class:`DataLoadMesh`.
-            dp_dims: Data-parallel mesh dimensions used with *device_mesh*.
-        """
+            base: Existing runtime context used as defaults.
+            seed: Base random seed.
+            env: Environment mapping used to resolve distributed runtime values.
+            prefer_torch: Whether to prefer PyTorch distributed runtime values when available.
+            mesh: Explicit data-load mesh override.
+            device_mesh: Optional torch device mesh used to derive data-parallel layout.
+            dp_dims: Device mesh dimension name or names that form the data-parallel axis.
+
+        Returns:
+            A runtime context resolved from explicit values and runtime state."""
 
         resolved_mesh = resolve_data_load_mesh(mesh=mesh, device_mesh=device_mesh, dp_dims=dp_dims)
         if base is not None:

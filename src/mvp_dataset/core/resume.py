@@ -25,30 +25,76 @@ class ResumeStateError(ValueError):
 class StatefulIterator(Protocol):
     """Iterator that can persist and restore its future output state."""
 
-    def __iter__(self) -> StatefulIterator: ...
+    def __iter__(self) -> StatefulIterator:
+        """Return the iterator object."""
+        ...
 
-    def __next__(self) -> object: ...
+    def __next__(self) -> object:
+        """Return the next output item."""
+        ...
 
-    def state_dict(self) -> dict[str, object]: ...
+    def state_dict(self) -> dict[str, object]:
+        """Return the resumable state for this iterator.
 
-    def load_state_dict(self, state: dict[str, object]) -> None: ...
+        Returns:
+            A dictionary that can be passed to load_state_dict()."""
+        ...
 
-    def fingerprint(self) -> str: ...
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        """Restore this iterator from a resumable state dictionary.
+
+        Args:
+            state: Resume state dictionary to validate and load.
+
+        Returns:
+            None."""
+        ...
+
+    def fingerprint(self) -> str:
+        """Return a stable fingerprint for resume compatibility checks.
+
+        Returns:
+            A stable fingerprint string."""
+        ...
 
 
 @runtime_checkable
 class StatefulStage(Protocol):
     """Pipeline stage that can persist and restore its internal state."""
 
-    def state_dict(self) -> dict[str, object]: ...
+    def state_dict(self) -> dict[str, object]:
+        """Return the resumable state for this stage.
 
-    def load_state_dict(self, state: dict[str, object]) -> None: ...
+        Returns:
+            A dictionary that can be passed to load_state_dict()."""
+        ...
 
-    def fingerprint(self) -> str: ...
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        """Restore this stage from a resumable state dictionary.
+
+        Args:
+            state: Resume state dictionary to validate and load.
+
+        Returns:
+            None."""
+        ...
+
+    def fingerprint(self) -> str:
+        """Return a stable fingerprint for resume compatibility checks.
+
+        Returns:
+            A stable fingerprint string."""
+        ...
 
 
 def callable_fingerprint(fn: Callable[..., object] | None) -> dict[str, object] | None:
-    """Return a stable payload describing callable identity, config, and code."""
+    """Return a stable payload describing callable identity, config, and code.
+
+    Args:
+        fn: Callable applied to each upstream sample.
+
+    Returns:
+        A stable payload for the callable, or None when no callable is provided."""
 
     if fn is None:
         return None
@@ -88,6 +134,7 @@ def callable_fingerprint(fn: Callable[..., object] | None) -> dict[str, object] 
 
 
 def _callable_name(fn: Callable[..., object]) -> str:
+    """Return the import path for a callable when one is available."""
     module = getattr(fn, "__module__", None) or type(fn).__module__
     qualname = getattr(fn, "__qualname__", None)
     if qualname is None:
@@ -96,11 +143,13 @@ def _callable_name(fn: Callable[..., object]) -> str:
 
 
 def _type_name(value: object) -> str:
+    """Return the import path for an object type."""
     value_type = type(value)
     return f"{value_type.__module__}.{value_type.__qualname__}"
 
 
 def _source_target(fn: Callable[..., object]) -> object:
+    """Return the source lookup target for a callable."""
     if isinstance(fn, functools.partial):
         return fn.func
     if inspect.isclass(fn) or inspect.isfunction(fn) or inspect.ismethod(fn):
@@ -109,6 +158,7 @@ def _source_target(fn: Callable[..., object]) -> object:
 
 
 def _source_hash(target: object) -> str | None:
+    """Return a hash of the callable source text when available."""
     try:
         source = inspect.getsource(target)
     except (OSError, TypeError):
@@ -118,6 +168,7 @@ def _source_hash(target: object) -> str | None:
 
 
 def _code_hash(target: object) -> str | None:
+    """Return a hash of the callable bytecode and constants."""
     code = getattr(target, "__code__", None)
     if code is None and inspect.ismethod(target):
         code = getattr(target.__func__, "__code__", None)
@@ -136,6 +187,7 @@ def _code_hash(target: object) -> str | None:
 
 
 def _defaults(fn: Callable[..., object]) -> dict[str, object] | None:
+    """Return a serializable summary of callable default arguments."""
     defaults = getattr(fn, "__defaults__", None)
     kwdefaults = getattr(fn, "__kwdefaults__", None)
     if defaults is None and kwdefaults is None:
@@ -147,6 +199,7 @@ def _defaults(fn: Callable[..., object]) -> dict[str, object] | None:
 
 
 def _closure(fn: Callable[..., object]) -> list[str] | None:
+    """Return a serializable summary of callable closure values."""
     closure = getattr(fn, "__closure__", None)
     if not closure:
         return None
@@ -160,7 +213,13 @@ def _closure(fn: Callable[..., object]) -> list[str] | None:
 
 
 def stable_fingerprint(payload: object) -> str:
-    """Return a stable SHA256 fingerprint for a JSON-serializable payload."""
+    """Return a stable SHA256 fingerprint for a JSON-serializable payload.
+
+    Args:
+        payload: JSON-compatible payload to fingerprint.
+
+    Returns:
+        A SHA256 hex digest."""
 
     encoded = json.dumps(
         payload,
