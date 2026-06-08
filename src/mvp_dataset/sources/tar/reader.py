@@ -1,4 +1,4 @@
-"""Tar shard source implementation for streaming sample iteration."""
+"""TAR shard readers."""
 
 from __future__ import annotations
 
@@ -53,15 +53,12 @@ def _split_key_and_field(name: str, *, key_dot_level: int) -> tuple[str, str] | 
 def iter_tar(shard_path: PathLikeStr, key_dot_level: int = 1) -> Iterator[Sample]:
     """Iterate a tar shard and yield grouped samples by key.
 
-    Files are expected to follow the naming convention implied by ``key_dot_level``.
-    Consecutive entries with the same parsed key are grouped into one sample.
+    Args:
+        shard_path: Tar shard path to read.
+        key_dot_level: Number of dot-separated suffix components removed from tar member keys.
 
-    Each yielded sample contains:
-    - ``__key__``: sample key
-    - ``__shard__``: shard path
-    - ``__index_in_shard__``: zero-based row index within the shard
-    - one entry per field with raw ``bytes`` payload
-    """
+    Returns:
+        An iterator over samples from one tar shard."""
 
     shard = str(shard_path)
     current_key: str | None = None
@@ -120,24 +117,18 @@ def _require_sample_key(sample: Sample, *, shard_path: PathLikeStr, source_name:
     return key
 
 
-def iter_tars(
+def iter_tar_shards(
     shard_paths: Iterator[PathLikeStr],
     sidecars: Sequence[SidecarSpec] | None = None,
 ) -> Iterator[Sample]:
-    """Iterate multiple tar shards, optionally merging sidecar tars.
+    """Iterate multiple TAR shards, optionally merging sidecar archives.
 
     Args:
-        shard_paths: Iterator of paths to the main tar shards.
-        sidecars: Optional list of ``(name, path_fn)`` pairs.  For each main
-            shard path, ``path_fn(shard_path)`` is called to locate the
-            corresponding sidecar shard.  After yielding one sample from the
-            main shard and one from every sidecar, the ``__key__`` values are
-            checked for equality; on mismatch a :class:`ValueError` is raised.
-            Sidecar metadata fields (``__key__``, ``__shard__``,
-            ``__index_in_shard__``) are dropped and the remaining fields are
-            merged into the main sample dict.  Duplicate field names across
-            shards raise a :class:`ValueError`.
-    """
+        shard_paths: Shard paths to read.
+        sidecars: Sidecar tar specifications joined to main samples.
+
+    Returns:
+        An iterator over samples from all tar shards."""
     key_dot_level = int(os.environ.get("MVP_DATASET_TAR_KEY_DOT_LEVEL", "1"))
     for shard_path in shard_paths:
         if not sidecars:
@@ -157,7 +148,7 @@ def iter_tars(
             if any(s is _SENTINEL for s in group):
                 msg = (
                     f"[SidecarLengthMismatch] main shard and one or more sidecar "
-                    f"tars have different numbers of samples in shard {shard_path!r}"
+                    f"TAR archives have different numbers of samples in shard {shard_path!r}"
                 )
                 raise ValueError(msg)
 

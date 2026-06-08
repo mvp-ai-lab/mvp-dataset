@@ -1,8 +1,5 @@
-from .utils import ParquetFragment, iter_parquet, iter_parquets, list_parquet_fragments
+"""Parquet source."""
 
-__all__ = [
-    "ParquetFragment",
-    "iter_parquet",
-    "iter_parquets",
-    "list_parquet_fragments",
-]
+from .dataset import ParquetDataset
+
+__all__ = ["ParquetDataset"]

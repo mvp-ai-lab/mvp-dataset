@@ -1,0 +1,20 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">MVP Dataset logo</title>
+  <desc id="desc">A minimal large-model training dataflow mark with token streams and a resume checkpoint.</desc>
+  <rect width="256" height="256" rx="56" fill="#0F172A"/>
+
+  <path d="M52 86C84 56 122 56 154 86L204 136" stroke="#38BDF8" stroke-width="14" stroke-linecap="round"/>
+  <path d="M52 170C84 200 122 200 154 170L204 120" stroke="#34D399" stroke-width="14" stroke-linecap="round"/>
+
+  <path d="M70 128H186" stroke="#E5E7EB" stroke-width="12" stroke-linecap="round" stroke-dasharray="1 26"/>
+  <path d="M88 104H168" stroke="#94A3B8" stroke-width="8" stroke-linecap="round" stroke-dasharray="1 22"/>
+  <path d="M88 152H168" stroke="#94A3B8" stroke-width="8" stroke-linecap="round" stroke-dasharray="1 22"/>
+
+  <circle cx="52" cy="86" r="12" fill="#38BDF8"/>
+  <circle cx="52" cy="170" r="12" fill="#34D399"/>
+  <circle cx="204" cy="128" r="18" fill="#FBBF24"/>
+  <path d="M196 128L203 135L214 121" stroke="#0F172A" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <path d="M128 66V190" stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="2" stroke-linecap="round"/>
+  <circle cx="128" cy="128" r="28" stroke="#E5E7EB" stroke-opacity="0.2" stroke-width="8"/>
+</svg>

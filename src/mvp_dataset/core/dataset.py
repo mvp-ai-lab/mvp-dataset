@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 
-from ..utils.sharding import assign_items
 from .context import RuntimeContext
+from .iterator import DatasetIterator
+from .resume import RESUME_STATE_VERSION, ResumeStateError, stable_fingerprint
 from .stages import (
     _AssembleStage,
     _BatchStage,
@@ -15,13 +17,13 @@ from .stages import (
     _SelectStage,
     _ShuffleStage,
     _UnbatchStage,
-    torch_iterabledataset_class,
 )
-from .types import Assembler, SourceKind, SourceStore, StageSpec
+from .torch_compat import TorchIterableDataset
+from .types import Assembler, SourceKind, StageSpec
 
 
 @dataclass(frozen=True, slots=True)
-class Dataset(torch_iterabledataset_class()):
+class Dataset(TorchIterableDataset):
     """Chainable iterable dataset built from local shard sources.
 
     A :class:`Dataset` is immutable: every transformation returns a new dataset
@@ -33,27 +35,121 @@ class Dataset(torch_iterabledataset_class()):
     context: RuntimeContext
 
     _source_kind: SourceKind
-    _source: SourceStore
+    _source: object
     _stages: tuple[StageSpec, ...]
     _resample: bool
-    _iter_source_stream: Callable
+    _resume_state: dict[str, object] | None = None
 
     def _build_source_stream(self, *, context: RuntimeContext) -> Iterable[object]:
-        source_shard_stream = assign_items(self._source, context=context, resample=self._resample)
-        return self._iter_source_stream(source_shard_stream)
+        """Build the source iterator for a runtime context."""
+        msg = f"[UnsupportedSourceKind] source kind {self._source_kind!r} does not implement iteration"
+        raise NotImplementedError(msg)
 
     def _append_stage(self, spec: StageSpec) -> Dataset:
-        return dataclass_replace(self, _stages=self._stages + (spec,))
+        """Return a new dataset with one additional stage."""
+        return dataclass_replace(self, _stages=self._stages + (spec,), _resume_state=None)
+
+    def _source_fingerprint(self) -> dict[str, object]:
+        """Return the source portion of the pipeline fingerprint."""
+        msg = f"[UnsupportedSourceKind] source kind {self._source_kind!r} does not implement fingerprinting"
+        raise NotImplementedError(msg)
+
+    def _stages_fingerprint(self) -> list[dict[str, object]]:
+        """Return the stage portion of the pipeline fingerprint."""
+        result: list[dict[str, object]] = []
+        for spec in self._stages:
+            fingerprint = getattr(spec.apply, "fingerprint", None)
+            if callable(fingerprint):
+                result.append({"kind": spec.kind, "fingerprint": fingerprint()})
+            else:
+                result.append(
+                    {
+                        "kind": spec.kind,
+                        "apply_class": f"{spec.apply.__class__.__module__}.{spec.apply.__class__.__qualname__}",
+                        "apply_config": repr(spec.apply),
+                    }
+                )
+        return result
+
+    def _pipeline_fingerprint(self) -> str:
+        """Return the combined source and stage fingerprint."""
+        payload = {
+            "source": self._source_fingerprint(),
+            "stages": self._stages_fingerprint(),
+        }
+        return stable_fingerprint(payload)
+
+    def state_dict(self) -> dict[str, object]:
+        """Return the resumable state for future pipeline outputs.
+
+        Returns:
+            A dictionary that can be passed to load_state_dict()."""
+        warnings.warn(
+            "Dataset.state_dict() creates a fresh initial iterator state. "
+            "Use iterator.state_dict() to checkpoint an in-progress iteration.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return DatasetIterator(self).state_dict()
+
+    def load_state_dict(self, state: dict[str, object]) -> Dataset:
+        """Return a dataset with validated resume state attached.
+
+        Args:
+            state: Resume state dictionary to validate and load.
+
+        Returns:
+            None."""
+
+        if not isinstance(state, dict):
+            msg = "[InvalidResumeState] state must be a dict"
+            raise ResumeStateError(msg)
+        version = state.get("version")
+        if version != RESUME_STATE_VERSION:
+            msg = f"[InvalidResumeStateVersion] expected={RESUME_STATE_VERSION} got={version!r}"
+            raise ResumeStateError(msg)
+
+        runtime_fingerprint = state.get("runtime_fingerprint")
+        if not isinstance(runtime_fingerprint, str):
+            msg = "[InvalidResumeState] runtime_fingerprint must be a string"
+            raise ResumeStateError(msg)
+        if runtime_fingerprint != self.context.fingerprint():
+            msg = "[ResumeRuntimeMismatch] runtime fingerprint does not match"
+            raise ResumeStateError(msg)
+
+        pipeline_fingerprint = state.get("pipeline_fingerprint")
+        if not isinstance(pipeline_fingerprint, str):
+            msg = "[InvalidResumeState] pipeline_fingerprint must be a string"
+            raise ResumeStateError(msg)
+        if pipeline_fingerprint != self._pipeline_fingerprint():
+            msg = "[ResumePipelineMismatch] pipeline fingerprint does not match"
+            raise ResumeStateError(msg)
+
+        source = state.get("source")
+        if not isinstance(source, dict):
+            msg = "[InvalidResumeState] source must be a dict"
+            raise ResumeStateError(msg)
+        stages = state.get("stages")
+        if not isinstance(stages, list):
+            msg = "[InvalidResumeState] stages must be a list"
+            raise ResumeStateError(msg)
+
+        warnings.warn(
+            "Dataset.load_state_dict() stores pending resume state. "
+            "The source cursor is restored when iter(dataset) creates a DatasetIterator.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return dataclass_replace(self, _resume_state=state)
 
     def map(self, fn: Callable[[object], object]) -> Dataset:
         """Append a lazy map stage.
 
         Args:
-            fn: Callable applied to each sample yielded by the upstream stage.
+            fn: Callable applied to each upstream sample.
 
         Returns:
-            A new dataset that applies ``fn`` lazily during iteration.
-        """
+            A new dataset with the map stage appended."""
 
         spec = StageSpec(kind="map", apply=_MapStage(fn))
         return self._append_stage(spec)
@@ -62,14 +158,11 @@ class Dataset(torch_iterabledataset_class()):
         """Append a deterministic sample-level shuffle stage.
 
         Args:
-            buffer_size: Maximum number of samples to keep in the randomization
-                buffer.
-            initial: Minimum number of buffered samples before the stage starts
-                yielding values. Defaults to ``buffer_size``.
+            buffer_size: Maximum number of items kept in the shuffle buffer.
+            initial: Minimum buffered item count before shuffle starts yielding.
 
         Returns:
-            A new dataset with bounded-memory shuffling applied lazily.
-        """
+            A new object with the shuffle stage appended."""
 
         spec = StageSpec(
             kind="shuffle",
@@ -80,9 +173,11 @@ class Dataset(torch_iterabledataset_class()):
     def select(self, fields: list[str] | tuple[str, ...]) -> Dataset:
         """Append a lazy field projection stage.
 
-        The stage keeps requested user fields and preserves internal metadata
-        keys such as ``__key__``.
-        """
+        Args:
+            fields: Field names to keep in each dictionary sample.
+
+        Returns:
+            A new dataset with the select stage appended."""
 
         selected_fields = tuple(fields)
 
@@ -101,14 +196,12 @@ class Dataset(torch_iterabledataset_class()):
         """Append a batching stage.
 
         Args:
-            batch_size: Number of samples per yielded batch.
-            drop_last: Whether to drop the final incomplete batch.
-            collate_fn: Optional callable that transforms each list of samples
-                into a user-defined batch object.
+            batch_size: Number of samples to group into each batch.
+            drop_last: Whether to discard the final incomplete batch.
+            collate_fn: Optional callable used to convert a list of samples into one batch.
 
         Returns:
-            A new dataset that yields batches instead of individual samples.
-        """
+            A new object with the batch stage appended."""
 
         spec = StageSpec(
             kind="batch",
@@ -129,15 +222,11 @@ class Dataset(torch_iterabledataset_class()):
         """Append a stateful assembly stage.
 
         Args:
-            factory: Callable that builds one fresh assembler for each iterator
-                execution. The assembler may consume multiple upstream samples
-                before yielding one or more downstream outputs.
-            drop_last: Whether to discard unfinished tail state instead of
-                delegating it to the assembler's final flush.
+            factory: Callable that builds a fresh assembler for the runtime context.
+            drop_last: Whether to discard the final incomplete batch.
 
         Returns:
-            A new dataset that assembles the upstream sample stream lazily.
-        """
+            A new object with the assemble stage appended."""
 
         spec = StageSpec(
             kind="assemble",
@@ -149,9 +238,7 @@ class Dataset(torch_iterabledataset_class()):
         """Append an unbatching stage.
 
         Returns:
-            A new dataset that expands list, tuple, or dict-style batches back
-            into individual samples during iteration.
-        """
+            A new object with the unbatch stage appended."""
 
         spec = StageSpec(
             kind="unbatch",
@@ -161,19 +248,20 @@ class Dataset(torch_iterabledataset_class()):
 
     def __iter__(self) -> Iterator[object]:
         """Materialize and run the full lazy pipeline."""
-        context = RuntimeContext.from_runtime(base=self.context)
-        stream: Iterable[object] = self._build_source_stream(context=context)
-        for spec in self._stages:
-            stream = spec.apply(stream)
-        yield from stream
+        return DatasetIterator(self)
 
     @classmethod
     def from_source(cls, source_kind: SourceKind, *args, **kwargs) -> Dataset:
         """Construct a dataset from a supported source type.
 
-        See the relevant source-specific classmethod constructors for details.
-        """
-        if source_kind == "tars":
+        Args:
+            source_kind: Source backend name.
+            args: Positional arguments forwarded to the source constructor.
+            kwargs: Keyword arguments forwarded to the source constructor.
+
+        Returns:
+            A dataset configured for the requested source."""
+        if source_kind == "tar":
             from ..sources.tar.dataset import TarDataset
 
             return TarDataset.from_source(*args, **kwargs)

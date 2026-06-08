@@ -1,6 +1,5 @@
-from .utils import iter_tar, iter_tars
+"""TAR source."""
 
-__all__ = [
-    "iter_tar",
-    "iter_tars",
-]
+from .dataset import TarDataset
+
+__all__ = ["TarDataset"]
