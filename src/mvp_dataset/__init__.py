@@ -1,6 +1,12 @@
 """Public package interface for mvp-dataset."""
 
-from .core import DataLoadMesh, ResumeStateError, RuntimeContext, UnsupportedResume
+from .core import (
+    Consumer,
+    DataLoadMesh,
+    ResumeStateError,
+    RuntimeContext,
+    UnsupportedResume,
+)
 from .core.dataset import Dataset
 from .loader import TorchLoader
 from .log import (
@@ -14,6 +20,7 @@ from .log import (
 
 __all__ = [
     "DataLoadMesh",
+    "Consumer",
     "Dataset",
     "ResumeStateError",
     "RuntimeContext",

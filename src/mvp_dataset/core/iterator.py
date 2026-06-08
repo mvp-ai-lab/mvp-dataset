@@ -21,10 +21,10 @@ if TYPE_CHECKING:
 class DatasetIterator:
     """Materialized iterator for one Dataset pipeline execution."""
 
-    def __init__(self, dataset: Dataset):
+    def __init__(self, dataset: Dataset, *, context: RuntimeContext | None = None):
         """Initialize the object."""
         self.dataset = dataset
-        self.context = RuntimeContext.from_runtime(base=dataset.context)
+        self.context = RuntimeContext.from_runtime(base=dataset.context) if context is None else context
         self.num_yielded = 0
 
         source = dataset._build_source_stream(context=self.context)

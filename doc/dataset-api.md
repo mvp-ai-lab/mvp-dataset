@@ -82,6 +82,23 @@ dataset = dataset.unbatch()
 
 Expands list, tuple, or dictionary-style batches back into samples.
 
+## Terminal Operations
+
+### `consume(factory)`
+
+```python
+result = dataset.consume(lambda context: consumer)
+```
+
+Eagerly consumes the pipeline and returns `consumer.finish()`. The consumer is
+created with the same resolved `RuntimeContext` used by the dataset iterator.
+
+- `consumer.push(item)` receives each pipeline output.
+- Returning `False` from `push()` stops consumption early.
+- Returning `True` or `None` continues consumption.
+- Exceptions from the upstream pipeline or consumer propagate, and `finish()` is
+  not called after a failed `push()`.
+
 ## Iteration
 
 ```python
