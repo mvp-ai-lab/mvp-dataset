@@ -14,7 +14,7 @@ from .iterator import _LanceSourceIterator
 from .reader import list_lance_sources
 from .refs import LanceResolveRefFactory, attach_lance_ref_columns, validate_ref_names
 from .shuffle import DEFAULT_CHUNK_AWARE_SHUFFLE_CHUNK_SIZE, DEFAULT_CHUNK_AWARE_SHUFFLE_K
-from .types import LanceRefIndexScope, LanceShuffleMode
+from .types import LanceRefIndexBuildStrategy, LanceRefIndexScope, LanceShuffleMode
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +158,8 @@ class LanceDataset(Dataset):
         batch_size: int = 1024,
         context: RuntimeContext | None = None,
         ref_index_scope: LanceRefIndexScope | None = None,
+        ref_index_build_strategy: LanceRefIndexBuildStrategy | None = None,
+        ref_index_bucket_count: int | None = None,
     ) -> Dataset:
         """Append a lazy stage that resolves configured Lance reference columns.
 
@@ -166,11 +168,16 @@ class LanceDataset(Dataset):
             batch_size: Number of samples to group into each batch.
             context: Runtime context used for sharding and deterministic randomness.
             ref_index_scope: Scope that controls where Lance reference indexes are stored.
+            ref_index_build_strategy: Strategy for building missing reference indexes.
+            ref_index_bucket_count: Number of temporary hash buckets for bucketed builds.
 
         Returns:
             A dataset that resolves the requested Lance reference columns."""
         if batch_size <= 0:
             msg = "[InvalidLanceRefBatchSize] batch_size must be a positive integer"
+            raise ValueError(msg)
+        if ref_index_bucket_count is not None and ref_index_bucket_count <= 0:
+            msg = "[InvalidLanceRefIndexBucketCount] bucket_count must be > 0"
             raise ValueError(msg)
 
         ref_names = validate_ref_names(self._source[0], ref_names)
@@ -181,6 +188,8 @@ class LanceDataset(Dataset):
             ref_names=ref_names,
             batch_size=batch_size,
             ref_index_scope=ref_index_scope if ref_index_scope is not None else self._ref_index_scope,
+            ref_index_build_strategy=ref_index_build_strategy,
+            ref_index_bucket_count=ref_index_bucket_count,
         )
         stage_context = self.context if context is None else context
         spec = StageSpec(

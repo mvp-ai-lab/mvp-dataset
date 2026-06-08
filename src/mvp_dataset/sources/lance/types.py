@@ -7,6 +7,7 @@ from typing import Literal
 
 LanceShuffleMode = Literal["none", "global", "fragment_aware", "chunk_aware"]
 LanceRefIndexScope = Literal["shared", "node_local", "process"]
+LanceRefIndexBuildStrategy = Literal["auto", "in_memory", "bucketed"]
 
 
 @dataclass(frozen=True, slots=True)

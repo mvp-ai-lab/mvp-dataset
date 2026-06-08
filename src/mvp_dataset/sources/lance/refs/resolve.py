@@ -11,9 +11,10 @@ import lance
 import numpy as np
 
 from mvp_dataset.core.context import RuntimeContext
+from mvp_dataset.core.resume import ResumeStateError, stable_fingerprint
 from mvp_dataset.core.types import Sample
 
-from ..types import LanceIndexItem, LanceRefIndexScope, LanceSourceSpec
+from ..types import LanceIndexItem, LanceRefIndexBuildStrategy, LanceRefIndexScope, LanceSourceSpec
 from .index import REF_INDEX_MISSING_ROW, _open_ref_value_source, prepare_ref_indexes
 from .read import _read_table_rows
 
@@ -210,6 +211,8 @@ def iter_lance_ref_resolver(
     batch_size: int = 1024,
     context: RuntimeContext | None = None,
     ref_index_scope: LanceRefIndexScope | None = None,
+    ref_index_build_strategy: LanceRefIndexBuildStrategy | None = None,
+    ref_index_bucket_count: int | None = None,
 ):
     """Resolve configured Lance reference columns for already-read samples.
 
@@ -230,6 +233,8 @@ def iter_lance_ref_resolver(
         batch_size=batch_size,
         context=context,
         ref_index_scope=ref_index_scope,
+        ref_index_build_strategy=ref_index_build_strategy,
+        ref_index_bucket_count=ref_index_bucket_count,
     )
     for sample in sample_stream:
         yield from assembler.push(sample)
@@ -244,6 +249,8 @@ class LanceResolveRefFactory:
     ref_names: tuple[str, ...]
     batch_size: int = 1024
     ref_index_scope: LanceRefIndexScope | None = None
+    ref_index_build_strategy: LanceRefIndexBuildStrategy | None = None
+    ref_index_bucket_count: int | None = None
 
     def __call__(self, context: RuntimeContext) -> LanceRefResolverAssembler:
         """Apply this callable object."""
@@ -253,6 +260,8 @@ class LanceResolveRefFactory:
             batch_size=self.batch_size,
             context=context,
             ref_index_scope=self.ref_index_scope,
+            ref_index_build_strategy=self.ref_index_build_strategy,
+            ref_index_bucket_count=self.ref_index_bucket_count,
         )
 
 
@@ -267,10 +276,15 @@ class LanceRefResolverAssembler:
         batch_size: int = 1024,
         context: RuntimeContext | None = None,
         ref_index_scope: LanceRefIndexScope | None = None,
+        ref_index_build_strategy: LanceRefIndexBuildStrategy | None = None,
+        ref_index_bucket_count: int | None = None,
     ) -> None:
         """Initialize the object."""
         if batch_size <= 0:
             msg = f"[InvalidLanceRefBatchSize] batch_size must be > 0, got {batch_size}"
+            raise ValueError(msg)
+        if ref_index_bucket_count is not None and ref_index_bucket_count <= 0:
+            msg = f"[InvalidLanceRefIndexBucketCount] bucket_count must be > 0, got {ref_index_bucket_count}"
             raise ValueError(msg)
 
         self.ref_names = validate_ref_names(source, ref_names)
@@ -279,10 +293,48 @@ class LanceRefResolverAssembler:
             columns=self.ref_names,
             context=context,
             ref_index_scope=ref_index_scope,
+            ref_index_build_strategy=ref_index_build_strategy,
+            ref_index_bucket_count=ref_index_bucket_count,
         )
         self.batch_size = batch_size
+        self.ref_index_scope = ref_index_scope
+        self.ref_index_build_strategy = ref_index_build_strategy
+        self.ref_index_bucket_count = ref_index_bucket_count
         self.batch: list[Sample] = []
         self.queue_size = 0
+
+    def state_dict(self) -> dict[str, object]:
+        """Return resumable resolver state."""
+        return {
+            "batch": list(self.batch),
+            "queue_size": self.queue_size,
+        }
+
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        """Restore resolver state."""
+        batch = state.get("batch")
+        if not isinstance(batch, list):
+            msg = "[InvalidResumeState] lance ref resolver batch must be a list"
+            raise ResumeStateError(msg)
+        queue_size = state.get("queue_size")
+        if not isinstance(queue_size, int) or queue_size < 0:
+            msg = "[InvalidResumeState] lance ref resolver queue_size must be a non-negative integer"
+            raise ResumeStateError(msg)
+        self.batch = list(batch)
+        self.queue_size = queue_size
+
+    def fingerprint(self) -> str:
+        """Return a stable fingerprint for resume compatibility checks."""
+        return stable_fingerprint(
+            {
+                "kind": "lance_ref_resolver",
+                "ref_names": list(self.ref_names),
+                "batch_size": self.batch_size,
+                "ref_index_scope": self.ref_index_scope,
+                "ref_index_build_strategy": self.ref_index_build_strategy,
+                "ref_index_bucket_count": self.ref_index_bucket_count,
+            }
+        )
 
     def _flush(self) -> Iterable[object]:
         """Resolve and emit pending reference samples."""

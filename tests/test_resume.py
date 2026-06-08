@@ -18,6 +18,7 @@ from .helpers import (
     build_records,
     write_jsonl_file,
     write_lance_dataset,
+    write_lance_table,
     write_parquet_file,
     write_tar_shards,
 )
@@ -408,6 +409,68 @@ def test_lance_resume_supports_multiple_datasets(tmp_path) -> None:
         )
 
     _assert_dataset_resume_matches_continued(build_dataset, checkpoint_after=4)
+
+
+@pytest.mark.parametrize(
+    ("shuffle_mode", "resolve_ref"),
+    [
+        ("global", False),
+        ("global", True),
+        ("chunk_aware", False),
+        ("chunk_aware", True),
+    ],
+)
+def test_lance_shuffle_resume_with_and_without_resolve_ref(
+    tmp_path,
+    shuffle_mode: str,
+    resolve_ref: bool,
+) -> None:
+    pytest.importorskip("lance")
+
+    main_records = [
+        {"id": f"sample-{index}", "text": f"text-{index}", "value": index, "image_ref": f"img-{index % 5}"}
+        for index in range(17)
+    ]
+    ref_records = [{"image_id": f"img-{index}", "image_value": f"resolved-{index}"} for index in range(5)]
+    main_path = write_lance_table(tmp_path, "main.lance", main_records)
+    ref_path = write_lance_table(tmp_path, "refs.lance", ref_records)
+
+    def build_dataset() -> Dataset:
+        dataset = Dataset.from_source(
+            "lance",
+            shards=main_path,
+            context=RuntimeContext(seed=31),
+            batch_size=4,
+            shuffle_mode=shuffle_mode,
+            chunk_aware_shuffle_chunk_size=4,
+            chunk_aware_shuffle_k=3,
+            ref_columns={
+                "image_ref": {
+                    "uri": ref_path,
+                    "key_column": "image_id",
+                    "value_column": "image_value",
+                }
+            },
+        )
+        if not resolve_ref:
+            return dataset
+        return dataset.resolve_ref(
+            ["image_ref"],
+            batch_size=3,
+            ref_index_scope="process",
+            ref_index_build_strategy="bucketed",
+            ref_index_bucket_count=3,
+        )
+
+    state = _assert_dataset_resume_matches_continued(build_dataset, checkpoint_after=5)
+    expected_image_refs = (
+        {f"resolved-{index}" for index in range(5)} if resolve_ref else {f"img-{index}" for index in range(5)}
+    )
+    observed_image_refs = {sample["image_ref"] for sample in _remaining(iter(build_dataset()))}
+
+    assert observed_image_refs == expected_image_refs
+    assert state["source"]["state"]["shuffle_mode"] == shuffle_mode
+    assert [stage["kind"] for stage in state["stages"]] == (["assemble"] if resolve_ref else [])
 
 
 @pytest.mark.parametrize("shuffle_mode", ["none", "global", "chunk_aware"])

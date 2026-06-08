@@ -132,7 +132,13 @@ dataset = Dataset.from_source(
     },
 )
 
-dataset = dataset.resolve_ref(["image"])
+dataset = dataset.resolve_ref(
+    ["image"],
+    ref_index_build_strategy="auto",
+    ref_index_bucket_count=4096,
+)
 ```
 
 `resolve_ref(...)` appends a stateful assembly stage that resolves configured reference values lazily.
+Missing reference indexes are built with `ref_index_build_strategy="auto"` by default. Small sources use the in-memory
+builder, while larger sources use a bucketed on-disk join to avoid keeping all reference keys in memory.

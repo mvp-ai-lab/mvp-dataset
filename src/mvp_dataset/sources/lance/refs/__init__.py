@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..types import LanceRefIndexScope
+from ..types import LanceRefIndexBuildStrategy, LanceRefIndexScope
 from .config import attach_lance_ref_columns, parse_lance_ref_columns
 from .index import prepare_ref_indexes
 from .resolve import (
@@ -14,6 +14,7 @@ from .resolve import (
 
 __all__ = [
     "LanceRefIndexScope",
+    "LanceRefIndexBuildStrategy",
     "LanceRefResolverAssembler",
     "LanceResolveRefFactory",
     "attach_lance_ref_columns",
