@@ -5,6 +5,7 @@ from .mesh import DataLoadMesh
 from .resume import ResumeStateError, UnsupportedResume
 from .types import (
     Assembler,
+    Consumer,
     GroupedSample,
     PathLikeStr,
     Sample,
@@ -15,6 +16,7 @@ from .types import (
 
 __all__ = [
     "Assembler",
+    "Consumer",
     "DataLoadMesh",
     "GroupedSample",
     "PathLikeStr",

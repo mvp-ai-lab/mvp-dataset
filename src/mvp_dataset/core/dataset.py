@@ -19,7 +19,7 @@ from .stages import (
     _UnbatchStage,
 )
 from .torch_compat import TorchIterableDataset
-from .types import Assembler, SourceKind, StageSpec
+from .types import Assembler, Consumer, SourceKind, StageSpec
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,6 +245,23 @@ class Dataset(TorchIterableDataset):
             apply=_UnbatchStage(),
         )
         return self._append_stage(spec)
+
+    def consume(self, factory: Callable[[RuntimeContext], Consumer]) -> object:
+        """Consume this pipeline eagerly and return a user-defined result.
+
+        Args:
+            factory: Callable that builds a consumer for the resolved runtime context.
+
+        Returns:
+            The result returned by ``consumer.finish()`` after the stream ends or
+            ``consumer.push(item)`` returns False."""
+
+        context = RuntimeContext.from_runtime(base=self.context)
+        consumer = factory(context)
+        for item in DatasetIterator(self, context=context):
+            if consumer.push(item) is False:
+                break
+        return consumer.finish()
 
     def __iter__(self) -> Iterator[object]:
         """Materialize and run the full lazy pipeline."""

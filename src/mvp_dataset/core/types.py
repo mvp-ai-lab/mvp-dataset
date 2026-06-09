@@ -74,6 +74,27 @@ class Assembler[T, U](Protocol):
             Remaining outputs produced during final flush."""
 
 
+class Consumer(Protocol):
+    """Terminal stream consumer that returns a final result."""
+
+    def push(self, item: object) -> bool | None:
+        """Consume one pipeline output.
+
+        Args:
+            item: Output item yielded by the dataset pipeline.
+
+        Returns:
+            False to stop consuming early. True or None to continue."""
+        ...
+
+    def finish(self) -> object:
+        """Return the final consume result.
+
+        Returns:
+            User-defined result produced after consumption stops."""
+        ...
+
+
 @runtime_checkable
 class StatefulAssembler(Protocol):
     """Assembler that can persist and restore its internal state."""

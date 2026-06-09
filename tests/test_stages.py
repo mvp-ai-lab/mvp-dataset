@@ -3,7 +3,9 @@ from __future__ import annotations
 import pickle
 from dataclasses import dataclass, field
 
-from mvp_dataset import Dataset, RuntimeContext, TorchLoader
+import pytest
+
+from mvp_dataset import Consumer, Dataset, RuntimeContext, TorchLoader
 
 from .helpers import build_records, write_parquet_file
 
@@ -25,6 +27,63 @@ def add_mapped_flag(sample: object) -> object:
 
 def identity_collate(batch: list[object]) -> list[object]:
     return batch
+
+
+class CollectConsumer:
+    def __init__(self) -> None:
+        self.items: list[object] = []
+
+    def push(self, item: object) -> bool | None:
+        self.items.append(item)
+        return True
+
+    def finish(self) -> object:
+        return list(self.items)
+
+
+class StopAfterConsumer:
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.items: list[object] = []
+
+    def push(self, item: object) -> bool | None:
+        self.items.append(item)
+        return len(self.items) < self.limit
+
+    def finish(self) -> object:
+        return list(self.items)
+
+
+class ContextConsumer:
+    def __init__(self, context: RuntimeContext) -> None:
+        self.context = context
+        self.values: list[int] = []
+
+    def push(self, item: object) -> bool | None:
+        if not isinstance(item, dict):
+            msg = f"expected dict item, got {type(item)!r}"
+            raise TypeError(msg)
+        self.values.append(int(item["value"]))
+        return True
+
+    def finish(self) -> object:
+        return {
+            "rank": self.context.rank,
+            "world_size": self.context.world_size,
+            "values": self.values,
+        }
+
+
+class FinishTrackingConsumer:
+    def __init__(self) -> None:
+        self.finish_called = False
+
+    def push(self, item: object) -> bool | None:
+        raise RuntimeError("consumer failed")
+
+    def finish(self) -> object:
+        self.finish_called = True
+        return None
 
 
 @dataclass
@@ -97,6 +156,80 @@ def test_assemble_stage_flushes_tail_and_drop_last(tmp_path) -> None:
         {"left_id": "sample-4", "right_id": None, "sum_value": 4},
     ]
     assert drop_tail == keep_tail[:2]
+
+
+def test_dataset_consume_returns_finish_result(tmp_path) -> None:
+    records = build_records(count=4)
+    dataset = _build_parquet_dataset(tmp_path, records)
+
+    def build_consumer(_context: RuntimeContext) -> Consumer:
+        return CollectConsumer()
+
+    result = dataset.consume(build_consumer)
+
+    assert result == list(dataset)
+
+
+def test_dataset_consume_can_stop_early(tmp_path) -> None:
+    records = build_records(count=6)
+    seen: list[str] = []
+
+    def track(sample: object) -> object:
+        if not isinstance(sample, dict):
+            return sample
+        seen.append(str(sample["id"]))
+        return sample
+
+    result = _build_parquet_dataset(tmp_path, records).map(track).consume(lambda _context: StopAfterConsumer(2))
+
+    assert [item["id"] for item in result] == ["sample-0", "sample-1"]
+    assert seen == ["sample-0", "sample-1"]
+
+
+def test_dataset_consume_full_pipeline(tmp_path) -> None:
+    records = build_records(count=8)
+    dataset = (
+        _build_parquet_dataset(tmp_path, records, seed=23)
+        .map(add_mapped_flag)
+        .shuffle(buffer_size=3)
+        .assemble(build_pair_sum_assembler)
+        .batch(2, collate_fn=identity_collate)
+    )
+
+    assert dataset.consume(lambda _context: CollectConsumer()) == list(dataset)
+
+
+def test_dataset_consume_uses_same_runtime_context_as_iterator(tmp_path, monkeypatch) -> None:
+    records = build_records(count=8)
+    source = write_parquet_file(tmp_path, records, row_group_size=2)
+
+    def consume_rank(rank: int) -> dict[str, object]:
+        monkeypatch.setenv("WORLD_SIZE", "2")
+        monkeypatch.setenv("RANK", str(rank))
+        dataset = Dataset.from_source("parquet", shards=source, context=RuntimeContext(seed=11), shuffle_mode="none")
+        result = dataset.consume(lambda context: ContextConsumer(context))
+        assert isinstance(result, dict)
+        return result
+
+    rank0 = consume_rank(0)
+    rank1 = consume_rank(1)
+
+    assert rank0["rank"] == 0
+    assert rank1["rank"] == 1
+    assert rank0["world_size"] == 2
+    assert rank1["world_size"] == 2
+    assert sorted(rank0["values"] + rank1["values"]) == list(range(8))
+    assert set(rank0["values"]).isdisjoint(set(rank1["values"]))
+
+
+def test_dataset_consume_does_not_call_finish_on_error(tmp_path) -> None:
+    records = build_records(count=2)
+    consumer = FinishTrackingConsumer()
+
+    with pytest.raises(RuntimeError, match="consumer failed"):
+        _build_parquet_dataset(tmp_path, records).consume(lambda _context: consumer)
+
+    assert not consumer.finish_called
 
 
 def test_loader_stage_pipeline_is_deterministic(tmp_path) -> None:

@@ -21,6 +21,7 @@ from ..core.types import Assembler
 from .iterator import _TorchLoaderIterator
 from .stages import (
     _LoaderAssembleStage,
+    _LoaderBalanceStage,
     _LoaderBatchStage,
     _LoaderShuffleStage,
     _LoaderUnbatchStage,
@@ -386,6 +387,49 @@ class TorchLoader:
                 batch_size=batch_size,
                 drop_last=drop_last,
                 collate_fn=collate_fn,
+            )
+        )
+
+    def balance(
+        self,
+        *,
+        drop_last: bool = True,
+        dummy_factory: Callable[[RuntimeContext], object] | None = None,
+        buffer_size: int = 32,
+        chunk_size: int = 16,
+        max_transfer_per_round: int = 16,
+        topology: str = "node",
+        process_group: object | None = None,
+        device_process_group: object | None = None,
+    ) -> TorchLoader:
+        """Append a distributed output balancing stage.
+
+        Args:
+            drop_last: Whether to drop the final incomplete distributed step.
+            dummy_factory: Factory used to create dummy items when ``drop_last`` is False.
+            buffer_size: Maximum number of local materialized items to prefetch.
+            chunk_size: Maximum number of output steps planned per distributed sync.
+            max_transfer_per_round: Maximum items one donor rank sends per sync.
+            topology: Donor preference strategy, either ``"node"`` or ``"none"``.
+            process_group: Optional torch distributed process group used for
+                control sync and CPU/object transfers.
+            device_process_group: Optional torch distributed process group used
+                for non-CPU tensor transfers.
+
+        Returns:
+            A new object with the balance stage appended."""
+        base_context = getattr(self._dataset, "context", None)
+        return self._append_stage(
+            _LoaderBalanceStage(
+                base_context=base_context if isinstance(base_context, RuntimeContext) else None,
+                drop_last=drop_last,
+                dummy_factory=dummy_factory,
+                buffer_size=buffer_size,
+                chunk_size=chunk_size,
+                max_transfer_per_round=max_transfer_per_round,
+                topology=topology,
+                process_group=process_group,
+                device_process_group=device_process_group,
             )
         )
 
