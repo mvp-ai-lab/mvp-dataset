@@ -23,6 +23,7 @@ from .stages import (
     _LoaderAssembleStage,
     _LoaderBalanceStage,
     _LoaderBatchStage,
+    _LoaderMapStage,
     _LoaderShuffleStage,
     _LoaderUnbatchStage,
 )
@@ -319,6 +320,16 @@ class TorchLoader:
         Returns:
             A new object with the unbatch stage appended."""
         return self._append_stage(_LoaderUnbatchStage())
+
+    def map(self, fn: Callable[[object], object]) -> TorchLoader:
+        """Append a loader-side one-to-one map stage.
+
+        Args:
+            fn: Callable applied to each merged loader output.
+
+        Returns:
+            A new object with the map stage appended."""
+        return self._append_stage(_LoaderMapStage(fn))
 
     def shuffle(
         self,
