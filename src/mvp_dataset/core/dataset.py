@@ -294,5 +294,9 @@ class Dataset(TorchIterableDataset):
             from ..sources.lance.dataset import LanceDataset
 
             return LanceDataset.from_source(*args, **kwargs)
+        if source_kind == "mixed":
+            from ..sources.mixed.dataset import MixedDataset
+
+            return MixedDataset.from_source(*args, **kwargs)
         msg = f"[UnsupportedSourceKind] source_kind={source_kind!r}"
         raise ValueError(msg)

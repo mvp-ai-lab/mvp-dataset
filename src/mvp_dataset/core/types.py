@@ -144,4 +144,4 @@ class StatefulAssembler(Protocol):
         ...
 
 
-SourceKind = Literal["jsonl", "tar", "parquet", "lance"]
+SourceKind = Literal["jsonl", "tar", "parquet", "lance", "mixed"]
