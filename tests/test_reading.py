@@ -355,12 +355,51 @@ def test_lance_bucketed_ref_index_loads_with_shuffle_modes(tmp_path, shuffle_mod
         },
     ).resolve_ref(
         ["image_ref"],
-        batch_size=2,
-        ref_index_scope="process",
-        ref_index_build_strategy="bucketed",
-        ref_index_bucket_count=2,
+        resolve_batch_size=2,
+        index={
+            "scope": "process",
+            "build_strategy": "bucketed",
+            "bucket_count": 2,
+        },
     )
 
     observed = sorted(dataset, key=lambda sample: int(sample["value"]))
 
     assert [sample["image_ref"] for sample in observed] == [f"resolved-{index % 4}" for index in range(12)]
+
+
+def test_lance_ref_index_cache_dir_env(tmp_path, monkeypatch) -> None:
+    pytest.importorskip("lance")
+
+    main_path = write_lance_table(
+        tmp_path,
+        "main.lance",
+        [{"id": f"sample-{index}", "image_ref": f"img-{index}"} for index in range(3)],
+    )
+    ref_path = write_lance_table(
+        tmp_path,
+        "refs.lance",
+        [{"image_id": f"img-{index}", "image_value": f"resolved-{index}"} for index in range(3)],
+    )
+    cache_dir = tmp_path / "ref-index-cache"
+    monkeypatch.setenv("MVP_DATASET_LANCE_REF_INDEX_CACHE_DIR", str(cache_dir))
+
+    dataset = Dataset.from_source(
+        "lance",
+        shards=main_path,
+        ref_columns={
+            "image_ref": {
+                "uri": ref_path,
+                "key_column": "image_id",
+                "value_column": "image_value",
+            }
+        },
+    ).resolve_ref(
+        ["image_ref"],
+        resolve_batch_size=2,
+        index={"scope": "process", "build_strategy": "in_memory"},
+    )
+
+    assert [sample["image_ref"] for sample in dataset] == [f"resolved-{index}" for index in range(3)]
+    assert list(cache_dir.glob("ref-index-*"))
+    assert not (tmp_path / "main.lance" / "_mvp_ref_index").exists()

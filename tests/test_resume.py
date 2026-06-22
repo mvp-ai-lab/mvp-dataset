@@ -457,10 +457,12 @@ def test_lance_shuffle_resume_with_and_without_resolve_ref(
             return dataset
         return dataset.resolve_ref(
             ["image_ref"],
-            batch_size=3,
-            ref_index_scope="process",
-            ref_index_build_strategy="bucketed",
-            ref_index_bucket_count=3,
+            resolve_batch_size=3,
+            index={
+                "scope": "process",
+                "build_strategy": "bucketed",
+                "bucket_count": 3,
+            },
         )
 
     state = _assert_dataset_resume_matches_continued(build_dataset, checkpoint_after=5)

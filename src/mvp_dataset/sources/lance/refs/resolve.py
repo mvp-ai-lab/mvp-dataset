@@ -14,12 +14,7 @@ from mvp_dataset.core.types import Sample
 
 from ..order import map_global_indexes
 from ..reader import LanceBatchReader
-from ..types import (
-    LanceIndexItem,
-    LanceRefIndexBuildStrategy,
-    LanceRefIndexScope,
-    LanceSource,
-)
+from ..types import LanceRefResolverConfig, LanceSource
 from .index import REF_INDEX_MISSING_ROW, _open_ref_value_source, prepare_ref_indexes
 
 
@@ -35,15 +30,6 @@ def _read_ref_value_rows(
 
     batch_indexes = map_global_indexes(value_source, row_indices)
     return LanceBatchReader(value_source).read(batch_indexes, columns=columns)
-
-
-def _looks_like_lance_index_items(value: object) -> bool:
-    """Return whether values look like serialized Lance index items."""
-    if value is None:
-        return False
-    if not isinstance(value, Sequence) or isinstance(value, str):
-        return False
-    return bool(value) and isinstance(value[0], LanceIndexItem)
 
 
 def _get_ref_field(sample: object, field: str) -> Any:
@@ -62,69 +48,25 @@ def _set_ref_field(sample: object, field: str, value: Any) -> None:
 def _apply_ref_columns(
     source: LanceSource,
     batch: list[object],
-    columns_or_indexes: Sequence[str] | Sequence[LanceIndexItem] | None = None,
-    *,
-    columns: Sequence[str] | None = None,
+    ref_names: Sequence[str],
 ) -> None:
-    """Resolve configured Lance reference columns in-place for one sample batch.
-
-    ``prepare_ref_indexes`` builds a CSR-style lookup for each configured ref
-    column. For every main-dataset global row, ``offsets[row]:offsets[row + 1]``
-    points into ``entries``. The ``entries`` slice contains the row indexes in
-    the reference Lance dataset that correspond to the key or keys stored in
-    the main sample column.
-
-    This function uses those prepared indexes to replace each requested ref
-    column value in ``batch``:
-
-    1. Map every batch sample to its global main-table row index.
-    2. For each active ref column, recover the reference row indexes needed by
-       each sample.
-    3. Fetch each unique reference row once from the reference Lance dataset.
-    4. Scatter fetched values back into the original sample positions while
-       preserving scalar-vs-multi-value shape.
-
-    The input ``batch`` is mutated in place. Samples are expected to contain the
-    internal ``__global_index__`` metadata added by the Lance resolver assembler.
-    """
-
-    # Step 1: Restrict work to the requested/projection-visible ref columns.
-    # If ``columns`` is None, all configured refs are active. Otherwise a ref is
-    # resolved only when its source column is present in the current projection.
-    if columns is None:
-        columns = None if _looks_like_lance_index_items(columns_or_indexes) else columns_or_indexes
-
-    active_refs = (
-        source.ref_columns if columns is None else tuple(ref for ref in source.ref_columns if ref.column in columns)
-    )
+    """Resolve configured Lance reference columns in-place for one sample batch."""
+    active_refs = tuple(ref for ref in source.ref_columns if ref.column in ref_names)
     if not active_refs:
         return
 
-    # Step 2: Convert each batch sample into the global row index used by the
-    # prepared CSR ref index. The index is global across all physical Lance
-    # datasets in ``source``, not local to a single dataset file.
     global_indices = np.asarray([_get_ref_field(item, "__global_index__") for item in batch], dtype=np.int64)
     for ref in active_refs:
-        # Step 3: Validate that ``prepare_ref_indexes`` has attached the CSR
-        # arrays and the prepared reference dataset handle for this ref column.
         if not isinstance(ref.index_handle, dict):
             msg = f"[UnpreparedLanceRefIndex] ref index for {ref.column!r} was not prepared"
             raise RuntimeError(msg)
 
-        # Step 4: Read each sample's CSR range. For sample global row ``i``,
-        # ``offsets[i]:offsets[i + 1]`` gives the slice in ``entries`` holding
-        # the reference dataset row indexes for that sample's key(s).
+        # CSR ranges map main global row indexes to referenced value rows.
         offsets = ref.index_handle["offsets"]
         entries = ref.index_handle["entries"]
         starts = np.asarray(offsets[global_indices], dtype=np.int64)
         ends = np.asarray(offsets[global_indices + 1], dtype=np.int64)
 
-        # Step 5: Build a scatter plan.
-        #
-        # ``per_sample_row_indices`` keeps each sample's ref row indexes in
-        # original key order. ``positions_by_row_index`` groups all output slots
-        # by reference dataset row index, so duplicate references across the
-        # batch are fetched once and then scattered back to every consumer.
         positions_by_row_index: dict[int, list[tuple[int, int]]] = {}
         per_sample_row_indices: list[np.ndarray] = []
         for sample_position, (start, end) in enumerate(zip(starts, ends, strict=True)):
@@ -134,15 +76,11 @@ def _apply_ref_columns(
                 if int(row_index) != REF_INDEX_MISSING_ROW:
                     positions_by_row_index.setdefault(int(row_index), []).append((sample_position, value_position))
 
-        # Step 6: Allocate the output slots before reading values. The slot
-        # counts mirror the source cardinality exactly, which preserves list
-        # lengths and keeps scalar refs distinguishable from empty multi-refs.
         resolved_values: list[list[Any]] = [[] for _ in per_sample_row_indices]
         for sample_position, ref_row_indices in enumerate(per_sample_row_indices):
             resolved_values[sample_position] = [None] * len(ref_row_indices)
 
-        # Step 7: Fetch each unique reference row once, then scatter the fetched
-        # ``value_column`` into every sample/value slot recorded in the plan.
+        # Read each referenced value row once, then scatter it back to every consumer.
         if positions_by_row_index:
             ordered_row_indices = list(positions_by_row_index)
             value_source = ref.index_handle.get("value_source")
@@ -153,10 +91,6 @@ def _apply_ref_columns(
                 for sample_position, value_position in positions_by_row_index[row_index]:
                     resolved_values[sample_position][value_position] = row[ref.value_column]
 
-        # Step 8: Replace the original key column with resolved values. Empty
-        # CSR ranges resolve to ``None`` for scalar refs and ``[]`` for
-        # list/tuple/ndarray refs; non-empty ranges preserve scalar-vs-multi
-        # shape based on the original value.
         for sample, ref_row_indices, values in zip(batch, per_sample_row_indices, resolved_values, strict=True):
             original_value = _get_ref_field(sample, ref.column)
             is_multi_value = isinstance(original_value, (list, tuple, np.ndarray))
@@ -197,65 +131,21 @@ def validate_ref_names(source: LanceSource, ref_names: Sequence[str]) -> tuple[s
     return normalized
 
 
-def iter_lance_ref_resolver(
-    source: LanceSource,
-    sample_stream: Iterable[object],
-    ref_names: Sequence[str],
-    *,
-    batch_size: int = 1024,
-    context: RuntimeContext | None = None,
-    ref_index_scope: LanceRefIndexScope | None = None,
-    ref_index_build_strategy: LanceRefIndexBuildStrategy | None = None,
-    ref_index_bucket_count: int | None = None,
-):
-    """Resolve configured Lance reference columns for already-read samples.
-
-    Args:
-        source: Lance source specification.
-        sample_stream: Stream of samples whose references should be resolved.
-        ref_names: Reference column names to resolve.
-        batch_size: Number of samples to group into each batch.
-        context: Runtime context used for sharding and deterministic randomness.
-        ref_index_scope: Scope that controls where Lance reference indexes are stored.
-
-    Returns:
-        An iterator over samples with resolved Lance references."""
-
-    assembler = LanceRefResolverAssembler(
-        source=source,
-        ref_names=ref_names,
-        batch_size=batch_size,
-        context=context,
-        ref_index_scope=ref_index_scope,
-        ref_index_build_strategy=ref_index_build_strategy,
-        ref_index_bucket_count=ref_index_bucket_count,
-    )
-    for sample in sample_stream:
-        yield from assembler.push(sample)
-    yield from assembler.finish()
-
-
 @dataclass(frozen=True, slots=True)
 class LanceResolveRefFactory:
     """Factory that creates Lance reference resolver assemblers."""
 
     source: LanceSource
     ref_names: tuple[str, ...]
-    batch_size: int = 1024
-    ref_index_scope: LanceRefIndexScope | None = None
-    ref_index_build_strategy: LanceRefIndexBuildStrategy | None = None
-    ref_index_bucket_count: int | None = None
+    config: LanceRefResolverConfig
 
     def __call__(self, context: RuntimeContext) -> LanceRefResolverAssembler:
         """Apply this callable object."""
         return LanceRefResolverAssembler(
             source=self.source,
             ref_names=self.ref_names,
-            batch_size=self.batch_size,
+            config=self.config,
             context=context,
-            ref_index_scope=self.ref_index_scope,
-            ref_index_build_strategy=self.ref_index_build_strategy,
-            ref_index_bucket_count=self.ref_index_bucket_count,
         )
 
 
@@ -267,33 +157,22 @@ class LanceRefResolverAssembler:
         *,
         source: LanceSource,
         ref_names: Sequence[str],
-        batch_size: int = 1024,
+        config: LanceRefResolverConfig,
         context: RuntimeContext | None = None,
-        ref_index_scope: LanceRefIndexScope | None = None,
-        ref_index_build_strategy: LanceRefIndexBuildStrategy | None = None,
-        ref_index_bucket_count: int | None = None,
     ) -> None:
         """Initialize the object."""
-        if batch_size <= 0:
-            msg = f"[InvalidLanceRefBatchSize] batch_size must be > 0, got {batch_size}"
-            raise ValueError(msg)
-        if ref_index_bucket_count is not None and ref_index_bucket_count <= 0:
-            msg = f"[InvalidLanceRefIndexBucketCount] bucket_count must be > 0, got {ref_index_bucket_count}"
+        if config.resolve_batch_size <= 0:
+            msg = f"[InvalidLanceRefResolveBatchSize] resolve_batch_size must be > 0, got {config.resolve_batch_size}"
             raise ValueError(msg)
 
         self.ref_names = validate_ref_names(source, ref_names)
         self.source = prepare_ref_indexes(
             source,
-            columns=self.ref_names,
+            ref_names=self.ref_names,
             context=context,
-            ref_index_scope=ref_index_scope,
-            ref_index_build_strategy=ref_index_build_strategy,
-            ref_index_bucket_count=ref_index_bucket_count,
+            config=config.index,
         )
-        self.batch_size = batch_size
-        self.ref_index_scope = ref_index_scope
-        self.ref_index_build_strategy = ref_index_build_strategy
-        self.ref_index_bucket_count = ref_index_bucket_count
+        self.config = config
         self.batch: list[object] = []
         self.queue_size = 0
 
@@ -323,10 +202,12 @@ class LanceRefResolverAssembler:
             {
                 "kind": "lance_ref_resolver",
                 "ref_names": list(self.ref_names),
-                "batch_size": self.batch_size,
-                "ref_index_scope": self.ref_index_scope,
-                "ref_index_build_strategy": self.ref_index_build_strategy,
-                "ref_index_bucket_count": self.ref_index_bucket_count,
+                "resolve_batch_size": self.config.resolve_batch_size,
+                "ref_index": {
+                    "scope": self.config.index.scope,
+                    "build_strategy": self.config.index.build_strategy,
+                    "bucket_count": self.config.index.bucket_count,
+                },
             }
         )
 
@@ -362,7 +243,7 @@ class LanceRefResolverAssembler:
         self.batch.append(sample)
         self.queue_size += len(sample) if isinstance(sample, list) else 1
 
-        if not sample or self.queue_size >= self.batch_size:
+        if not sample or self.queue_size >= self.config.resolve_batch_size:
             return self._flush()
 
         return ()

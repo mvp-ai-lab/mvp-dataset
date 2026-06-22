@@ -94,7 +94,6 @@ Dataset.from_source(
     shuffle_mode="none",
     chunk_shuffle=None,
     ref_columns=None,
-    ref_index_scope=None,
 )
 ```
 
@@ -104,9 +103,11 @@ Arguments:
 - `columns`: optional projection.
 - `read_batch_size`: number of row indexes aggregated into one Lance read call.
 - `shuffle_mode`: `"none"`, `"global"`, or `"chunk"`.
-- `chunk_shuffle`: optional chunk shuffle configuration when `shuffle_mode="chunk"`.
-- `ref_columns`: optional Lance reference column configuration.
-- `ref_index_scope`: optional reference-index storage scope.
+- `chunk_shuffle`: optional chunk shuffle dict when `shuffle_mode="chunk"`.
+  Supported keys are `chunk_size` (default `250000`), `k` (default `8`), and
+  `row_order` (`"permuted"` or `"sequential"`, default `"permuted"`).
+- `ref_columns`: optional mapping from output column name to a dict with `uri`, `key_column`, and `value_column`.
+  `uri` may be a single Lance dataset URI or a list of URIs.
 
 Lance source notes:
 
@@ -133,11 +134,23 @@ dataset = Dataset.from_source(
 
 dataset = dataset.resolve_ref(
     ["image"],
-    ref_index_build_strategy="auto",
-    ref_index_bucket_count=4096,
+    resolve_batch_size=1024,
+    index={
+        "scope": "shared",
+        "build_strategy": "auto",
+        "bucket_count": 4096,
+    },
 )
 ```
 
 `resolve_ref(...)` appends a stateful assembly stage that resolves configured reference values lazily.
-Missing reference indexes are built with `ref_index_build_strategy="auto"` by default. Small sources use the in-memory
-builder, while larger sources use a bucketed on-disk join to avoid keeping all reference keys in memory.
+The `index` dict supports:
+
+- `scope`: `"shared"` (default), `"node_local"`, or `"process"`.
+- `build_strategy`: `"auto"` (default), `"in_memory"`, or `"bucketed"`.
+- `bucket_count`: positive integer for `"bucketed"` builds. Defaults to `4096`.
+
+With `build_strategy="auto"`, small sources use the in-memory builder, while larger sources use a bucketed on-disk
+join to avoid keeping all reference keys in memory.
+By default, index cache files are stored under the main Lance dataset. Set
+`MVP_DATASET_LANCE_REF_INDEX_CACHE_DIR` to place them in another directory.

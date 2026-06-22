@@ -8,23 +8,30 @@ import os
 import shutil
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
 import lance
 import numpy as np
+import pyarrow as pa
 
 from mvp_dataset.core.context import RuntimeContext
 
 from ..source import list_lance_sources
-from ..types import LanceDatasetSpec, LanceRefIndexScope, LanceRefSpec, LanceSource
-from .read import _iter_table_record_batches
+from ..types import (
+    LanceDatasetSpec,
+    LanceRefIndexConfig,
+    LanceRefIndexScope,
+    LanceRefSpec,
+    LanceSource,
+)
 
 REF_INDEX_BUILDER_VERSION = 1
 REF_INDEX_MISSING_ROW = -1
 REF_INDEX_MANIFEST = "metadata.json"
 REF_INDEX_DIR = "_mvp_ref_index"
+REF_INDEX_CACHE_DIR_ENV = "MVP_DATASET_LANCE_REF_INDEX_CACHE_DIR"
 REF_INDEX_BUILD_BATCH_SIZE = 65536
 REF_INDEX_LOCK_POLL_SECONDS = 0.25
 REF_INDEX_WAIT_TIMEOUT_SECONDS = 30 * 60
@@ -69,6 +76,21 @@ def _bucket_id_for_key_token(key_token: str, *, bucket_count: int) -> int:
     return int(digest[:16], 16) % bucket_count
 
 
+def _iter_table_record_batches(
+    dataset_handle: object,
+    *,
+    columns: Sequence[str],
+    batch_size: int = REF_INDEX_BUILD_BATCH_SIZE,
+) -> Iterable[pa.RecordBatch]:
+    to_batches = getattr(dataset_handle, "to_batches", None)
+    if callable(to_batches):
+        yield from to_batches(columns=columns, batch_size=batch_size)
+        return
+
+    scanner = dataset_handle.scanner(columns=columns, batch_size=batch_size, scan_in_order=True)
+    yield from scanner.to_batches()
+
+
 class _BucketWriter:
     """Write hash-bucketed records without keeping all files open."""
 
@@ -99,28 +121,11 @@ class _BucketWriter:
         self.close()
 
 
-def _resolve_ref_index_build_strategy(strategy: str | None, source: LanceSource) -> str:
-    raw_strategy = strategy or os.environ.get("MVP_LANCE_REF_INDEX_BUILD_STRATEGY", REF_INDEX_DEFAULT_BUILD_STRATEGY)
-    if raw_strategy not in ("auto", "in_memory", "bucketed"):
-        msg = f"[InvalidLanceRefIndexBuildStrategy] expected auto, in_memory, or bucketed, got {raw_strategy!r}"
-        raise ValueError(msg)
-    if raw_strategy != "auto":
-        return raw_strategy
-
-    raw_min_rows = os.environ.get("MVP_LANCE_REF_INDEX_AUTO_BUCKETED_MIN_ROWS")
-    min_rows = REF_INDEX_AUTO_BUCKETED_MIN_ROWS if raw_min_rows is None else int(raw_min_rows)
-    return "bucketed" if source.total_rows >= min_rows else "in_memory"
-
-
-def _resolve_ref_index_bucket_count(bucket_count: int | None) -> int:
-    raw_bucket_count = bucket_count
-    if raw_bucket_count is None:
-        env_bucket_count = os.environ.get("MVP_LANCE_REF_INDEX_BUCKET_COUNT")
-        raw_bucket_count = REF_INDEX_DEFAULT_BUCKET_COUNT if env_bucket_count is None else int(env_bucket_count)
-    if raw_bucket_count <= 0:
-        msg = f"[InvalidLanceRefIndexBucketCount] bucket_count must be > 0, got {raw_bucket_count}"
-        raise ValueError(msg)
-    return raw_bucket_count
+def _resolve_ref_index_root(source: LanceSource) -> Path:
+    raw_cache_dir = os.environ.get(REF_INDEX_CACHE_DIR_ENV)
+    if raw_cache_dir:
+        return Path(raw_cache_dir).expanduser()
+    return Path(source.datasets[0].uri) / REF_INDEX_DIR
 
 
 def _dataset_manifest_fingerprint(uri: str) -> dict[str, Any]:
@@ -208,38 +213,6 @@ def _ref_index_is_valid(
     )
 
 
-def _acquire_ref_index_build_lock(
-    lock_dir: Path,
-    index_dir: Path,
-    manifest: dict[str, Any],
-    ref_files: dict[str, dict[str, Any]],
-    active_refs: Sequence[LanceRefSpec],
-) -> bool:
-    """Try to acquire the file lock for building a reference index."""
-    lock_dir.parent.mkdir(parents=True, exist_ok=True)
-    while True:
-        if _ref_index_is_valid(index_dir, manifest, ref_files, active_refs):
-            return False
-        try:
-            lock_dir.mkdir()
-            (lock_dir / "owner.json").write_text(
-                json.dumps({"pid": os.getpid(), "created_at": time.time()}, sort_keys=True),
-                encoding="utf-8",
-            )
-            return True
-        except FileExistsError:
-            time.sleep(REF_INDEX_LOCK_POLL_SECONDS)
-
-
-def _resolve_ref_index_scope(scope: LanceRefIndexScope | None) -> LanceRefIndexScope:
-    """Resolve where a reference index should be stored."""
-    raw_scope = scope or os.environ.get("MVP_LANCE_REF_INDEX_SCOPE", "shared")
-    if raw_scope not in ("shared", "node_local", "process"):
-        msg = f"[InvalidLanceRefIndexScope] expected shared, node_local, or process, got {raw_scope!r}"
-        raise ValueError(msg)
-    return raw_scope
-
-
 def _is_ref_index_builder(context: RuntimeContext | None, scope: LanceRefIndexScope) -> bool:
     """Return whether this worker should build the reference index."""
     if context is None or scope == "process":
@@ -248,8 +221,7 @@ def _is_ref_index_builder(context: RuntimeContext | None, scope: LanceRefIndexSc
         return context.rank == 0 and context.worker_id == 0
     if scope == "node_local":
         return context.local_rank == 0 and context.worker_id == 0
-    msg = f"[InvalidLanceRefIndexScope] expected shared, node_local, or process, got {scope!r}"
-    raise ValueError(msg)
+    return False
 
 
 def _wait_for_ref_index(
@@ -280,35 +252,6 @@ def _publish_ref_index(tmp_index_dir: Path, index_dir: Path) -> None:
     except OSError:
         if not index_dir.exists():
             raise
-
-
-def _build_ref_index(
-    index_dir: Path,
-    manifest: dict[str, Any],
-    ref_files: dict[str, dict[str, Any]],
-    active_refs: Sequence[LanceRefSpec],
-    source: LanceSource,
-    *,
-    build_strategy: str,
-    bucket_count: int,
-) -> None:
-    """Build lookup indexes for Lance reference fields."""
-    if build_strategy == "bucketed":
-        _build_ref_index_bucketed(
-            index_dir,
-            manifest,
-            ref_files,
-            active_refs,
-            source,
-            bucket_count=bucket_count,
-        )
-        return
-    if build_strategy == "in_memory":
-        _build_ref_index_in_memory(index_dir, manifest, ref_files, active_refs, source)
-        return
-
-    msg = f"[InvalidLanceRefIndexBuildStrategy] expected in_memory or bucketed, got {build_strategy!r}"
-    raise ValueError(msg)
 
 
 def _build_ref_index_in_memory(
@@ -532,30 +475,25 @@ def _join_ref_buckets(
 def prepare_ref_indexes(
     source: LanceSource,
     *,
-    columns: Sequence[str] | None = None,
+    ref_names: Sequence[str],
     context: RuntimeContext | None = None,
-    ref_index_scope: LanceRefIndexScope | None = None,
-    ref_index_build_strategy: str | None = None,
-    ref_index_bucket_count: int | None = None,
+    config: LanceRefIndexConfig,
 ) -> LanceSource:
     """Ensure all configured Lance reference indexes are available.
 
     Args:
         source: Lance source specification.
-        columns: Column names to read from the source.
+        ref_names: Reference column names to prepare.
         context: Runtime context used for sharding and deterministic randomness.
-        ref_index_scope: Scope that controls where Lance reference indexes are stored.
-        ref_index_build_strategy: Strategy for building missing reference indexes.
-        ref_index_bucket_count: Number of temporary hash buckets for bucketed builds.
+        config: Reference index configuration.
 
     Returns:
         A Lance source specification whose reference indexes are ready."""
     if not source.ref_columns:
         return source
 
-    active_refs = (
-        source.ref_columns if columns is None else tuple(ref for ref in source.ref_columns if ref.column in columns)
-    )
+    ref_name_set = set(ref_names)
+    active_refs = tuple(ref for ref in source.ref_columns if ref.column in ref_name_set)
     if not active_refs:
         return LanceSource(datasets=source.datasets, ref_columns=())
 
@@ -583,29 +521,29 @@ def prepare_ref_indexes(
         },
     }
     digest = hashlib.sha256(json.dumps(manifest, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:32]
-    index_root = Path(source.datasets[0].uri) / REF_INDEX_DIR
+    index_root = _resolve_ref_index_root(source)
     index_dir = index_root / f"ref-index-{digest}"
-    scope = _resolve_ref_index_scope(ref_index_scope)
-    build_strategy = _resolve_ref_index_build_strategy(ref_index_build_strategy, source)
-    bucket_count = (
-        _resolve_ref_index_bucket_count(ref_index_bucket_count)
-        if build_strategy == "bucketed"
-        else REF_INDEX_DEFAULT_BUCKET_COUNT
-    )
+    scope = config.scope or "shared"
+    build_strategy = config.build_strategy or REF_INDEX_DEFAULT_BUILD_STRATEGY
+    if build_strategy == "auto":
+        build_strategy = "bucketed" if source.total_rows >= REF_INDEX_AUTO_BUCKETED_MIN_ROWS else "in_memory"
+    bucket_count = config.bucket_count or REF_INDEX_DEFAULT_BUCKET_COUNT
 
     if not _ref_index_is_valid(index_dir, manifest, ref_files, active_refs):
         if _is_ref_index_builder(context, scope):
             tmp_index_dir = index_root / ".tmp" / f"ref-index-{digest}-{os.getpid()}-{uuid.uuid4().hex}"
             try:
-                _build_ref_index(
-                    tmp_index_dir,
-                    manifest,
-                    ref_files,
-                    active_refs,
-                    source,
-                    build_strategy=build_strategy,
-                    bucket_count=bucket_count,
-                )
+                if build_strategy == "in_memory":
+                    _build_ref_index_in_memory(tmp_index_dir, manifest, ref_files, active_refs, source)
+                else:
+                    _build_ref_index_bucketed(
+                        tmp_index_dir,
+                        manifest,
+                        ref_files,
+                        active_refs,
+                        source,
+                        bucket_count=bucket_count,
+                    )
                 if not _ref_index_is_valid(index_dir, manifest, ref_files, active_refs):
                     _publish_ref_index(tmp_index_dir, index_dir)
             finally:
@@ -629,7 +567,6 @@ def prepare_ref_indexes(
             else np.memmap(entries_path, dtype=np.int64, mode="r", shape=(entry_count,))
         )
         value_source = _open_ref_value_source(ref)
-        value_dataset = value_source.datasets[0].handle if len(value_source.datasets) == 1 else None
         prepared_refs.append(
             LanceRefSpec(
                 column=ref.column,
@@ -642,7 +579,6 @@ def prepare_ref_indexes(
                 index_handle={
                     "offsets": offsets,
                     "entries": entries,
-                    "value_dataset": value_dataset,
                     "value_source": value_source,
                 },
             )

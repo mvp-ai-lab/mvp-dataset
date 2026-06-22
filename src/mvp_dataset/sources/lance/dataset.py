@@ -12,9 +12,14 @@ from mvp_dataset.core.types import ShardInput, StageSpec
 from .config import resolve_lance_source_config
 from .iterator import _LanceSourceIterator
 from .order import ChunkShuffleConfig, ChunkShuffleInput, resolve_chunk_shuffle_config
-from .refs import LanceResolveRefFactory, attach_lance_ref_columns, validate_ref_names
+from .refs import (
+    LanceResolveRefFactory,
+    attach_lance_ref_columns,
+    resolve_ref_index_config,
+    validate_ref_names,
+)
 from .source import list_lance_sources
-from .types import LanceRefIndexBuildStrategy, LanceRefIndexScope, LanceShuffleMode
+from .types import LanceRefIndexConfigInput, LanceRefResolverConfig, LanceShuffleMode
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,7 +30,6 @@ class LanceDataset(Dataset):
     _columns: tuple[str, ...] | None = None
     _read_batch_size: int = 1024
     _chunk_shuffle: ChunkShuffleConfig | None = None
-    _ref_index_scope: LanceRefIndexScope | None = None
 
     @classmethod
     def from_source(
@@ -38,7 +42,6 @@ class LanceDataset(Dataset):
         shuffle_mode: LanceShuffleMode = "none",
         chunk_shuffle: ChunkShuffleInput = None,
         ref_columns: dict[str, dict[str, str]] | None = None,
-        ref_index_scope: LanceRefIndexScope | None = None,
     ):
         """Build a dataset from local Lance dataset paths.
 
@@ -49,9 +52,16 @@ class LanceDataset(Dataset):
             columns: Column names to read from the source.
             read_batch_size: Number of row indexes aggregated into one Lance read call.
             shuffle_mode: Source-level shuffle mode.
-            chunk_shuffle: Optional chunk shuffle configuration.
-            ref_columns: Lance reference column configuration.
-            ref_index_scope: Scope that controls where Lance reference indexes are stored.
+            chunk_shuffle: Optional chunk shuffle configuration used when ``shuffle_mode="chunk"``.
+                Supported keys are:
+                ``chunk_size``: positive integer number of rows in each chunk. Defaults to ``250000``.
+                ``k``: positive integer number of chunks in each local shuffle window. Defaults to ``8``.
+                ``row_order``: ``"permuted"`` to shuffle rows inside chunks, or ``"sequential"`` to keep rows
+                sequential inside each shuffled chunk. Defaults to ``"permuted"``.
+            ref_columns: Optional Lance reference column configuration. It maps output column names to dicts with:
+                ``uri``: reference Lance dataset URI, or a list of URIs.
+                ``key_column``: column in the reference dataset containing lookup keys.
+                ``value_column``: column in the reference dataset containing resolved values.
 
         Returns:
             A dataset configured for the requested source."""
@@ -85,7 +95,6 @@ class LanceDataset(Dataset):
             _columns=tuple(columns) if columns is not None else None,
             _read_batch_size=read_batch_size,
             _chunk_shuffle=resolved_chunk_shuffle,
-            _ref_index_scope=ref_index_scope,
         )
 
     def _build_source_stream(self, *, context: RuntimeContext) -> Iterable[object]:
@@ -112,7 +121,6 @@ class LanceDataset(Dataset):
             "resample": self._resample,
             "shuffle_mode": self._shuffle_mode,
             "chunk_shuffle": self._chunk_shuffle_fingerprint(),
-            "ref_index_scope": self._ref_index_scope,
             "iter": {
                 "columns": list(self._columns) if self._columns else None,
                 "read_batch_size": self._read_batch_size,
@@ -154,41 +162,45 @@ class LanceDataset(Dataset):
         self,
         ref_names: Sequence[str],
         *,
-        batch_size: int = 1024,
+        resolve_batch_size: int = 1024,
         context: RuntimeContext | None = None,
-        ref_index_scope: LanceRefIndexScope | None = None,
-        ref_index_build_strategy: LanceRefIndexBuildStrategy | None = None,
-        ref_index_bucket_count: int | None = None,
+        index: LanceRefIndexConfigInput = None,
     ) -> Dataset:
         """Append a lazy stage that resolves configured Lance reference columns.
 
         Args:
             ref_names: Reference column names to resolve.
-            batch_size: Number of samples to group into each batch.
+            resolve_batch_size: Number of source samples to collect before resolving reference values.
             context: Runtime context used for sharding and deterministic randomness.
-            ref_index_scope: Scope that controls where Lance reference indexes are stored.
-            ref_index_build_strategy: Strategy for building missing reference indexes.
-            ref_index_bucket_count: Number of temporary hash buckets for bucketed builds.
+            index: Optional reference index configuration. Supported keys are:
+                ``scope``: where workers coordinate index building. Use ``"shared"`` for one
+                builder across all ranks, ``"node_local"`` for one builder per node, or
+                ``"process"`` for each process to build independently. Defaults to ``"shared"``.
+                ``build_strategy``: missing-index build strategy. Use ``"auto"``, ``"in_memory"``,
+                or ``"bucketed"``. Defaults to ``"auto"``, which uses ``"in_memory"`` for small
+                sources and ``"bucketed"`` for large sources.
+                ``bucket_count``: positive integer number of hash buckets used by ``"bucketed"``
+                builds. Defaults to ``4096``.
+                Index cache files are stored under the main Lance dataset by default. Set
+                ``MVP_DATASET_LANCE_REF_INDEX_CACHE_DIR`` to use another cache directory.
 
         Returns:
             A dataset that resolves the requested Lance reference columns."""
-        if batch_size <= 0:
-            msg = "[InvalidLanceRefBatchSize] batch_size must be a positive integer"
-            raise ValueError(msg)
-        if ref_index_bucket_count is not None and ref_index_bucket_count <= 0:
-            msg = "[InvalidLanceRefIndexBucketCount] bucket_count must be > 0"
+        if resolve_batch_size <= 0:
+            msg = "[InvalidLanceRefResolveBatchSize] resolve_batch_size must be a positive integer"
             raise ValueError(msg)
 
         ref_names = validate_ref_names(self._source[0], ref_names)
         source = self._source[0]
+        ref_index = resolve_ref_index_config(index)
 
         factory = LanceResolveRefFactory(
             source=source,
             ref_names=ref_names,
-            batch_size=batch_size,
-            ref_index_scope=ref_index_scope if ref_index_scope is not None else self._ref_index_scope,
-            ref_index_build_strategy=ref_index_build_strategy,
-            ref_index_bucket_count=ref_index_bucket_count,
+            config=LanceRefResolverConfig(
+                resolve_batch_size=resolve_batch_size,
+                index=ref_index,
+            ),
         )
         stage_context = self.context if context is None else context
         spec = StageSpec(

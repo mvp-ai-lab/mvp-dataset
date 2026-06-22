@@ -8,6 +8,7 @@ from typing import Literal
 LanceShuffleMode = Literal["none", "global", "chunk"]
 LanceRefIndexScope = Literal["shared", "node_local", "process"]
 LanceRefIndexBuildStrategy = Literal["auto", "in_memory", "bucketed"]
+LanceRefIndexConfigInput = dict[str, object] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +33,23 @@ class LanceRefSpec:
     index_offsets_path: str | None = None
     index_entries_path: str | None = None
     index_handle: object | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LanceRefIndexConfig:
+    """Reference index preparation configuration."""
+
+    scope: LanceRefIndexScope | None = None
+    build_strategy: LanceRefIndexBuildStrategy | None = None
+    bucket_count: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LanceRefResolverConfig:
+    """Reference resolver runtime configuration."""
+
+    resolve_batch_size: int = 1024
+    index: LanceRefIndexConfig = field(default_factory=LanceRefIndexConfig)
 
 
 @dataclass(frozen=True, slots=True)
