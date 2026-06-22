@@ -11,9 +11,9 @@ from mvp_dataset.core.types import ShardInput, StageSpec
 
 from .config import resolve_lance_source_config
 from .iterator import _LanceSourceIterator
-from .reader import list_lance_sources
+from .order import ChunkShuffleConfig, ChunkShuffleInput, resolve_chunk_shuffle_config
 from .refs import LanceResolveRefFactory, attach_lance_ref_columns, validate_ref_names
-from .shuffle import DEFAULT_CHUNK_AWARE_SHUFFLE_CHUNK_SIZE, DEFAULT_CHUNK_AWARE_SHUFFLE_K
+from .source import list_lance_sources
 from .types import LanceRefIndexBuildStrategy, LanceRefIndexScope, LanceShuffleMode
 
 
@@ -22,10 +22,9 @@ class LanceDataset(Dataset):
     """Dataset configuration for Lance datasets."""
 
     _shuffle_mode: LanceShuffleMode = "none"
-    _chunk_aware_shuffle_chunk_size: int = DEFAULT_CHUNK_AWARE_SHUFFLE_CHUNK_SIZE
-    _chunk_aware_shuffle_k: int = DEFAULT_CHUNK_AWARE_SHUFFLE_K
     _columns: tuple[str, ...] | None = None
-    _batch_size: int = 1024
+    _read_batch_size: int = 1024
+    _chunk_shuffle: ChunkShuffleConfig | None = None
     _ref_index_scope: LanceRefIndexScope | None = None
 
     @classmethod
@@ -35,10 +34,9 @@ class LanceDataset(Dataset):
         context: RuntimeContext | None = None,
         resample: bool = False,
         columns: Sequence[str] | None = None,
-        batch_size: int = 1024,
+        read_batch_size: int = 1024,
         shuffle_mode: LanceShuffleMode = "none",
-        chunk_aware_shuffle_chunk_size: int = DEFAULT_CHUNK_AWARE_SHUFFLE_CHUNK_SIZE,
-        chunk_aware_shuffle_k: int = DEFAULT_CHUNK_AWARE_SHUFFLE_K,
+        chunk_shuffle: ChunkShuffleInput = None,
         ref_columns: dict[str, dict[str, str]] | None = None,
         ref_index_scope: LanceRefIndexScope | None = None,
     ):
@@ -49,27 +47,24 @@ class LanceDataset(Dataset):
             context: Runtime context used for sharding and deterministic randomness.
             resample: Whether to repeat the source indefinitely across rounds.
             columns: Column names to read from the source.
-            batch_size: Number of samples to group into each batch.
+            read_batch_size: Number of row indexes aggregated into one Lance read call.
             shuffle_mode: Source-level shuffle mode.
-            chunk_aware_shuffle_chunk_size: Number of rows per chunk when using
-                ``shuffle_mode="chunk_aware"``.
-            chunk_aware_shuffle_k: Number of active chunks to interleave when
-                using ``shuffle_mode="chunk_aware"``.
+            chunk_shuffle: Optional chunk shuffle configuration.
             ref_columns: Lance reference column configuration.
             ref_index_scope: Scope that controls where Lance reference indexes are stored.
 
         Returns:
             A dataset configured for the requested source."""
-        if batch_size <= 0:
-            msg = "[InvalidLanceBatchSize] batch_size must be a positive integer"
+        if read_batch_size <= 0:
+            msg = "[InvalidLanceReadBatchSize] read_batch_size must be a positive integer"
             raise ValueError(msg)
-        if chunk_aware_shuffle_chunk_size <= 0:
-            msg = "[InvalidLanceChunkAwareShuffle] chunk_size must be > 0"
+        if shuffle_mode not in ("none", "global", "chunk"):
+            msg = f"[InvalidLanceShuffleMode] expected none, global, or chunk, got {shuffle_mode!r}"
             raise ValueError(msg)
-        if chunk_aware_shuffle_k <= 0:
-            msg = "[InvalidLanceChunkAwareShuffle] k must be > 0"
+        if chunk_shuffle is not None and shuffle_mode != "chunk":
+            msg = "[InvalidLanceChunkShuffle] chunk_shuffle requires shuffle_mode='chunk'"
             raise ValueError(msg)
-
+        resolved_chunk_shuffle = resolve_chunk_shuffle_config(chunk_shuffle) if shuffle_mode == "chunk" else None
         runtime_context = RuntimeContext.from_runtime() if context is None else context
         normalized_shards, resolved_ref_columns = resolve_lance_source_config(shards, ref_columns)
         # 1. Merge all shards into a single source spec, validating that they can be read together.
@@ -87,10 +82,9 @@ class LanceDataset(Dataset):
             _source_kind="lance",
             _stages=(),
             _shuffle_mode=shuffle_mode,
-            _chunk_aware_shuffle_chunk_size=chunk_aware_shuffle_chunk_size,
-            _chunk_aware_shuffle_k=chunk_aware_shuffle_k,
             _columns=tuple(columns) if columns is not None else None,
-            _batch_size=batch_size,
+            _read_batch_size=read_batch_size,
+            _chunk_shuffle=resolved_chunk_shuffle,
             _ref_index_scope=ref_index_scope,
         )
 
@@ -104,11 +98,10 @@ class LanceDataset(Dataset):
             context=context,
             resample=self._resample,
             columns=self._columns,
-            batch_size=self._batch_size,
+            read_batch_size=self._read_batch_size,
             source_fingerprint=stable_fingerprint(self._source_fingerprint()),
             shuffle_mode=self._shuffle_mode,
-            chunk_aware_shuffle_chunk_size=self._chunk_aware_shuffle_chunk_size,
-            chunk_aware_shuffle_k=self._chunk_aware_shuffle_k,
+            chunk_config=self._chunk_shuffle,
         )
 
     def _source_fingerprint(self) -> dict[str, object]:
@@ -118,22 +111,17 @@ class LanceDataset(Dataset):
             "kind": "lance",
             "resample": self._resample,
             "shuffle_mode": self._shuffle_mode,
-            "chunk_aware_shuffle": {
-                "chunk_size": self._chunk_aware_shuffle_chunk_size,
-                "k": self._chunk_aware_shuffle_k,
-            },
+            "chunk_shuffle": self._chunk_shuffle_fingerprint(),
             "ref_index_scope": self._ref_index_scope,
             "iter": {
                 "columns": list(self._columns) if self._columns else None,
-                "batch_size": self._batch_size,
+                "read_batch_size": self._read_batch_size,
             },
             "datasets": [
                 {
                     "uri": dataset.uri,
                     "num_rows": dataset.num_rows,
                     "row_offset": dataset.row_offset,
-                    "fragment_ids": list(dataset.fragment_ids),
-                    "fragment_row_counts": list(dataset.fragment_row_counts),
                 }
                 for dataset in source.datasets
             ],
@@ -149,6 +137,17 @@ class LanceDataset(Dataset):
                 }
                 for ref in source.ref_columns
             ],
+        }
+
+    def _chunk_shuffle_fingerprint(self) -> dict[str, int] | None:
+        """Return chunk shuffle fingerprint payload."""
+        config = self._chunk_shuffle
+        if config is None:
+            return None
+        return {
+            "chunk_size": config.chunk_size,
+            "k": config.k,
+            "row_order": config.row_order,
         }
 
     def resolve_ref(

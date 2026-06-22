@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..types import LanceRefSpec, LanceSourceSpec
+from ..types import LanceRefSpec, LanceSource
 
 
 def parse_lance_ref_columns(ref_columns: object) -> tuple[LanceRefSpec, ...]:
@@ -58,7 +58,7 @@ def parse_lance_ref_columns(ref_columns: object) -> tuple[LanceRefSpec, ...]:
     return tuple(specs)
 
 
-def attach_lance_ref_columns(source: LanceSourceSpec, ref_columns: object) -> LanceSourceSpec:
+def attach_lance_ref_columns(source: LanceSource, ref_columns: object) -> LanceSource:
     """Attach Lance reference resolution stages to a dataset.
 
     Args:
@@ -67,4 +67,4 @@ def attach_lance_ref_columns(source: LanceSourceSpec, ref_columns: object) -> La
 
     Returns:
         A Lance source specification with reference metadata attached."""
-    return LanceSourceSpec(datasets=source.datasets, ref_columns=parse_lance_ref_columns(ref_columns))
+    return LanceSource(datasets=source.datasets, ref_columns=parse_lance_ref_columns(ref_columns))

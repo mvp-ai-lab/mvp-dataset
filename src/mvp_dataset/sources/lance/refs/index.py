@@ -17,8 +17,8 @@ import numpy as np
 
 from mvp_dataset.core.context import RuntimeContext
 
-from ..reader import list_lance_sources
-from ..types import LanceDatasetSpec, LanceRefIndexScope, LanceRefSpec, LanceSourceSpec
+from ..source import list_lance_sources
+from ..types import LanceDatasetSpec, LanceRefIndexScope, LanceRefSpec, LanceSource
 from .read import _iter_table_record_batches
 
 REF_INDEX_BUILDER_VERSION = 1
@@ -99,7 +99,7 @@ class _BucketWriter:
         self.close()
 
 
-def _resolve_ref_index_build_strategy(strategy: str | None, source: LanceSourceSpec) -> str:
+def _resolve_ref_index_build_strategy(strategy: str | None, source: LanceSource) -> str:
     raw_strategy = strategy or os.environ.get("MVP_LANCE_REF_INDEX_BUILD_STRATEGY", REF_INDEX_DEFAULT_BUILD_STRATEGY)
     if raw_strategy not in ("auto", "in_memory", "bucketed"):
         msg = f"[InvalidLanceRefIndexBuildStrategy] expected auto, in_memory, or bucketed, got {raw_strategy!r}"
@@ -170,20 +170,21 @@ def _ref_manifest_fingerprint(ref: LanceRefSpec) -> dict[str, Any]:
     }
 
 
-def _open_ref_value_source(ref: LanceRefSpec) -> LanceSourceSpec:
+def _open_ref_value_source(ref: LanceRefSpec) -> LanceSource:
     """Open the value source for a Lance reference field."""
     source = list_lance_sources(_ref_uris(ref))[0]
-    for dataset_i, dataset in enumerate(source.datasets):
+    datasets: list[LanceDatasetSpec] = []
+    for dataset in source.datasets:
         ds_handle: object = lance.dataset(dataset.uri)
-        source.datasets[dataset_i] = LanceDatasetSpec(
-            uri=dataset.uri,
-            num_rows=dataset.num_rows,
-            row_offset=dataset.row_offset,
-            fragment_ids=dataset.fragment_ids,
-            fragment_row_counts=dataset.fragment_row_counts,
-            handle=ds_handle,
+        datasets.append(
+            LanceDatasetSpec(
+                uri=dataset.uri,
+                num_rows=dataset.num_rows,
+                row_offset=dataset.row_offset,
+                handle=ds_handle,
+            )
         )
-    return source
+    return LanceSource(datasets=tuple(datasets), ref_columns=source.ref_columns)
 
 
 def _ref_index_is_valid(
@@ -286,7 +287,7 @@ def _build_ref_index(
     manifest: dict[str, Any],
     ref_files: dict[str, dict[str, Any]],
     active_refs: Sequence[LanceRefSpec],
-    source: LanceSourceSpec,
+    source: LanceSource,
     *,
     build_strategy: str,
     bucket_count: int,
@@ -315,7 +316,7 @@ def _build_ref_index_in_memory(
     manifest: dict[str, Any],
     ref_files: dict[str, dict[str, Any]],
     active_refs: Sequence[LanceRefSpec],
-    source: LanceSourceSpec,
+    source: LanceSource,
 ) -> None:
     """Build lookup indexes with an in-memory key-to-entry map."""
     manifest_path = index_dir / REF_INDEX_MANIFEST
@@ -395,7 +396,7 @@ def _build_ref_index_bucketed(
     manifest: dict[str, Any],
     ref_files: dict[str, dict[str, Any]],
     active_refs: Sequence[LanceRefSpec],
-    source: LanceSourceSpec,
+    source: LanceSource,
     *,
     bucket_count: int,
 ) -> None:
@@ -415,9 +416,7 @@ def _build_ref_index_bucketed(
         )
         offsets_by_column[ref.column][0] = 0
 
-    main_writers = {
-        ref.column: _BucketWriter(bucket_root / ref.column / "main") for ref in active_refs
-    }
+    main_writers = {ref.column: _BucketWriter(bucket_root / ref.column / "main") for ref in active_refs}
     try:
         global_row_index = 0
         main_columns = [ref.column for ref in active_refs]
@@ -531,14 +530,14 @@ def _join_ref_buckets(
 
 
 def prepare_ref_indexes(
-    source: LanceSourceSpec,
+    source: LanceSource,
     *,
     columns: Sequence[str] | None = None,
     context: RuntimeContext | None = None,
     ref_index_scope: LanceRefIndexScope | None = None,
     ref_index_build_strategy: str | None = None,
     ref_index_bucket_count: int | None = None,
-) -> LanceSourceSpec:
+) -> LanceSource:
     """Ensure all configured Lance reference indexes are available.
 
     Args:
@@ -558,7 +557,7 @@ def prepare_ref_indexes(
         source.ref_columns if columns is None else tuple(ref for ref in source.ref_columns if ref.column in columns)
     )
     if not active_refs:
-        return LanceSourceSpec(datasets=source.datasets, ref_columns=())
+        return LanceSource(datasets=source.datasets, ref_columns=())
 
     ref_files = {
         ref.column: {
@@ -649,4 +648,4 @@ def prepare_ref_indexes(
             )
         )
 
-    return LanceSourceSpec(datasets=source.datasets, ref_columns=tuple(prepared_refs))
+    return LanceSource(datasets=source.datasets, ref_columns=tuple(prepared_refs))

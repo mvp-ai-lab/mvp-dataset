@@ -74,7 +74,7 @@ dataset = Dataset.from_source(
 
 Parquet rows are yielded as dictionaries. `columns=` controls projection at read time.
 
-Parquet scheduling works on fragments built from row groups, which makes resume and distributed assignment cheaper than row-by-row skipping.
+Parquet scheduling works on chunks built from row groups, which makes resume and distributed assignment cheaper than row-by-row skipping.
 
 ## Lance Rows
 
@@ -84,8 +84,8 @@ Lance supports these source shuffle modes:
 
 - `none`: deterministic slot-stride order.
 - `global`: deterministic global permutation without materializing a full index list.
-- `chunk_aware`: deterministic chunk-window shuffle with bounded row-permutation state.
-- `fragment_aware`: deterministic row order with better fragment locality.
+- `chunk`: deterministic chunk-window shuffle with bounded row-permutation state.
+- `chunk` can be tuned with `chunk_shuffle={"chunk_size": ..., "k": ..., "row_order": ...}`.
 
 ## Environment Variables
 

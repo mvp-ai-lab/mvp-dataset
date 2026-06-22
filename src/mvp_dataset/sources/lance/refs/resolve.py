@@ -2,30 +2,29 @@
 
 from __future__ import annotations
 
-import bisect
 from collections.abc import Iterable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-import lance
 import numpy as np
 
 from mvp_dataset.core.context import RuntimeContext
 from mvp_dataset.core.resume import ResumeStateError, stable_fingerprint
 from mvp_dataset.core.types import Sample
 
+from ..order import map_global_indexes
+from ..reader import LanceBatchReader
 from ..types import (
     LanceIndexItem,
     LanceRefIndexBuildStrategy,
     LanceRefIndexScope,
-    LanceSourceSpec,
+    LanceSource,
 )
 from .index import REF_INDEX_MISSING_ROW, _open_ref_value_source, prepare_ref_indexes
-from .read import _read_table_rows
 
 
 def _read_ref_value_rows(
-    value_source: LanceSourceSpec,
+    value_source: LanceSource,
     row_indices: Sequence[int],
     *,
     columns: Sequence[str],
@@ -34,31 +33,8 @@ def _read_ref_value_rows(
     if not row_indices:
         return []
 
-    row_offsets = [dataset.row_offset for dataset in value_source.datasets]
-    batch_indexes: list[LanceIndexItem] = []
-    for row_index in row_indices:
-        dataset_i = bisect.bisect_right(row_offsets, row_index) - 1
-        dataset = value_source.datasets[dataset_i]
-        local_index = int(row_index - dataset.row_offset)
-        batch_indexes.append(LanceIndexItem(dataset_i=dataset_i, local_index=local_index, global_index=int(row_index)))
-
-    per_dataset_indices: dict[int, list[int]] = {}
-    for index_item in batch_indexes:
-        per_dataset_indices.setdefault(index_item.dataset_i, []).append(index_item.local_index)
-
-    per_dataset_rows: dict[int, list[Sample]] = {}
-    for dataset_i, local_indices in per_dataset_indices.items():
-        dataset = value_source.datasets[dataset_i]
-        dataset_handle = dataset.handle if dataset.handle is not None else lance.dataset(dataset.uri)
-        per_dataset_rows[dataset_i] = _read_table_rows(dataset_handle, local_indices, columns=columns)
-
-    per_dataset_offsets = {dataset_i: 0 for dataset_i in per_dataset_indices}
-    rows: list[Sample] = []
-    for index_item in batch_indexes:
-        dataset_offset = per_dataset_offsets[index_item.dataset_i]
-        rows.append(per_dataset_rows[index_item.dataset_i][dataset_offset])
-        per_dataset_offsets[index_item.dataset_i] += 1
-    return rows
+    batch_indexes = map_global_indexes(value_source, row_indices)
+    return LanceBatchReader(value_source).read(batch_indexes, columns=columns)
 
 
 def _looks_like_lance_index_items(value: object) -> bool:
@@ -84,7 +60,7 @@ def _set_ref_field(sample: object, field: str, value: Any) -> None:
 
 
 def _apply_ref_columns(
-    source: LanceSourceSpec,
+    source: LanceSource,
     batch: list[object],
     columns_or_indexes: Sequence[str] | Sequence[LanceIndexItem] | None = None,
     *,
@@ -170,7 +146,7 @@ def _apply_ref_columns(
         if positions_by_row_index:
             ordered_row_indices = list(positions_by_row_index)
             value_source = ref.index_handle.get("value_source")
-            if not isinstance(value_source, LanceSourceSpec):
+            if not isinstance(value_source, LanceSource):
                 value_source = _open_ref_value_source(ref)
             ref_rows = _read_ref_value_rows(value_source, ordered_row_indices, columns=[ref.value_column])
             for row_index, row in zip(ordered_row_indices, ref_rows, strict=True):
@@ -190,7 +166,7 @@ def _apply_ref_columns(
             _set_ref_field(sample, ref.column, values if is_multi_value else values[0])
 
 
-def validate_ref_names(source: LanceSourceSpec, ref_names: Sequence[str]) -> tuple[str, ...]:
+def validate_ref_names(source: LanceSource, ref_names: Sequence[str]) -> tuple[str, ...]:
     """Validate that reference fields do not collide with sample fields.
 
     Args:
@@ -222,7 +198,7 @@ def validate_ref_names(source: LanceSourceSpec, ref_names: Sequence[str]) -> tup
 
 
 def iter_lance_ref_resolver(
-    source: LanceSourceSpec,
+    source: LanceSource,
     sample_stream: Iterable[object],
     ref_names: Sequence[str],
     *,
@@ -263,7 +239,7 @@ def iter_lance_ref_resolver(
 class LanceResolveRefFactory:
     """Factory that creates Lance reference resolver assemblers."""
 
-    source: LanceSourceSpec
+    source: LanceSource
     ref_names: tuple[str, ...]
     batch_size: int = 1024
     ref_index_scope: LanceRefIndexScope | None = None
@@ -289,7 +265,7 @@ class LanceRefResolverAssembler:
     def __init__(
         self,
         *,
-        source: LanceSourceSpec,
+        source: LanceSource,
         ref_names: Sequence[str],
         batch_size: int = 1024,
         context: RuntimeContext | None = None,

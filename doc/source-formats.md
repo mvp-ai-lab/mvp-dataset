@@ -60,25 +60,25 @@ Dataset.from_source(
     shards,
     context=None,
     resample=False,
-    min_row_groups_per_fragment=1,
+    min_row_groups_per_chunk=1,
     columns=None,
     use_threads=True,
-    shuffle_mode="fragment_aware",
+    shuffle_mode="chunk_aware",
 )
 ```
 
 Arguments:
 
 - `shards`: Parquet file path or sequence of paths.
-- `min_row_groups_per_fragment`: minimum row groups grouped into one scheduling fragment.
+- `min_row_groups_per_chunk`: minimum row groups grouped into one scheduling chunk.
 - `columns`: optional projection.
 - `use_threads`: forwarded to the Parquet reader.
-- `shuffle_mode`: `"none"` or `"fragment_aware"`. `"global"` is intentionally unsupported for Parquet.
+- `shuffle_mode`: `"none"` or `"chunk_aware"`. `"global"` is intentionally unsupported for Parquet.
 
 Parquet source notes:
 
 - Inputs must end with `.parquet`.
-- Work is scheduled by fragment and row group.
+- Work is scheduled by chunk and row group.
 - Each row is yielded as a sample dictionary.
 
 ## Lance
@@ -90,10 +90,9 @@ Dataset.from_source(
     context=None,
     resample=False,
     columns=None,
-    batch_size=1024,
+    read_batch_size=1024,
     shuffle_mode="none",
-    chunk_aware_shuffle_chunk_size=250_000,
-    chunk_aware_shuffle_k=8,
+    chunk_shuffle=None,
     ref_columns=None,
     ref_index_scope=None,
 )
@@ -103,19 +102,19 @@ Arguments:
 
 - `shards`: Lance dataset URI or sequence of URIs.
 - `columns`: optional projection.
-- `batch_size`: internal Lance read batch size.
-- `shuffle_mode`: `"none"`, `"global"`, `"chunk_aware"`, or `"fragment_aware"`.
-- `chunk_aware_shuffle_chunk_size`: rows per chunk for `shuffle_mode="chunk_aware"`.
-- `chunk_aware_shuffle_k`: number of shuffled chunks in each chunk-aware window.
+- `read_batch_size`: number of row indexes aggregated into one Lance read call.
+- `shuffle_mode`: `"none"`, `"global"`, or `"chunk"`.
+- `chunk_shuffle`: optional chunk shuffle configuration when `shuffle_mode="chunk"`.
 - `ref_columns`: optional Lance reference column configuration.
 - `ref_index_scope`: optional reference-index storage scope.
 
 Lance source notes:
 
 - Lance supports exact deterministic global shuffle without materializing a full epoch index list.
-- `chunk_aware` shuffle randomizes chunk order and rows within a bounded chunk window.
-- `fragment_aware` shuffle preserves deterministic order while staying friendlier to fragment locality.
+- `chunk` shuffle randomizes chunk order and rows within a bounded chunk window.
 - Lance reference columns can be resolved with `resolve_ref(...)`.
+- Use `chunk_shuffle={"chunk_size": 65536, "k": 4, "row_order": "sequential"}` to tune chunk shuffle.
+- `row_order` can be `"permuted"` or `"sequential"`. The default is `"permuted"`.
 
 ### Lance Reference Resolution
 
