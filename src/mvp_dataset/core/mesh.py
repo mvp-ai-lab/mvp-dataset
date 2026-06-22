@@ -40,6 +40,29 @@ class DataLoadMesh:
         """Return a stable hash for this immutable value."""
         return hash((id(self.device_mesh), self.dp_dims))
 
+    def _mesh_dim_index(self, dim: str) -> int | str:
+        """Return the integer mesh dimension index for a named mesh dimension."""
+
+        dim_names = getattr(self.device_mesh, "mesh_dim_names", None)
+        if dim_names is None:
+            return dim
+        try:
+            return tuple(dim_names).index(dim)
+        except ValueError as exc:
+            msg = f"mesh dimension {dim!r} not found in {tuple(dim_names)!r}"
+            raise ValueError(msg) from exc
+
+    def _mesh_local_rank(self, dim: str) -> int:
+        """Return local rank for a mesh dimension without requiring process groups."""
+
+        dim_index = self._mesh_dim_index(dim)
+        get_coordinate = getattr(self.device_mesh, "get_coordinate", None)
+        if isinstance(dim_index, int) and get_coordinate is not None:
+            coordinate = get_coordinate()
+            if coordinate is not None:
+                return int(coordinate[dim_index])
+        return self.device_mesh.get_local_rank(dim_index)
+
     @property
     def dp_rank(self) -> int:
         """Flattened rank across all data-parallel dimensions.
@@ -47,8 +70,8 @@ class DataLoadMesh:
         Returns:
             The result of the operation."""
 
-        sizes = [self.device_mesh.size(dim) for dim in self.dp_dims]
-        local_ranks = [self.device_mesh.get_local_rank(dim) for dim in self.dp_dims]
+        sizes = [self.device_mesh.size(self._mesh_dim_index(dim)) for dim in self.dp_dims]
+        local_ranks = [self._mesh_local_rank(dim) for dim in self.dp_dims]
         rank = 0
         for i, lr in enumerate(local_ranks):
             stride = 1
@@ -66,7 +89,7 @@ class DataLoadMesh:
 
         size = 1
         for dim in self.dp_dims:
-            size *= self.device_mesh.size(dim)
+            size *= self.device_mesh.size(self._mesh_dim_index(dim))
         return size
 
     @property
@@ -81,7 +104,7 @@ class DataLoadMesh:
             return True
 
         non_dp_dims = [dim for dim in dim_names if dim not in self.dp_dims]
-        return all(self.device_mesh.get_local_rank(dim) == 0 for dim in non_dp_dims)
+        return all(self._mesh_local_rank(dim) == 0 for dim in non_dp_dims)
 
 
 def _normalize_dp_dims(dp_dims: str | Sequence[str]) -> tuple[str, ...]:
