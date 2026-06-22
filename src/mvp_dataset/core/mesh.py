@@ -52,6 +52,17 @@ class DataLoadMesh:
             msg = f"mesh dimension {dim!r} not found in {tuple(dim_names)!r}"
             raise ValueError(msg) from exc
 
+    def _mesh_size(self, dim: str) -> int:
+        """Return mesh dimension size for PyTorch and duck-typed meshes."""
+
+        dim_index = self._mesh_dim_index(dim)
+        try:
+            return int(self.device_mesh.size(dim_index))
+        except (KeyError, TypeError):
+            if dim_index == dim:
+                raise
+            return int(self.device_mesh.size(dim))
+
     def _mesh_local_rank(self, dim: str) -> int:
         """Return local rank for a mesh dimension without requiring process groups."""
 
@@ -61,7 +72,12 @@ class DataLoadMesh:
             coordinate = get_coordinate()
             if coordinate is not None:
                 return int(coordinate[dim_index])
-        return self.device_mesh.get_local_rank(dim_index)
+        try:
+            return int(self.device_mesh.get_local_rank(dim_index))
+        except (KeyError, TypeError):
+            if dim_index == dim:
+                raise
+            return int(self.device_mesh.get_local_rank(dim))
 
     @property
     def dp_rank(self) -> int:
@@ -70,7 +86,7 @@ class DataLoadMesh:
         Returns:
             The result of the operation."""
 
-        sizes = [self.device_mesh.size(self._mesh_dim_index(dim)) for dim in self.dp_dims]
+        sizes = [self._mesh_size(dim) for dim in self.dp_dims]
         local_ranks = [self._mesh_local_rank(dim) for dim in self.dp_dims]
         rank = 0
         for i, lr in enumerate(local_ranks):
@@ -89,7 +105,7 @@ class DataLoadMesh:
 
         size = 1
         for dim in self.dp_dims:
-            size *= self.device_mesh.size(self._mesh_dim_index(dim))
+            size *= self._mesh_size(dim)
         return size
 
     @property
