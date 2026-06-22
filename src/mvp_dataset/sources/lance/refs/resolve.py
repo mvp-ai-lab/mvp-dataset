@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import bisect
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,7 +14,12 @@ from mvp_dataset.core.context import RuntimeContext
 from mvp_dataset.core.resume import ResumeStateError, stable_fingerprint
 from mvp_dataset.core.types import Sample
 
-from ..types import LanceIndexItem, LanceRefIndexBuildStrategy, LanceRefIndexScope, LanceSourceSpec
+from ..types import (
+    LanceIndexItem,
+    LanceRefIndexBuildStrategy,
+    LanceRefIndexScope,
+    LanceSourceSpec,
+)
 from .index import REF_INDEX_MISSING_ROW, _open_ref_value_source, prepare_ref_indexes
 from .read import _read_table_rows
 
@@ -65,9 +70,22 @@ def _looks_like_lance_index_items(value: object) -> bool:
     return bool(value) and isinstance(value[0], LanceIndexItem)
 
 
+def _get_ref_field(sample: object, field: str) -> Any:
+    if isinstance(sample, Mapping):
+        return sample[field]
+    return getattr(sample, field)
+
+
+def _set_ref_field(sample: object, field: str, value: Any) -> None:
+    if isinstance(sample, MutableMapping):
+        sample[field] = value
+    else:
+        setattr(sample, field, value)
+
+
 def _apply_ref_columns(
     source: LanceSourceSpec,
-    batch: list[Sample],
+    batch: list[object],
     columns_or_indexes: Sequence[str] | Sequence[LanceIndexItem] | None = None,
     *,
     columns: Sequence[str] | None = None,
@@ -109,7 +127,7 @@ def _apply_ref_columns(
     # Step 2: Convert each batch sample into the global row index used by the
     # prepared CSR ref index. The index is global across all physical Lance
     # datasets in ``source``, not local to a single dataset file.
-    global_indices = np.asarray([item["__global_index__"] for item in batch], dtype=np.int64)
+    global_indices = np.asarray([_get_ref_field(item, "__global_index__") for item in batch], dtype=np.int64)
     for ref in active_refs:
         # Step 3: Validate that ``prepare_ref_indexes`` has attached the CSR
         # arrays and the prepared reference dataset handle for this ref column.
@@ -164,12 +182,12 @@ def _apply_ref_columns(
         # list/tuple/ndarray refs; non-empty ranges preserve scalar-vs-multi
         # shape based on the original value.
         for sample, ref_row_indices, values in zip(batch, per_sample_row_indices, resolved_values, strict=True):
-            original_value = sample.get(ref.column)
+            original_value = _get_ref_field(sample, ref.column)
             is_multi_value = isinstance(original_value, (list, tuple, np.ndarray))
             if len(ref_row_indices) == 0:
-                sample[ref.column] = [] if is_multi_value else None
+                _set_ref_field(sample, ref.column, [] if is_multi_value else None)
                 continue
-            sample[ref.column] = values if is_multi_value else values[0]
+            _set_ref_field(sample, ref.column, values if is_multi_value else values[0])
 
 
 def validate_ref_names(source: LanceSourceSpec, ref_names: Sequence[str]) -> tuple[str, ...]:
@@ -300,7 +318,7 @@ class LanceRefResolverAssembler:
         self.ref_index_scope = ref_index_scope
         self.ref_index_build_strategy = ref_index_build_strategy
         self.ref_index_bucket_count = ref_index_bucket_count
-        self.batch: list[Sample] = []
+        self.batch: list[object] = []
         self.queue_size = 0
 
     def state_dict(self) -> dict[str, object]:
@@ -341,16 +359,13 @@ class LanceRefResolverAssembler:
         if not self.batch:
             return ()
 
-        if isinstance(self.batch[0], dict):
-            _apply_ref_columns(self.source, self.batch, self.ref_names)
-        elif isinstance(self.batch[0], list):
-            for sub_batch in self.batch:
-                if isinstance(sub_batch, list) and sub_batch and isinstance(sub_batch[0], dict):
-                    _apply_ref_columns(self.source, sub_batch, self.ref_names)
-                else:
-                    raise TypeError(f"[InvalidLanceBatch] expected dict samples, got {type(sub_batch).__name__}")
-        else:
-            raise TypeError(f"[InvalidLanceBatch] expected dict or list samples, got {type(self.batch[0]).__name__}")
+        targets: list[object] = []
+        for sample in self.batch:
+            if isinstance(sample, list):
+                targets.extend(sample)
+            else:
+                targets.append(sample)
+        _apply_ref_columns(self.source, targets, self.ref_names)
 
         flushed_batch = self.batch
         self.batch = []
@@ -365,12 +380,11 @@ class LanceRefResolverAssembler:
 
         Returns:
             Completed outputs produced after consuming the sample."""
-        if not isinstance(sample, (dict, list)):
-            msg = f"[InvalidLanceSample] expected dict or list sample, got {type(sample).__name__}"
+        if sample is None:
+            msg = "[InvalidLanceSample] expected dict, list, or object sample, got None"
             raise TypeError(msg)
-        is_single_sample = isinstance(sample, dict)
         self.batch.append(sample)
-        self.queue_size += 1 if is_single_sample else len(sample)
+        self.queue_size += len(sample) if isinstance(sample, list) else 1
 
         if not sample or self.queue_size >= self.batch_size:
             return self._flush()

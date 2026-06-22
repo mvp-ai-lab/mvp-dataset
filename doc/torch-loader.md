@@ -61,6 +61,35 @@ Available stages:
 - `.shuffle(buffer_size, initial=None, seed=None)`
 - `.assemble(factory, drop_last=False)`
 - `.batch(batch_size, drop_last=False, collate_fn=None)`
+- `.balance(drop_last=True, dummy_factory=None, buffer_size=32, chunk_size=16, ...)`
+
+### Distributed Balance
+
+`balance()` is a loader-side distributed stage for already materialized packs or
+batches. It runs in the main process after worker outputs are merged, performs a
+small all-rank control sync once per chunk, and uses sparse point-to-point
+transfers only when a rank needs items from another rank.
+
+```python
+loader = (
+    TorchLoader(dataset, num_workers=8)
+    .assemble(make_pack)
+    .balance(chunk_size=16, drop_last=True)
+)
+```
+
+- Use it as a runtime fallback when an offline packing plan is unavailable.
+- Prefer placing it after pack or batch construction, not at sample granularity.
+- `drop_last=True` synchronously drops a final incomplete distributed step.
+- `drop_last=False` requires `dummy_factory`, which must return a batch-compatible
+  dummy item that the training step can mask out.
+- `process_group` is used for control sync, Python object payloads, and CPU tensor
+  payloads.
+- `device_process_group` is used for non-CPU tensor payloads, such as CUDA/NPU
+  tensors. Tensors are stripped out of the Python batch structure, coalesced by
+  device and dtype, transferred as flat tensors, then restored on the receiving
+  rank.
+- Resume is not supported for this stage.
 
 ## Resume
 
