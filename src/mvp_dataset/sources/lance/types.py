@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
-LanceShuffleMode = Literal["none", "global", "fragment_aware"]
+LanceShuffleMode = Literal["none", "global", "chunk"]
 LanceRefIndexScope = Literal["shared", "node_local", "process"]
+LanceRefIndexBuildStrategy = Literal["auto", "in_memory", "bucketed"]
+LanceRefIndexConfigInput = dict[str, object] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,8 +18,6 @@ class LanceDatasetSpec:
     uri: str
     num_rows: int
     row_offset: int
-    fragment_ids: tuple[int, ...]
-    fragment_row_counts: tuple[int, ...] = ()
     handle: object | None = None
 
 
@@ -36,27 +36,38 @@ class LanceRefSpec:
 
 
 @dataclass(frozen=True, slots=True)
-class LanceSourceSpec:
-    """One schedulable Lance source configuration."""
+class LanceRefIndexConfig:
+    """Reference index preparation configuration."""
 
-    datasets: list[LanceDatasetSpec]
+    scope: LanceRefIndexScope | None = None
+    build_strategy: LanceRefIndexBuildStrategy | None = None
+    bucket_count: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LanceRefResolverConfig:
+    """Reference resolver runtime configuration."""
+
+    resolve_batch_size: int = 1024
+    index: LanceRefIndexConfig = field(default_factory=LanceRefIndexConfig)
+
+
+@dataclass(frozen=True, slots=True)
+class LanceSource:
+    """Merged Lance source metadata over one global row space."""
+
+    datasets: tuple[LanceDatasetSpec, ...]
     ref_columns: tuple[LanceRefSpec, ...] = ()
+    row_offsets: tuple[int, ...] = field(init=False)
+    total_rows: int = field(init=False)
 
-    @property
-    def total_rows(self) -> int:
-        """Return the total number of rows across Lance sources.
-
-        Returns:
-            Total rows across all Lance dataset specs."""
-        return sum(dataset.num_rows for dataset in self.datasets)
-
-    @property
-    def total_fragments(self) -> int:
-        """Return the total number of fragments across Lance sources.
-
-        Returns:
-            Total fragments across all Lance dataset specs."""
-        return sum(len(dataset.fragment_ids) for dataset in self.datasets)
+    def __post_init__(self) -> None:
+        datasets = tuple(self.datasets)
+        object.__setattr__(self, "datasets", datasets)
+        object.__setattr__(self, "ref_columns", tuple(self.ref_columns))
+        object.__setattr__(self, "row_offsets", tuple(dataset.row_offset for dataset in datasets))
+        total_rows = 0 if not datasets else datasets[-1].row_offset + datasets[-1].num_rows
+        object.__setattr__(self, "total_rows", total_rows)
 
 
 @dataclass(frozen=True, slots=True)

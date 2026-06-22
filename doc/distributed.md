@@ -41,7 +41,7 @@ context = RuntimeContext(mesh=mesh, seed=123)
 ## Sharding Behavior
 
 - Tar and JSONL schedule shard-level work across runtime slots.
-- Parquet schedules fragment / row-group work across runtime slots.
+- Parquet schedules chunk / row-group work across runtime slots.
 - Lance maps logical positions to physical rows deterministically for each slot.
 
 For finite datasets, each slot receives its assigned portion. With `resample=True`, the source repeats across deterministic rounds.

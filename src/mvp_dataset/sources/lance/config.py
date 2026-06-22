@@ -31,7 +31,12 @@ def _resolve_config_uri_or_list(uri: object, *, base_dir: Path) -> str | list[st
 
 
 def _load_lance_source_config(config_path: Path) -> tuple[list[str], dict[str, dict[str, object]] | None]:
-    """Load a Lance source configuration from disk."""
+    """Load a Lance JSON source config.
+
+    The JSON object must contain ``uri``, ``shards``, or ``main_uri`` as a string or list of strings.
+    It may also contain ``ref_columns`` using the same shape as ``LanceDataset.from_source(ref_columns=...)``.
+    Relative URIs are resolved from the JSON file directory.
+    """
     if not config_path.exists():
         msg = f"[MissingLanceConfig] Lance source config was not found: {config_path}"
         raise FileNotFoundError(msg)
@@ -98,7 +103,8 @@ def resolve_lance_source_config(
 
     Args:
         shards: Input shard path or paths.
-        ref_columns: Lance reference column configuration.
+        ref_columns: Optional mapping from output column name to a config dict with ``uri``, ``key_column``, and
+            ``value_column``. This overrides ``ref_columns`` in a Lance JSON source config when both are provided.
 
     Returns:
         Normalized Lance shard URIs and reference column configuration."""

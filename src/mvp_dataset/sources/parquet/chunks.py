@@ -1,4 +1,4 @@
-"""Parquet fragment discovery."""
+"""Parquet chunk discovery."""
 
 from __future__ import annotations
 
@@ -17,8 +17,8 @@ _MAX_METADATA_WORKERS: Final[int] = 16
 
 
 @dataclass(frozen=True, slots=True)
-class ParquetFragment:
-    """One schedulable parquet row-group fragment."""
+class ParquetChunk:
+    """One schedulable parquet row-group chunk."""
 
     path: str
     row_groups: tuple[int, ...]
@@ -28,60 +28,60 @@ class ParquetFragment:
     row_group_num_rows: tuple[int, ...]
 
 
-def list_parquet_fragments(
+def list_parquet_chunks(
     shard_paths: Sequence[PathLikeStr],
     *,
-    min_row_groups_per_fragment: int = 1,
-    min_fragments: int = 0,
-) -> list[ParquetFragment]:
-    """Expand parquet files into schedulable row-group fragments.
+    min_row_groups_per_chunk: int = 1,
+    min_chunks: int = 0,
+) -> list[ParquetChunk]:
+    """Expand parquet files into schedulable row-group chunks.
 
     Args:
         shard_paths: Shard paths to read.
-        min_row_groups_per_fragment: Minimum row groups combined into one Parquet fragment.
-        min_fragments: Minimum number of fragments to produce.
+        min_row_groups_per_chunk: Minimum row groups combined into one Parquet chunk.
+        min_chunks: Minimum number of chunks to produce.
 
     Returns:
-        Parquet fragments collected from the input shards."""
-    min_row_groups_per_fragment = _validate_min_row_groups_per_fragment(min_row_groups_per_fragment)
-    fragments = _collect_parquet_fragments(shard_paths, min_row_groups_per_fragment)
-    if len(fragments) < min_fragments:
-        fragments = _collect_parquet_fragments(shard_paths, 1)
-    return fragments
+        Parquet chunks collected from the input shards."""
+    min_row_groups_per_chunk = _validate_min_row_groups_per_chunk(min_row_groups_per_chunk)
+    chunks = _collect_parquet_chunks(shard_paths, min_row_groups_per_chunk)
+    if len(chunks) < min_chunks:
+        chunks = _collect_parquet_chunks(shard_paths, 1)
+    return chunks
 
 
-def _validate_min_row_groups_per_fragment(value: int) -> int:
-    """Validate Parquet row-group fragmentation settings."""
+def _validate_min_row_groups_per_chunk(value: int) -> int:
+    """Validate Parquet row-group chunk settings."""
     if value <= 0:
-        msg = f"[InvalidParquetFragmentConfig] min_row_groups_per_fragment must be >= 1, got {value}"
+        msg = f"[InvalidParquetChunkConfig] min_row_groups_per_chunk must be >= 1, got {value}"
         raise ValueError(msg)
     return value
 
 
-def _collect_parquet_fragments(
+def _collect_parquet_chunks(
     shard_paths: Sequence[PathLikeStr],
-    min_row_groups_per_fragment: int,
-) -> list[ParquetFragment]:
-    """Collect Parquet fragments for all shards."""
+    min_row_groups_per_chunk: int,
+) -> list[ParquetChunk]:
+    """Collect Parquet chunks for all shards."""
     shards = [str(shard_path) for shard_path in shard_paths]
     if not shards:
         return []
 
-    fragments: list[ParquetFragment] = []
+    chunks: list[ParquetChunk] = []
     num_workers = _metadata_num_workers(len(shards))
     if num_workers == 1:
         for shard in shards:
-            fragments.extend(_collect_parquet_fragments_for_shard(shard, min_row_groups_per_fragment))
-        return fragments
+            chunks.extend(_collect_parquet_chunks_for_shard(shard, min_row_groups_per_chunk))
+        return chunks
 
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        for shard_fragments in executor.map(
-            _collect_parquet_fragments_for_shard,
+        for shard_chunks in executor.map(
+            _collect_parquet_chunks_for_shard,
             shards,
-            repeat(min_row_groups_per_fragment),
+            repeat(min_row_groups_per_chunk),
         ):
-            fragments.extend(shard_fragments)
-    return fragments
+            chunks.extend(shard_chunks)
+    return chunks
 
 
 def _metadata_num_workers(num_shards: int) -> int:
@@ -89,13 +89,13 @@ def _metadata_num_workers(num_shards: int) -> int:
     return min(num_shards, max(1, min(_MAX_METADATA_WORKERS, os.cpu_count() or 1)))
 
 
-def _collect_parquet_fragments_for_shard(
+def _collect_parquet_chunks_for_shard(
     shard: str,
-    min_row_groups_per_fragment: int,
-) -> list[ParquetFragment]:
-    """Collect Parquet fragments for one shard."""
+    min_row_groups_per_chunk: int,
+) -> list[ParquetChunk]:
+    """Collect Parquet chunks for one shard."""
     metadata = pq.read_metadata(shard)
-    fragments: list[ParquetFragment] = []
+    chunks: list[ParquetChunk] = []
     row_offset = 0
     pending_groups: list[int] = []
     pending_group_offsets: list[int] = []
@@ -108,9 +108,9 @@ def _collect_parquet_fragments_for_shard(
         pending_group_offsets.append(row_offset + pending_rows)
         pending_group_num_rows.append(num_rows)
         pending_rows += num_rows
-        if len(pending_groups) >= min_row_groups_per_fragment:
-            fragments.append(
-                ParquetFragment(
+        if len(pending_groups) >= min_row_groups_per_chunk:
+            chunks.append(
+                ParquetChunk(
                     path=shard,
                     row_groups=tuple(pending_groups),
                     row_offset=row_offset,
@@ -126,8 +126,8 @@ def _collect_parquet_fragments_for_shard(
             pending_rows = 0
 
     if pending_groups:
-        fragments.append(
-            ParquetFragment(
+        chunks.append(
+            ParquetChunk(
                 path=shard,
                 row_groups=tuple(pending_groups),
                 row_offset=row_offset,
@@ -137,4 +137,4 @@ def _collect_parquet_fragments_for_shard(
             )
         )
 
-    return fragments
+    return chunks

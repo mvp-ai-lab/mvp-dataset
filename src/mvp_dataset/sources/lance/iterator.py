@@ -2,40 +2,55 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from mvp_dataset.core.context import RuntimeContext
 from mvp_dataset.core.resume import ResumeStateError
 
-from .reader import _read_batch
-from .shuffle import fragment_aware_index_order, lance_index_at, lance_round_size
-from .types import LanceIndexItem, LanceShuffleMode, LanceSourceSpec
+from .order import ChunkShuffleConfig, LanceIndexOrder, build_lance_index_order
+from .reader import LanceBatchReader
+from .types import LanceIndexItem, LanceShuffleMode, LanceSource
 
 
 @dataclass(slots=True)
 class _LanceSourceIterator:
-    """Stateful iterator over Lance rows with deterministic shuffling."""
+    """Runtime iterator over a Lance source."""
 
-    source: LanceSourceSpec
+    source: LanceSource
     context: RuntimeContext
     resample: bool
     columns: Sequence[str] | None
-    batch_size: int
+    read_batch_size: int
     source_fingerprint: str
     shuffle_mode: LanceShuffleMode = "none"
+    chunk_config: ChunkShuffleConfig | None = None
     round_index: int = 0
     position_in_round: int = 0
-    _pending_samples: list[object] = field(default_factory=list)
-    _pending_positions: list[tuple[int, int]] = field(default_factory=list)
-    _index_order: list[LanceIndexItem] = field(default_factory=list)
-    _index_order_round: int | None = None
+    _pending_samples: deque[object] = field(default_factory=deque)
+    _pending_positions: deque[tuple[int, int]] = field(default_factory=deque)
+    index_order: LanceIndexOrder = field(init=False)
+    batch_reader: LanceBatchReader = field(init=False)
 
     def __post_init__(self) -> None:
-        """Validate dataclass configuration after initialization."""
-        if self.batch_size <= 0:
-            msg = "[InvalidLanceBatchSize] batch_size must be a positive integer"
+        """Validate configuration and build runtime helpers."""
+        if self.read_batch_size <= 0:
+            msg = "[InvalidLanceReadBatchSize] read_batch_size must be a positive integer"
             raise ValueError(msg)
+        if self.shuffle_mode not in ("none", "global", "chunk"):
+            msg = f"[InvalidLanceShuffleMode] expected none, global, or chunk, got {self.shuffle_mode!r}"
+            raise ValueError(msg)
+        if self.shuffle_mode == "chunk" and self.chunk_config is None:
+            msg = "[InvalidLanceChunkShuffle] chunk_config is required for shuffle_mode='chunk'"
+            raise ValueError(msg)
+        self.index_order = build_lance_index_order(
+            self.source,
+            self.context,
+            self.shuffle_mode,
+            chunk_config=self.chunk_config,
+        )
+        self.batch_reader = LanceBatchReader(self.source)
 
     def __iter__(self):
         """Return the iterator object."""
@@ -48,27 +63,40 @@ class _LanceSourceIterator:
         if not self._pending_samples:
             raise StopIteration
 
-        sample = self._pending_samples.pop(0)
-        self.round_index, self.position_in_round = self._pending_positions.pop(0)
+        sample = self._pending_samples.popleft()
+        self.round_index, self.position_in_round = self._pending_positions.popleft()
         return sample
 
     def state_dict(self) -> dict[str, object]:
-        """Return the resumable state for this object."""
+        """Return the resumable state for this source iterator."""
         return {
             "kind": "lance",
             "shuffle_mode": self.shuffle_mode,
+            "chunk_shuffle_chunk_size": self._chunk_size,
+            "chunk_shuffle_k": self._chunk_k,
+            "chunk_row_order": self._chunk_row_order,
             "round_index": self.round_index,
             "position_in_round": self.position_in_round,
         }
 
     def load_state_dict(self, state: dict[str, object]) -> None:
-        """Restore this object from a resumable state dictionary."""
+        """Restore this iterator from a resumable state dictionary."""
         if state.get("kind") != "lance":
             msg = f"[InvalidResumeState] expected source kind='lance', got={state.get('kind')!r}"
             raise ResumeStateError(msg)
         if state.get("shuffle_mode") != self.shuffle_mode:
             msg = "[InvalidResumeState] shuffle_mode does not match"
             raise ResumeStateError(msg)
+        if self.shuffle_mode == "chunk":
+            if state.get("chunk_shuffle_chunk_size") != self._chunk_size:
+                msg = "[InvalidResumeState] chunk_shuffle_chunk_size does not match"
+                raise ResumeStateError(msg)
+            if state.get("chunk_shuffle_k") != self._chunk_k:
+                msg = "[InvalidResumeState] chunk_shuffle_k does not match"
+                raise ResumeStateError(msg)
+            if state.get("chunk_row_order") != self._chunk_row_order:
+                msg = "[InvalidResumeState] chunk_row_order does not match"
+                raise ResumeStateError(msg)
 
         round_index = state.get("round_index")
         if not isinstance(round_index, int) or round_index < 0:
@@ -82,7 +110,7 @@ class _LanceSourceIterator:
         if not isinstance(position_in_round, int) or position_in_round < 0:
             msg = "[InvalidResumeState] position_in_round must be a non-negative integer"
             raise ResumeStateError(msg)
-        if position_in_round > self._round_size(round_index):
+        if position_in_round > self.index_order.round_size(round_index):
             msg = "[InvalidResumeState] position_in_round is out of range"
             raise ResumeStateError(msg)
 
@@ -95,63 +123,43 @@ class _LanceSourceIterator:
         """Return a stable fingerprint for resume compatibility checks."""
         return self.source_fingerprint
 
+    @property
+    def _chunk_size(self) -> int | None:
+        return None if self.chunk_config is None else self.chunk_config.chunk_size
+
+    @property
+    def _chunk_k(self) -> int | None:
+        return None if self.chunk_config is None else self.chunk_config.k
+
+    @property
+    def _chunk_row_order(self) -> str | None:
+        return None if self.chunk_config is None else self.chunk_config.row_order
+
     def _fill_pending(self) -> None:
-        """Fill the pending sample buffer from Lance rows."""
-        batch_indexes: list[LanceIndexItem] = []
-        batch_positions: list[tuple[int, int]] = []
+        """Fill pending samples by aggregating row indexes into one Lance read."""
+        indexes: list[LanceIndexItem] = []
+        positions: list[tuple[int, int]] = []
         round_index = self.round_index
         position_in_round = self.position_in_round
-        while len(batch_indexes) < self.batch_size:
-            round_size = self._round_size(round_index)
+
+        while len(indexes) < self.read_batch_size:
+            round_size = self.index_order.round_size(round_index)
             if position_in_round >= round_size:
                 if not self.resample:
                     break
                 round_index += 1
                 position_in_round = 0
-                round_size = self._round_size(round_index)
-                if round_size <= 0:
+                if self.index_order.round_size(round_index) <= 0:
                     break
+                continue
 
-            batch_indexes.append(self._index_item_at(round_index, position_in_round))
-            position_in_round += 1
-            batch_positions.append((round_index, position_in_round))
+            count = min(self.read_batch_size - len(indexes), round_size - position_in_round)
+            indexes.extend(self.index_order.items(round_index, position_in_round, count))
+            positions.extend((round_index, position_in_round + offset + 1) for offset in range(count))
+            position_in_round += count
 
-        if not batch_indexes:
+        if not indexes:
             return
-        self._pending_samples.extend(_read_batch(self.source, batch_indexes, columns=self.columns))
-        self._pending_positions.extend(batch_positions)
 
-    def _round_size(self, round_index: int) -> int:
-        """Return the number of source items in one Lance round."""
-        fragment_order = self._index_order_for_round(round_index) if self.shuffle_mode == "fragment_aware" else []
-        return lance_round_size(self.source, self.context, self.shuffle_mode, fragment_order)
-
-    def _index_item_at(self, round_index: int, position_in_round: int) -> LanceIndexItem:
-        """Return the physical Lance row location for a logical position."""
-        fragment_order = self._index_order_for_round(round_index) if self.shuffle_mode == "fragment_aware" else []
-        return lance_index_at(
-            self.source,
-            self.context,
-            self.shuffle_mode,
-            round_index,
-            position_in_round,
-            fragment_order,
-        )
-
-    def _index_order_for_round(self, round_index: int) -> list[LanceIndexItem]:
-        """Return the deterministic fragment-aware order for one round."""
-        if self._index_order_round == round_index:
-            return self._index_order
-
-        if self.shuffle_mode == "fragment_aware":
-            index_order = fragment_aware_index_order(self.source, self.context, round_index)
-        else:
-            msg = (
-                "[InvalidLanceShuffleMode] index order is only materialized for "
-                f"fragment_aware, got {self.shuffle_mode!r}"
-            )
-            raise ValueError(msg)
-
-        self._index_order = index_order
-        self._index_order_round = round_index
-        return self._index_order
+        self._pending_samples.extend(self.batch_reader.read(indexes, columns=self.columns))
+        self._pending_positions.extend(positions)

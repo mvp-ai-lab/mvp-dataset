@@ -18,6 +18,7 @@ from .helpers import (
     build_records,
     write_jsonl_file,
     write_lance_dataset,
+    write_lance_table,
     write_parquet_file,
     write_tar_shards,
 )
@@ -161,7 +162,7 @@ def _source_factory(
                 "parquet",
                 shards=path,
                 context=context,
-                min_row_groups_per_fragment=1,
+                min_row_groups_per_chunk=1,
                 resample=resample,
             )
 
@@ -170,14 +171,16 @@ def _source_factory(
     if source == "lance":
         pytest.importorskip("lance")
         path = write_lance_dataset(tmp_path, records, max_rows_per_file=2)
+        chunk_shuffle = {"chunk_size": 3, "k": 2} if lance_shuffle_mode == "chunk" else None
 
         def build() -> Dataset:
             return Dataset.from_source(
                 "lance",
                 shards=path,
                 context=context,
-                batch_size=2,
+                read_batch_size=2,
                 shuffle_mode=lance_shuffle_mode,
+                chunk_shuffle=chunk_shuffle,
                 resample=resample,
             )
 
@@ -311,7 +314,7 @@ def test_runtime_context_fingerprint_is_stable_and_seed_sensitive() -> None:
 def test_lance_global_shuffle_permute_index_is_bijective(total_rows: int) -> None:
     pytest.importorskip("lance")
 
-    from mvp_dataset.sources.lance.shuffle import permute_index
+    from mvp_dataset.sources.lance.order import permute_index
 
     observed = [permute_index(position, total_rows=total_rows, seed=41) for position in range(total_rows)]
 
@@ -326,7 +329,7 @@ def test_lance_global_shuffle_permute_index_is_bijective(total_rows: int) -> Non
         ("parquet", "none"),
         ("lance", "none"),
         ("lance", "global"),
-        ("lance", "fragment_aware"),
+        ("lance", "chunk"),
     ],
 )
 def test_dataset_resume_full_pipeline_matches_continued_stream(tmp_path, source: str, lance_shuffle_mode: str) -> None:
@@ -402,15 +405,79 @@ def test_lance_resume_supports_multiple_datasets(tmp_path) -> None:
             "lance",
             shards=[path_a, path_b],
             context=RuntimeContext(seed=29),
-            batch_size=3,
+            read_batch_size=3,
             shuffle_mode="global",
         )
 
     _assert_dataset_resume_matches_continued(build_dataset, checkpoint_after=4)
 
 
-@pytest.mark.parametrize("shuffle_mode", ["none", "global"])
-def test_lance_none_and_global_shuffle_do_not_materialize_round_order(tmp_path, shuffle_mode: str) -> None:
+@pytest.mark.parametrize(
+    ("shuffle_mode", "resolve_ref"),
+    [
+        ("global", False),
+        ("global", True),
+        ("chunk", False),
+        ("chunk", True),
+    ],
+)
+def test_lance_shuffle_resume_with_and_without_resolve_ref(
+    tmp_path,
+    monkeypatch,
+    shuffle_mode: str,
+    resolve_ref: bool,
+) -> None:
+    pytest.importorskip("lance")
+
+    main_records = [
+        {"id": f"sample-{index}", "text": f"text-{index}", "value": index, "image_ref": f"img-{index % 5}"}
+        for index in range(17)
+    ]
+    ref_records = [{"image_id": f"img-{index}", "image_value": f"resolved-{index}"} for index in range(5)]
+    main_path = write_lance_table(tmp_path, "main.lance", main_records)
+    ref_path = write_lance_table(tmp_path, "refs.lance", ref_records)
+
+    def build_dataset() -> Dataset:
+        dataset = Dataset.from_source(
+            "lance",
+            shards=main_path,
+            context=RuntimeContext(seed=31),
+            read_batch_size=4,
+            shuffle_mode=shuffle_mode,
+            chunk_shuffle={"chunk_size": 4, "k": 3} if shuffle_mode == "chunk" else None,
+            ref_columns={
+                "image_ref": {
+                    "uri": ref_path,
+                    "key_column": "image_id",
+                    "value_column": "image_value",
+                }
+            },
+        )
+        if not resolve_ref:
+            return dataset
+        return dataset.resolve_ref(
+            ["image_ref"],
+            resolve_batch_size=3,
+            index={
+                "scope": "process",
+                "build_strategy": "bucketed",
+                "bucket_count": 3,
+            },
+        )
+
+    state = _assert_dataset_resume_matches_continued(build_dataset, checkpoint_after=5)
+    expected_image_refs = (
+        {f"resolved-{index}" for index in range(5)} if resolve_ref else {f"img-{index}" for index in range(5)}
+    )
+    observed_image_refs = {sample["image_ref"] for sample in _remaining(iter(build_dataset()))}
+
+    assert observed_image_refs == expected_image_refs
+    assert state["source"]["state"]["shuffle_mode"] == shuffle_mode
+    assert [stage["kind"] for stage in state["stages"]] == (["assemble"] if resolve_ref else [])
+
+
+@pytest.mark.parametrize("shuffle_mode", ["none", "global", "chunk"])
+def test_lance_non_global_shuffle_do_not_materialize_full_round_order(tmp_path, shuffle_mode: str) -> None:
     pytest.importorskip("lance")
 
     path = write_lance_dataset(tmp_path, build_records(count=16))
@@ -419,15 +486,16 @@ def test_lance_none_and_global_shuffle_do_not_materialize_round_order(tmp_path, 
             "lance",
             shards=path,
             context=RuntimeContext(seed=31),
-            batch_size=4,
+            read_batch_size=4,
             shuffle_mode=shuffle_mode,
+            chunk_shuffle={"chunk_size": 4, "k": 3} if shuffle_mode == "chunk" else None,
         )
     )
 
     _consume(iterator, 5)
 
-    assert iterator.source._index_order == []
-    assert iterator.source._index_order_round is None
+    assert not hasattr(iterator.source, "_index_order")
+    assert not hasattr(iterator.source, "_index_order_round")
 
 
 def test_resume_rejects_source_fingerprint_mismatch(tmp_path) -> None:

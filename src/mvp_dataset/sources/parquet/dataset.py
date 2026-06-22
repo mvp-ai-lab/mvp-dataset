@@ -9,7 +9,7 @@ from mvp_dataset.core.resume import stable_fingerprint
 from mvp_dataset.core.types import ShardInput
 from mvp_dataset.utils.url import normalize_paths
 
-from .fragments import list_parquet_fragments
+from .chunks import list_parquet_chunks
 from .iterator import _ParquetSourceIterator
 from .reader import resolve_parquet_batch_size
 from .types import ParquetShuffleMode
@@ -21,7 +21,7 @@ class ParquetDataset(Dataset):
 
     _columns: tuple[str, ...] | None = None
     _use_threads: bool = True
-    _shuffle_mode: ParquetShuffleMode = "fragment_aware"
+    _shuffle_mode: ParquetShuffleMode = "chunk_aware"
 
     @classmethod
     def from_source(
@@ -29,10 +29,10 @@ class ParquetDataset(Dataset):
         shards: ShardInput | Sequence[ShardInput],
         context: RuntimeContext | None = None,
         resample: bool = False,
-        min_row_groups_per_fragment: int = 1,
+        min_row_groups_per_chunk: int = 1,
         columns: Sequence[str] | None = None,
         use_threads: bool = True,
-        shuffle_mode: ParquetShuffleMode = "fragment_aware",
+        shuffle_mode: ParquetShuffleMode = "chunk_aware",
     ):
         """Build a dataset from local Parquet file paths.
 
@@ -40,7 +40,7 @@ class ParquetDataset(Dataset):
             shards: Input shard path or paths.
             context: Runtime context used for sharding and deterministic randomness.
             resample: Whether to repeat the source indefinitely across rounds.
-            min_row_groups_per_fragment: Minimum row groups combined into one Parquet fragment.
+            min_row_groups_per_chunk: Minimum row groups combined into one Parquet chunk.
             columns: Column names to read from the source.
             use_threads: Whether the reader may use threaded decoding.
             shuffle_mode: Source-level shuffle mode.
@@ -51,23 +51,23 @@ class ParquetDataset(Dataset):
         if shuffle_mode == "global":
             msg = "[UnsupportedParquetShuffleMode] shuffle_mode='global'"
             raise ValueError(msg)
-        if shuffle_mode not in ("none", "fragment_aware"):
-            msg = f"[InvalidParquetShuffleMode] expected none or fragment_aware, got={shuffle_mode!r}"
+        if shuffle_mode not in ("none", "chunk_aware"):
+            msg = f"[InvalidParquetShuffleMode] expected none or chunk_aware, got={shuffle_mode!r}"
             raise ValueError(msg)
         resolve_parquet_batch_size()
         normalized_shards = normalize_paths(shards)
         if not all(path.endswith(".parquet") for path in normalized_shards):
             msg = f"[InvalidSourceType] expected .parquet inputs, got={normalized_shards!r}"
             raise ValueError(msg)
-        fragments = list_parquet_fragments(
+        chunks = list_parquet_chunks(
             normalized_shards,
-            min_row_groups_per_fragment=min_row_groups_per_fragment,
-            min_fragments=runtime_context.total_slots,
+            min_row_groups_per_chunk=min_row_groups_per_chunk,
+            min_chunks=runtime_context.total_slots,
         )
 
         return cls(
             context=runtime_context,
-            _source=fragments,
+            _source=chunks,
             _resample=resample,
             _source_kind="parquet",
             _stages=(),
@@ -79,7 +79,7 @@ class ParquetDataset(Dataset):
     def _build_source_stream(self, *, context: RuntimeContext) -> Iterable[object]:
         """Build the source iterator for a runtime context."""
         return _ParquetSourceIterator(
-            fragments=self._source,
+            chunks=self._source,
             context=context,
             resample=self._resample,
             columns=self._columns,
@@ -98,15 +98,15 @@ class ParquetDataset(Dataset):
                 "columns": list(self._columns) if self._columns else None,
                 "use_threads": self._use_threads,
             },
-            "fragments": [
+            "chunks": [
                 {
-                    "path": fragment.path,
-                    "row_groups": list(fragment.row_groups),
-                    "row_offset": fragment.row_offset,
-                    "num_rows": fragment.num_rows,
-                    "row_group_offsets": list(fragment.row_group_offsets),
-                    "row_group_num_rows": list(fragment.row_group_num_rows),
+                    "path": chunk.path,
+                    "row_groups": list(chunk.row_groups),
+                    "row_offset": chunk.row_offset,
+                    "num_rows": chunk.num_rows,
+                    "row_group_offsets": list(chunk.row_group_offsets),
+                    "row_group_num_rows": list(chunk.row_group_num_rows),
                 }
-                for fragment in self._source
+                for chunk in self._source
             ],
         }

@@ -60,25 +60,25 @@ Dataset.from_source(
     shards,
     context=None,
     resample=False,
-    min_row_groups_per_fragment=1,
+    min_row_groups_per_chunk=1,
     columns=None,
     use_threads=True,
-    shuffle_mode="fragment_aware",
+    shuffle_mode="chunk_aware",
 )
 ```
 
 Arguments:
 
 - `shards`: Parquet file path or sequence of paths.
-- `min_row_groups_per_fragment`: minimum row groups grouped into one scheduling fragment.
+- `min_row_groups_per_chunk`: minimum row groups grouped into one scheduling chunk.
 - `columns`: optional projection.
 - `use_threads`: forwarded to the Parquet reader.
-- `shuffle_mode`: `"none"` or `"fragment_aware"`. `"global"` is intentionally unsupported for Parquet.
+- `shuffle_mode`: `"none"` or `"chunk_aware"`. `"global"` is intentionally unsupported for Parquet.
 
 Parquet source notes:
 
 - Inputs must end with `.parquet`.
-- Work is scheduled by fragment and row group.
+- Work is scheduled by chunk and row group.
 - Each row is yielded as a sample dictionary.
 
 ## Lance
@@ -90,10 +90,10 @@ Dataset.from_source(
     context=None,
     resample=False,
     columns=None,
-    batch_size=1024,
+    read_batch_size=1024,
     shuffle_mode="none",
+    chunk_shuffle=None,
     ref_columns=None,
-    ref_index_scope=None,
 )
 ```
 
@@ -101,16 +101,21 @@ Arguments:
 
 - `shards`: Lance dataset URI or sequence of URIs.
 - `columns`: optional projection.
-- `batch_size`: internal Lance read batch size.
-- `shuffle_mode`: `"none"`, `"global"`, or `"fragment_aware"`.
-- `ref_columns`: optional Lance reference column configuration.
-- `ref_index_scope`: optional reference-index storage scope.
+- `read_batch_size`: number of row indexes aggregated into one Lance read call.
+- `shuffle_mode`: `"none"`, `"global"`, or `"chunk"`.
+- `chunk_shuffle`: optional chunk shuffle dict when `shuffle_mode="chunk"`.
+  Supported keys are `chunk_size` (default `250000`), `k` (default `8`), and
+  `row_order` (`"permuted"` or `"sequential"`, default `"permuted"`).
+- `ref_columns`: optional mapping from output column name to a dict with `uri`, `key_column`, and `value_column`.
+  `uri` may be a single Lance dataset URI or a list of URIs.
 
 Lance source notes:
 
 - Lance supports exact deterministic global shuffle without materializing a full epoch index list.
-- `fragment_aware` shuffle preserves deterministic order while staying friendlier to fragment locality.
+- `chunk` shuffle randomizes chunk order and rows within a bounded chunk window.
 - Lance reference columns can be resolved with `resolve_ref(...)`.
+- Use `chunk_shuffle={"chunk_size": 65536, "k": 4, "row_order": "sequential"}` to tune chunk shuffle.
+- `row_order` can be `"permuted"` or `"sequential"`. The default is `"permuted"`.
 
 ### Lance Reference Resolution
 
@@ -127,7 +132,25 @@ dataset = Dataset.from_source(
     },
 )
 
-dataset = dataset.resolve_ref(["image"])
+dataset = dataset.resolve_ref(
+    ["image"],
+    resolve_batch_size=1024,
+    index={
+        "scope": "shared",
+        "build_strategy": "auto",
+        "bucket_count": 4096,
+    },
+)
 ```
 
 `resolve_ref(...)` appends a stateful assembly stage that resolves configured reference values lazily.
+The `index` dict supports:
+
+- `scope`: `"shared"` (default), `"node_local"`, or `"process"`.
+- `build_strategy`: `"auto"` (default), `"in_memory"`, or `"bucketed"`.
+- `bucket_count`: positive integer for `"bucketed"` builds. Defaults to `4096`.
+
+With `build_strategy="auto"`, small sources use the in-memory builder, while larger sources use a bucketed on-disk
+join to avoid keeping all reference keys in memory.
+By default, index cache files are stored under the main Lance dataset. Set
+`MVP_DATASET_LANCE_REF_INDEX_CACHE_DIR` to place them in another directory.
