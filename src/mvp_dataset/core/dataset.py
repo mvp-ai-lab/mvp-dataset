@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import warnings
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 
@@ -245,6 +245,44 @@ class Dataset(TorchIterableDataset):
             apply=_UnbatchStage(),
         )
         return self._append_stage(spec)
+
+    def split(self, fractions: Sequence[float]) -> tuple[Dataset, ...]:
+        """Partition this dataset into disjoint subsets covering all data.
+
+        Each returned dataset reads only its own data.
+
+        The default implementation treats each ``_source`` element as one
+        equally weighted unit. Sources override this when they partition at a
+        different granularity or do not support subsetting.
+
+        Args:
+            fractions: Split weights, normalized internally (``[0.8, 0.2]`` and
+                ``[8, 2]`` are equivalent).
+
+        Returns:
+            One dataset per fraction, in the input order."""
+        from .subset import split_units
+
+        return split_units(self, [1.0] * len(self._source), fractions)
+
+    def sample(self, fraction: float, *, seed: int = 0) -> Dataset:
+        """Return a dataset over a seeded random subset of this dataset.
+
+        Sampling is without replacement and cannot oversample
+        (``0 < fraction <= 1``). It is reproducible for a given ``seed``.
+
+        The default implementation treats each ``_source`` element as one equally
+        weighted unit; sources override this for other granularities or to opt out.
+
+        Args:
+            fraction: Fraction of the dataset to keep, in ``(0, 1]``.
+            seed: Seed controlling which data is kept.
+
+        Returns:
+            A new dataset reading only the sampled data."""
+        from .subset import sample_units
+
+        return sample_units(self, [1.0] * len(self._source), fraction, seed)
 
     def consume(self, factory: Callable[[RuntimeContext], Consumer]) -> object:
         """Consume this pipeline eagerly and return a user-defined result.

@@ -71,6 +71,23 @@ class LanceSource:
 
 
 @dataclass(frozen=True, slots=True)
+class LanceSelection:
+    """Row-subset window used by ``split()`` and ``sample()``.
+
+    Attributes:
+        start: Window start in source logical positions.
+        count: Number of rows in the subset (the effective row space size).
+        total: Total rows in the underlying source.
+        seed: Optional seed for sample membership permutation.
+    """
+
+    start: int
+    count: int
+    total: int
+    seed: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class LanceIndexItem:
     """Physical Lance row location used by the source iterator."""
 

@@ -1,12 +1,15 @@
 """Lance dataset source configuration."""
 
+import math
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 
 from mvp_dataset.core.context import RuntimeContext
 from mvp_dataset.core.dataset import Dataset
 from mvp_dataset.core.resume import stable_fingerprint
 from mvp_dataset.core.stages import _AssembleStage
+from mvp_dataset.core.subset import split_offsets
 from mvp_dataset.core.types import ShardInput, StageSpec
 
 from .config import resolve_lance_source_config
@@ -19,7 +22,12 @@ from .refs import (
     validate_ref_names,
 )
 from .source import list_lance_sources
-from .types import LanceRefIndexConfigInput, LanceRefResolverConfig, LanceShuffleMode
+from .types import (
+    LanceRefIndexConfigInput,
+    LanceRefResolverConfig,
+    LanceSelection,
+    LanceShuffleMode,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +38,7 @@ class LanceDataset(Dataset):
     _columns: tuple[str, ...] | None = None
     _read_batch_size: int = 1024
     _chunk_shuffle: ChunkShuffleConfig | None = None
+    _selection: LanceSelection | None = None
 
     @classmethod
     def from_source(
@@ -111,6 +120,7 @@ class LanceDataset(Dataset):
             source_fingerprint=stable_fingerprint(self._source_fingerprint()),
             shuffle_mode=self._shuffle_mode,
             chunk_config=self._chunk_shuffle,
+            selection=self._selection,
         )
 
     def _source_fingerprint(self) -> dict[str, object]:
@@ -121,6 +131,7 @@ class LanceDataset(Dataset):
             "resample": self._resample,
             "shuffle_mode": self._shuffle_mode,
             "chunk_shuffle": self._chunk_shuffle_fingerprint(),
+            "selection": self._selection_fingerprint(),
             "iter": {
                 "columns": list(self._columns) if self._columns else None,
                 "read_batch_size": self._read_batch_size,
@@ -157,6 +168,78 @@ class LanceDataset(Dataset):
             "k": config.k,
             "row_order": config.row_order,
         }
+
+    def _selection_fingerprint(self) -> dict[str, object] | None:
+        """Return the split/sample selection fingerprint payload."""
+        selection = self._selection
+        if selection is None:
+            return None
+        return {
+            "seed": selection.seed,
+            "start": selection.start,
+            "count": selection.count,
+            "total": selection.total,
+        }
+
+    def split(self, fractions: Sequence[float]) -> tuple[Dataset, ...]:
+        """Partition the Lance dataset into disjoint row subsets covering all rows.
+
+        Splitting is row-exact and efficient: each split reads only its own rows
+        through ``take()``. Splits are contiguous source windows; source-level
+        shuffle can randomize the physical membership.
+
+        Args:
+            fractions: Split weights, normalized internally.
+
+        Returns:
+            One dataset per fraction, in input order."""
+        if self._selection is not None:
+            msg = (
+                "[UnsupportedNestedLanceSubset] apply split()/sample() on the base Lance "
+                "dataset before other subset operations"
+            )
+            raise ValueError(msg)
+        total = self._source[0].total_rows
+        offsets = split_offsets(total, fractions)
+        return tuple(
+            dataclass_replace(
+                self,
+                _selection=LanceSelection(
+                    start=offsets[index],
+                    count=offsets[index + 1] - offsets[index],
+                    total=total,
+                ),
+                _resume_state=None,
+            )
+            for index in range(len(offsets) - 1)
+        )
+
+    def sample(self, fraction: float, *, seed: int = 0) -> Dataset:
+        """Return a dataset over a seeded random row subset of the Lance dataset.
+
+        Sampling is row-exact and efficient: only the sampled rows are read. It is
+        without replacement and cannot oversample (``0 < fraction <= 1``).
+
+        Args:
+            fraction: Fraction of rows to keep, in ``(0, 1]``.
+            seed: Seed controlling which rows are kept.
+
+        Returns:
+            A new dataset reading only the sampled rows."""
+        if self._selection is not None:
+            msg = (
+                "[UnsupportedNestedLanceSubset] apply split()/sample() on the base Lance "
+                "dataset before other subset operations"
+            )
+            raise ValueError(msg)
+        fraction = float(fraction)
+        if not math.isfinite(fraction) or not 0 < fraction <= 1:
+            msg = f"[InvalidSampleFraction] fraction must be in (0, 1], got={fraction!r}"
+            raise ValueError(msg)
+        total = self._source[0].total_rows
+        count = round(fraction * total)
+        selection = LanceSelection(start=0, count=count, total=total, seed=seed)
+        return dataclass_replace(self, _selection=selection, _resume_state=None)
 
     def resolve_ref(
         self,

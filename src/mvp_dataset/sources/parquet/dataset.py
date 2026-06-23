@@ -76,6 +76,18 @@ class ParquetDataset(Dataset):
             _shuffle_mode=shuffle_mode,
         )
 
+    def split(self, fractions: Sequence[float]) -> tuple[Dataset, ...]:
+        """Partition the dataset by chunks weighted by row count."""
+        from mvp_dataset.core.subset import split_units
+
+        return split_units(self, [float(chunk.num_rows) for chunk in self._source], fractions)
+
+    def sample(self, fraction: float, *, seed: int = 0) -> Dataset:
+        """Sample a subset by chunks weighted by row count."""
+        from mvp_dataset.core.subset import sample_units
+
+        return sample_units(self, [float(chunk.num_rows) for chunk in self._source], fraction, seed)
+
     def _build_source_stream(self, *, context: RuntimeContext) -> Iterable[object]:
         """Build the source iterator for a runtime context."""
         return _ParquetSourceIterator(
