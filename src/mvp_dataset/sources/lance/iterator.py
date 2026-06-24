@@ -11,7 +11,7 @@ from mvp_dataset.core.resume import ResumeStateError
 
 from .order import ChunkShuffleConfig, LanceIndexOrder, build_lance_index_order
 from .reader import LanceBatchReader
-from .types import LanceIndexItem, LanceShuffleMode, LanceSource
+from .types import LanceIndexItem, LanceSelection, LanceShuffleMode, LanceSource
 
 
 @dataclass(slots=True)
@@ -26,6 +26,7 @@ class _LanceSourceIterator:
     source_fingerprint: str
     shuffle_mode: LanceShuffleMode = "none"
     chunk_config: ChunkShuffleConfig | None = None
+    selection: LanceSelection | None = None
     round_index: int = 0
     position_in_round: int = 0
     _pending_samples: deque[object] = field(default_factory=deque)
@@ -49,6 +50,7 @@ class _LanceSourceIterator:
             self.context,
             self.shuffle_mode,
             chunk_config=self.chunk_config,
+            selection=self.selection,
         )
         self.batch_reader = LanceBatchReader(self.source)
 

@@ -82,6 +82,52 @@ dataset = dataset.unbatch()
 
 Expands list, tuple, or dictionary-style batches back into samples.
 
+## Subset Operations
+
+`split` and `sample` derive new datasets that cover or sample the source. They
+are supported on all sources except `mixed`. Each derived dataset reads only its
+own data.
+
+### `split(fractions)`
+
+```python
+train, val = dataset.split([0.8, 0.2])          # [8, 2] is equivalent
+train, val, test = dataset.split([0.8, 0.1, 0.1])
+```
+
+Partitions the dataset into disjoint subsets that together cover all data.
+
+- `fractions` are normalized internally, so `[8, 2]` and `[0.8, 0.2]` are the same.
+- Returns a tuple of datasets, one per fraction, in input order.
+- The partition follows source order. Source-level shuffle can be used before
+  splitting when random membership is needed.
+
+### `sample(fraction, *, seed=0)`
+
+```python
+subset = dataset.sample(0.1, seed=0)
+```
+
+Returns a dataset over a seeded random subset.
+
+- `fraction` must be in `(0, 1]` — sampling is without replacement and cannot oversample.
+- Reproducible for a given `seed`.
+
+### Granularity
+
+Selection granularity depends on what the source can read efficiently:
+
+- **lance** — row-exact. `split([0.8, 0.2])` yields exactly 80% / 20% of rows,
+  and `sample(f)` keeps exactly `round(f * num_rows)` rows, reading only those rows.
+- **parquet** — chunk-level, weighted by row count.
+- **tar** / **jsonl** — whole-shard level. Fractions are approximate and bounded
+  by the shard/file count; a single tar or `.jsonl` file is one shard and cannot
+  be split internally.
+
+A subset must keep at least `context.total_slots` units (shards/chunks) for
+unit-based sources, otherwise a `ValueError` is raised. `split`/`sample` cannot
+be stacked on an already-subset `lance` dataset; apply them on the base dataset first.
+
 ## Terminal Operations
 
 ### `consume(factory)`

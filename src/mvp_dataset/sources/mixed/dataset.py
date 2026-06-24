@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 from mvp_dataset.core.context import RuntimeContext
@@ -55,6 +55,16 @@ class MixedDataset(Dataset):
             _stages=(),
             _strategy=strategy,
         )
+
+    def split(self, fractions: Sequence[float]) -> tuple[Dataset, ...]:
+        """Mixed sources cannot be split; split each child dataset instead."""
+        msg = f"[UnsupportedSubsetSource] source_kind={self._source_kind!r} does not support split()"
+        raise ValueError(msg)
+
+    def sample(self, fraction: float, *, seed: int = 0) -> Dataset:
+        """Mixed sources cannot be sampled; sample each child dataset instead."""
+        msg = f"[UnsupportedSubsetSource] source_kind={self._source_kind!r} does not support sample()"
+        raise ValueError(msg)
 
     def _build_source_stream(self, *, context: RuntimeContext) -> Iterable[object]:
         """Build the source iterator for a runtime context."""

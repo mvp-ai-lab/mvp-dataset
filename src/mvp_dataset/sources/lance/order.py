@@ -12,7 +12,7 @@ import numpy as np
 
 from mvp_dataset.core.context import RuntimeContext
 
-from .types import LanceIndexItem, LanceShuffleMode, LanceSource
+from .types import LanceIndexItem, LanceSelection, LanceShuffleMode, LanceSource
 
 DEFAULT_CHUNK_SHUFFLE_CHUNK_SIZE: Final[int] = 250_000
 DEFAULT_CHUNK_SHUFFLE_K: Final[int] = 8
@@ -90,15 +90,21 @@ def build_lance_index_order(
     shuffle_mode: LanceShuffleMode,
     *,
     chunk_config: ChunkShuffleConfig | None = None,
+    selection: LanceSelection | None = None,
 ) -> LanceIndexOrder:
     """Build the index order implementation for a Lance shuffle mode."""
+    resolved_selection = selection or LanceSelection(
+        start=0,
+        count=source.total_rows,
+        total=source.total_rows,
+    )
     if shuffle_mode == "none":
-        return SequentialIndexOrder(source=source, context=context)
+        return SequentialIndexOrder(source=source, context=context, selection=resolved_selection)
     if shuffle_mode == "global":
-        return GlobalShuffleIndexOrder(source=source, context=context)
+        return GlobalShuffleIndexOrder(source=source, context=context, selection=resolved_selection)
     if shuffle_mode == "chunk":
         config = resolve_chunk_shuffle_config(chunk_config)
-        return ChunkShuffleIndexOrder(source=source, context=context, config=config)
+        return ChunkShuffleIndexOrder(source=source, context=context, selection=resolved_selection, config=config)
 
     msg = f"[InvalidLanceShuffleMode] expected none, global, or chunk, got {shuffle_mode!r}"
     raise ValueError(msg)
@@ -154,65 +160,115 @@ def _map_sorted_global_indexes(source: LanceSource, global_indexes: Sequence[int
 
 
 class LanceIndexOrder(ABC):
-    """Map logical source positions to Lance row indexes in batches."""
+    """Map logical source positions to Lance row indexes in batches.
 
-    def __init__(self, *, source: LanceSource, context: RuntimeContext) -> None:
+    All ordering operates over the *effective* row space defined by the active
+    :class:`LanceSelection` (size ``selection.count``). Effective indexes are
+    translated to source logical positions before source-level ordering maps them
+    to physical rows.
+    """
+
+    _epoch_sorted: bool = False
+
+    def __init__(self, *, source: LanceSource, context: RuntimeContext, selection: LanceSelection) -> None:
         self.source = source
         self.context = context
+        self.selection = selection
 
     def round_size(self, round_index: int) -> int:
         """Return item count assigned to this runtime slot in one round."""
         _ = round_index
-        if self.context.slot >= self.source.total_rows:
+        effective_total = self.selection.count
+        if self.context.slot >= effective_total:
             return 0
-        return ((self.source.total_rows - 1 - self.context.slot) // self.context.total_slots) + 1
+        return ((effective_total - 1 - self.context.slot) // self.context.total_slots) + 1
 
-    @abstractmethod
     def items(self, round_index: int, start: int, count: int) -> list[LanceIndexItem]:
         """Return physical Lance indexes for a logical position range."""
+        effective_indexes = self._effective_indexes(round_index, start, count)
+        selection = self.selection
+        if selection.seed is None:
+            source_positions = [selection.start + effective_index for effective_index in effective_indexes]
+        else:
+            source_positions = [
+                permute_index(selection.start + effective_index, total_rows=selection.total, seed=selection.seed)
+                for effective_index in effective_indexes
+            ]
+        global_indexes = self._global_indexes(round_index, source_positions)
+        if self._epoch_sorted and selection.seed is None:
+            return _map_sorted_global_indexes(self.source, global_indexes)
+        return map_global_indexes(self.source, global_indexes)
 
-    def _global_positions(self, start: int, count: int) -> list[int]:
-        return [self.context.slot + position * self.context.total_slots for position in range(start, start + count)]
+    @abstractmethod
+    def _effective_indexes(self, round_index: int, start: int, count: int) -> list[int]:
+        """Return effective-space indexes (in ``[0, effective_total)``) for a range."""
+
+    @abstractmethod
+    def _global_indexes(self, round_index: int, source_positions: Sequence[int]) -> list[int]:
+        """Map source logical positions to physical global row indexes."""
 
 
 class SequentialIndexOrder(LanceIndexOrder):
     """Non-shuffled deterministic Lance order."""
 
-    def items(self, round_index: int, start: int, count: int) -> list[LanceIndexItem]:
-        """Return sequential Lance indexes for a logical position range."""
+    _epoch_sorted = True
+
+    def _effective_indexes(self, round_index: int, start: int, count: int) -> list[int]:
+        """Return sequential effective indexes for a logical position range."""
         _ = round_index
-        return _map_sorted_global_indexes(self.source, self._global_positions(start, count))
+        return [self.context.slot + position * self.context.total_slots for position in range(start, start + count)]
+
+    def _global_indexes(self, round_index: int, source_positions: Sequence[int]) -> list[int]:
+        """Map source logical positions to physical global row indexes."""
+        _ = round_index
+        return list(source_positions)
 
 
 class GlobalShuffleIndexOrder(LanceIndexOrder):
     """Deterministic global Lance shuffle."""
 
-    def items(self, round_index: int, start: int, count: int) -> list[LanceIndexItem]:
-        """Return globally shuffled Lance indexes for a logical position range."""
-        global_indexes = [
+    def _effective_indexes(self, round_index: int, start: int, count: int) -> list[int]:
+        """Return globally shuffled effective indexes for a logical position range."""
+        step = self.context.total_slots
+        first = self.context.slot + start * step
+        stop = first + count * step
+        return list(range(first, stop, step))
+
+    def _global_indexes(self, round_index: int, source_positions: Sequence[int]) -> list[int]:
+        """Map source logical positions to globally shuffled physical row indexes."""
+        return [
             permute_index(position, total_rows=self.source.total_rows, seed=self.context.seed + round_index)
-            for position in self._global_positions(start, count)
+            for position in source_positions
         ]
-        return map_global_indexes(self.source, global_indexes)
 
 
 class ChunkShuffleIndexOrder(LanceIndexOrder):
     """Deterministic chunk-window Lance shuffle."""
 
-    def __init__(self, *, source: LanceSource, context: RuntimeContext, config: ChunkShuffleConfig) -> None:
-        super().__init__(source=source, context=context)
+    def __init__(
+        self,
+        *,
+        source: LanceSource,
+        context: RuntimeContext,
+        selection: LanceSelection,
+        config: ChunkShuffleConfig,
+    ) -> None:
+        super().__init__(source=source, context=context, selection=selection)
         self.config = config
         self._round_index: int | None = None
         self._round_order: _ChunkRoundOrder | None = None
 
-    def items(self, round_index: int, start: int, count: int) -> list[LanceIndexItem]:
-        """Return chunk-shuffled Lance indexes for a logical position range."""
+    def _effective_indexes(self, round_index: int, start: int, count: int) -> list[int]:
+        """Return chunk-shuffled effective indexes for a logical position range."""
+        step = self.context.total_slots
+        first = self.context.slot + start * step
+        stop = first + count * step
+        return list(range(first, stop, step))
+
+    def _global_indexes(self, round_index: int, source_positions: Sequence[int]) -> list[int]:
+        """Map source logical positions to chunk-shuffled physical row indexes."""
         order = self._order_for_round(round_index)
-        global_indexes = [
-            self._global_index_at(position, round_index=round_index, order=order)
-            for position in self._global_positions(start, count)
-        ]
-        return map_global_indexes(self.source, global_indexes)
+        return [self._global_index_at(position, round_index=round_index, order=order) for position in source_positions]
 
     def _order_for_round(self, round_index: int) -> _ChunkRoundOrder:
         if self._round_index == round_index and self._round_order is not None:
@@ -220,7 +276,8 @@ class ChunkShuffleIndexOrder(LanceIndexOrder):
 
         chunk_size = self.config.chunk_size
         k = self.config.k
-        if self.source.total_rows <= 0:
+        total_rows = self.source.total_rows
+        if total_rows <= 0:
             order = _ChunkRoundOrder(
                 chunk_size=chunk_size,
                 k=k,
@@ -229,7 +286,7 @@ class ChunkShuffleIndexOrder(LanceIndexOrder):
                 window_offsets=(0,),
             )
         else:
-            num_chunks = (self.source.total_rows + chunk_size - 1) // chunk_size
+            num_chunks = (total_rows + chunk_size - 1) // chunk_size
             rng = np.random.default_rng(_mix_seed(self.context.seed, round_index, 0))
             chunk_order = tuple(int(chunk_id) for chunk_id in rng.permutation(num_chunks))
             chunk_offsets = [0]
