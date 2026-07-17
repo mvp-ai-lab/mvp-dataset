@@ -113,6 +113,14 @@ Lance source notes:
 
 - Lance supports exact deterministic global shuffle without materializing a full epoch index list.
 - `chunk` shuffle randomizes chunk order and rows within a bounded chunk window.
+- `dataset.filter(predicate)` accepts a Lance SQL WHERE expression or a sequence of expressions. Sequence entries are
+  OR-combined logically and executed as independent native filtered scans, which supports bounded ID `IN (...)`
+  batches. Matching rows are deduplicated in source order and stored in a disk-backed row index.
+- Filter indexes are split into deterministic fragment parts and memory-mapped at runtime. Set
+  `MVP_DATASET_LANCE_FILTER_INDEX_CACHE_DIR` when the Lance source is remote or read-only.
+- Select filter index scope with `index={"scope": "process" | "node_local" | "shared"}`. The default is `"shared"`;
+  storage visibility is not detected automatically.
+- Filtering Lance datasets with deleted rows is not supported.
 - Lance reference columns can be resolved with `resolve_ref(...)`.
 - Use `chunk_shuffle={"chunk_size": 65536, "k": 4, "row_order": "sequential"}` to tune chunk shuffle.
 - `row_order` can be `"permuted"` or `"sequential"`. The default is `"permuted"`.

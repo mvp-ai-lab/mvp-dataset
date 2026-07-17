@@ -154,6 +154,19 @@ class Dataset(TorchIterableDataset):
         spec = StageSpec(kind="map", apply=_MapStage(fn))
         return self._append_stage(spec)
 
+    def filter(self, predicate: str | Sequence[str], *, index: dict[str, object] | None = None) -> Dataset:
+        """Return a source-filtered dataset when supported by the backend.
+
+        Args:
+            predicate: Backend-native filter expression or batched expressions.
+            index: Optional backend filter-index configuration.
+
+        Returns:
+            A new filtered dataset."""
+        _ = predicate, index
+        msg = f"[UnsupportedFilter] source kind={self._source_kind!r}"
+        raise NotImplementedError(msg)
+
     def shuffle(self, buffer_size: int, initial: int | None = None) -> Dataset:
         """Append a deterministic sample-level shuffle stage.
 

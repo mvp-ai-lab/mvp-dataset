@@ -26,6 +26,45 @@ All source constructors accept these common arguments:
 
 Source-specific arguments are documented in [Source Formats](source-formats.md).
 
+## Source Filter
+
+### `filter(predicate, index=None)`
+
+```python
+dataset = Dataset.from_source("lance", "/data/train.lance").filter(
+    "score >= 0.8 AND label IS NOT NULL",
+    index={"scope": "shared"},
+)
+```
+
+Applies a Lance SQL predicate before source sharding, source shuffle, and row projection. Filtering currently supports
+only Lance and must be called before pipeline stages, `split()`, or `sample()`.
+
+A predicate sequence is combined with `OR` logically and executed as independent Lance filter queries. This keeps
+large ID filters bounded without constructing one large SQL expression:
+
+```python
+ids = [line.strip() for line in open("train.ids", encoding="utf-8") if line.strip()]
+predicates = [
+    "id IN (" + ", ".join("'" + value.replace("'", "''") + "'" for value in ids[start : start + 512]) + ")"
+    for start in range(0, len(ids), 512)
+]
+dataset = Dataset.from_source("lance", "/data/train.lance").filter(predicates)
+```
+
+Overlapping predicate results are deduplicated and source order is preserved. Repeated `filter()` calls are combined
+with `AND`, so `filter([p1, p2]).filter(q)` means `(p1 AND q) OR (p2 AND q)`. A Lance scalar index on the ID column is
+recommended because each predicate is a separate query.
+
+The optional index scope controls how the disk-backed filtered-row index is built:
+
+- `"process"`: the current process prepares all missing parts.
+- `"node_local"`: local ranks build parts together; the cache must be visible within the node.
+- `"shared"` (default): all ranks build parts together; the cache must be visible across nodes.
+
+`filter(...).split(...)` and `filter(...).sample(...)` operate on the filtered row space. Lance source shuffle modes
+`none`, `global`, and `chunk` remain supported.
+
 ## Stages
 
 All dataset stages are lazy and immutable. Calling a stage returns a new dataset.

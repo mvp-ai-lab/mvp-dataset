@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 LanceShuffleMode = Literal["none", "global", "chunk"]
+LanceFilterIndexScope = Literal["shared", "node_local", "process"]
+LanceFilterIndexConfigInput = dict[str, object] | None
 LanceRefIndexScope = Literal["shared", "node_local", "process"]
 LanceRefIndexBuildStrategy = Literal["auto", "in_memory", "bucketed"]
 LanceRefIndexConfigInput = dict[str, object] | None
@@ -18,7 +20,24 @@ class LanceDatasetSpec:
     uri: str
     num_rows: int
     row_offset: int
+    version: int | str | None = None
     handle: object | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LanceFilterIndexConfig:
+    """Filter-index build configuration."""
+
+    scope: LanceFilterIndexScope = "shared"
+
+
+@dataclass(frozen=True, slots=True)
+class LanceFilterIndex:
+    """Disk-backed mapping from filtered positions to source row indexes."""
+
+    paths: tuple[str, ...]
+    offsets: tuple[int, ...]
+    count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +48,7 @@ class LanceRefSpec:
     uri: str | tuple[str, ...]
     key_column: str
     value_column: str
+    datasets: tuple[LanceDatasetSpec, ...] = ()
     index_uri: str | None = None
     index_offsets_path: str | None = None
     index_entries_path: str | None = None
