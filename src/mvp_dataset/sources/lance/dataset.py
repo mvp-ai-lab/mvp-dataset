@@ -2,7 +2,7 @@
 
 import math
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dataclasses import replace as dataclass_replace
 
 from mvp_dataset.core.context import RuntimeContext
@@ -13,6 +13,7 @@ from mvp_dataset.core.subset import split_offsets
 from mvp_dataset.core.types import ShardInput, StageSpec
 
 from .config import resolve_lance_source_config
+from .filter import prepare_filter_index, resolve_filter_index_config
 from .iterator import _LanceSourceIterator
 from .order import ChunkShuffleConfig, ChunkShuffleInput, resolve_chunk_shuffle_config
 from .refs import (
@@ -23,6 +24,7 @@ from .refs import (
 )
 from .source import list_lance_sources
 from .types import (
+    LanceFilterIndexConfig,
     LanceRefIndexConfigInput,
     LanceRefResolverConfig,
     LanceSelection,
@@ -39,6 +41,8 @@ class LanceDataset(Dataset):
     _read_batch_size: int = 1024
     _chunk_shuffle: ChunkShuffleConfig | None = None
     _selection: LanceSelection | None = None
+    _filter_predicate_groups: tuple[tuple[str, ...], ...] = ()
+    _filter_index_config: LanceFilterIndexConfig = field(default_factory=LanceFilterIndexConfig)
 
     @classmethod
     def from_source(
@@ -111,8 +115,19 @@ class LanceDataset(Dataset):
         if len(self._source) != 1:
             msg = "[InvalidLanceSource] exactly one merged Lance source is required"
             raise RuntimeError(msg)
+        source = self._source[0]
+        filter_index = (
+            prepare_filter_index(
+                source,
+                predicate_groups=self._filter_predicate_groups,
+                context=context,
+                config=self._filter_index_config,
+            )
+            if self._filter_predicate_groups
+            else None
+        )
         return _LanceSourceIterator(
-            source=self._source[0],
+            source=source,
             context=context,
             resample=self._resample,
             columns=self._columns,
@@ -121,6 +136,7 @@ class LanceDataset(Dataset):
             shuffle_mode=self._shuffle_mode,
             chunk_config=self._chunk_shuffle,
             selection=self._selection,
+            filter_index=filter_index,
         )
 
     def _source_fingerprint(self) -> dict[str, object]:
@@ -132,6 +148,7 @@ class LanceDataset(Dataset):
             "shuffle_mode": self._shuffle_mode,
             "chunk_shuffle": self._chunk_shuffle_fingerprint(),
             "selection": self._selection_fingerprint(),
+            "filter": stable_fingerprint(self._filter_predicate_groups) if self._filter_predicate_groups else None,
             "iter": {
                 "columns": list(self._columns) if self._columns else None,
                 "read_batch_size": self._read_batch_size,
@@ -141,6 +158,7 @@ class LanceDataset(Dataset):
                     "uri": dataset.uri,
                     "num_rows": dataset.num_rows,
                     "row_offset": dataset.row_offset,
+                    "version": dataset.version,
                 }
                 for dataset in source.datasets
             ],
@@ -150,6 +168,14 @@ class LanceDataset(Dataset):
                     "uri": ref.uri,
                     "key_column": ref.key_column,
                     "value_column": ref.value_column,
+                    "datasets": [
+                        {
+                            "uri": dataset.uri,
+                            "version": dataset.version,
+                            "num_rows": dataset.num_rows,
+                        }
+                        for dataset in ref.datasets
+                    ],
                     "index_uri": ref.index_uri,
                     "index_offsets_path": ref.index_offsets_path,
                     "index_entries_path": ref.index_entries_path,
@@ -181,6 +207,64 @@ class LanceDataset(Dataset):
             "total": selection.total,
         }
 
+    def filter(self, predicate: str | Sequence[str], *, index: dict[str, object] | None = None) -> Dataset:
+        """Return a dataset over rows matching Lance SQL predicates.
+
+        Args:
+            predicate: A Lance SQL WHERE expression, or a non-empty sequence of expressions combined with ``OR``.
+            index: Optional filter-index config containing ``scope``.
+
+        Returns:
+            A new filtered dataset."""
+        if self._stages or self._selection is not None:
+            msg = "[InvalidFilterPlacement] filter() must be applied before stages, split(), or sample()"
+            raise ValueError(msg)
+        if isinstance(predicate, str):
+            raw_predicates = (predicate,)
+        elif isinstance(predicate, Sequence):
+            raw_predicates = tuple(predicate)
+        else:
+            msg = "[InvalidLanceFilter] predicate must be a string or sequence of strings"
+            raise TypeError(msg)
+        if not raw_predicates:
+            msg = "[InvalidLanceFilter] predicate sequence must be non-empty"
+            raise ValueError(msg)
+
+        predicates: list[str] = []
+        for item in raw_predicates:
+            if not isinstance(item, str):
+                msg = "[InvalidLanceFilter] every predicate must be a string"
+                raise TypeError(msg)
+            item = item.strip()
+            if not item:
+                msg = "[InvalidLanceFilter] predicate must be non-empty"
+                raise ValueError(msg)
+            predicates.append(item)
+
+        group = tuple(dict.fromkeys(predicates))
+        groups = self._filter_predicate_groups
+        if groups and len(groups[-1]) == 1 and len(group) == 1:
+            group = (f"({groups[-1][0]}) AND ({group[0]})",)
+            groups = groups[:-1]
+        config = self._filter_index_config if index is None else resolve_filter_index_config(index)
+        return dataclass_replace(
+            self,
+            _filter_predicate_groups=groups + (group,),
+            _filter_index_config=config,
+            _resume_state=None,
+        )
+
+    def _active_row_count(self) -> int:
+        """Return the row count after source filtering."""
+        if not self._filter_predicate_groups:
+            return self._source[0].total_rows
+        return prepare_filter_index(
+            self._source[0],
+            predicate_groups=self._filter_predicate_groups,
+            context=self.context,
+            config=self._filter_index_config,
+        ).count
+
     def split(self, fractions: Sequence[float]) -> tuple[Dataset, ...]:
         """Partition the Lance dataset into disjoint row subsets covering all rows.
 
@@ -199,7 +283,7 @@ class LanceDataset(Dataset):
                 "dataset before other subset operations"
             )
             raise ValueError(msg)
-        total = self._source[0].total_rows
+        total = self._active_row_count()
         offsets = split_offsets(total, fractions)
         return tuple(
             dataclass_replace(
@@ -236,7 +320,7 @@ class LanceDataset(Dataset):
         if not math.isfinite(fraction) or not 0 < fraction <= 1:
             msg = f"[InvalidSampleFraction] fraction must be in (0, 1], got={fraction!r}"
             raise ValueError(msg)
-        total = self._source[0].total_rows
+        total = self._active_row_count()
         count = round(fraction * total)
         selection = LanceSelection(start=0, count=count, total=total, seed=seed)
         return dataclass_replace(self, _selection=selection, _resume_state=None)
@@ -275,6 +359,13 @@ class LanceDataset(Dataset):
 
         ref_names = validate_ref_names(self._source[0], ref_names)
         source = self._source[0]
+        versioned_refs = []
+        for ref in source.ref_columns:
+            if ref.column in ref_names and not ref.datasets:
+                ref_source = list_lance_sources((ref.uri,) if isinstance(ref.uri, str) else ref.uri)[0]
+                ref = dataclass_replace(ref, datasets=ref_source.datasets)
+            versioned_refs.append(ref)
+        source = dataclass_replace(source, ref_columns=tuple(versioned_refs))
         ref_index = resolve_ref_index_config(index)
 
         factory = LanceResolveRefFactory(
@@ -290,4 +381,4 @@ class LanceDataset(Dataset):
             kind="assemble",
             apply=_AssembleStage(factory=factory, context=stage_context),
         )
-        return self._append_stage(spec)
+        return dataclass_replace(self, _source=(source,))._append_stage(spec)

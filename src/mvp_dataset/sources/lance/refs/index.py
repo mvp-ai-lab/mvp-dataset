@@ -18,14 +18,7 @@ import pyarrow as pa
 
 from mvp_dataset.core.context import RuntimeContext
 
-from ..source import list_lance_sources
-from ..types import (
-    LanceDatasetSpec,
-    LanceRefIndexConfig,
-    LanceRefIndexScope,
-    LanceRefSpec,
-    LanceSource,
-)
+from ..types import LanceRefIndexConfig, LanceRefIndexScope, LanceRefSpec, LanceSource
 
 REF_INDEX_BUILDER_VERSION = 1
 REF_INDEX_MISSING_ROW = -1
@@ -128,68 +121,25 @@ def _resolve_ref_index_root(source: LanceSource) -> Path:
     return Path(source.datasets[0].uri) / REF_INDEX_DIR
 
 
-def _dataset_manifest_fingerprint(uri: str) -> dict[str, Any]:
-    """Return a fingerprint for a Lance dataset manifest."""
-    dataset = lance.dataset(uri)
-    version = getattr(dataset, "version", None)
-    if callable(version):
-        version = version()
-    if version is not None:
-        version = str(version)
-
-    fingerprint: dict[str, Any] = {
-        "uri": uri,
-        "num_rows": dataset.count_rows(),
-        "version": version,
-    }
-
-    versions_dir = Path(uri) / "_versions"
-    if versions_dir.exists():
-        manifests = sorted(versions_dir.glob("*.manifest"))
-        if manifests:
-            latest = manifests[-1]
-            stat = latest.stat()
-            fingerprint["manifest"] = {
-                "name": latest.name,
-                "mtime_ns": stat.st_mtime_ns,
-                "size": stat.st_size,
-            }
-    return fingerprint
-
-
-def _ref_uris(ref: LanceRefSpec) -> tuple[str, ...]:
-    """Return referenced Lance URIs for one reference field."""
-    return (ref.uri,) if isinstance(ref.uri, str) else ref.uri
-
-
 def _ref_manifest_fingerprint(ref: LanceRefSpec) -> dict[str, Any]:
     """Return a fingerprint for reference source manifests."""
-    uris = _ref_uris(ref)
-    if len(uris) == 1:
-        return _dataset_manifest_fingerprint(uris[0])
-    datasets = [_dataset_manifest_fingerprint(uri) for uri in uris]
+    datasets = [
+        {
+            "uri": dataset.uri,
+            "num_rows": dataset.num_rows,
+            "version": dataset.version,
+        }
+        for dataset in ref.datasets
+    ]
     return {
-        "uris": list(uris),
         "datasets": datasets,
-        "num_rows": sum(int(dataset["num_rows"]) for dataset in datasets),
+        "num_rows": sum(dataset.num_rows for dataset in ref.datasets),
     }
 
 
 def _open_ref_value_source(ref: LanceRefSpec) -> LanceSource:
     """Open the value source for a Lance reference field."""
-    source = list_lance_sources(_ref_uris(ref))[0]
-    datasets: list[LanceDatasetSpec] = []
-    for dataset in source.datasets:
-        ds_handle: object = lance.dataset(dataset.uri)
-        datasets.append(
-            LanceDatasetSpec(
-                uri=dataset.uri,
-                num_rows=dataset.num_rows,
-                row_offset=dataset.row_offset,
-                handle=ds_handle,
-            )
-        )
-    return LanceSource(datasets=tuple(datasets), ref_columns=source.ref_columns)
+    return LanceSource(datasets=ref.datasets)
 
 
 def _ref_index_is_valid(
@@ -280,7 +230,9 @@ def _build_ref_index_in_memory(
     global_row_index = 0
     main_columns = [ref.column for ref in active_refs]
     for dataset in source.datasets:
-        for batch in _iter_table_record_batches(lance.dataset(dataset.uri), columns=main_columns):
+        for batch in _iter_table_record_batches(
+            lance.dataset(dataset.uri, version=dataset.version), columns=main_columns
+        ):
             for row in batch.to_pylist():
                 global_row_index += 1
                 for ref in active_refs:
@@ -313,14 +265,16 @@ def _build_ref_index_in_memory(
     for ref in active_refs:
         row_index = 0
         resolved_keys: set[Any] = set()
-        for uri in _ref_uris(ref):
-            for batch in _iter_table_record_batches(lance.dataset(uri), columns=[ref.key_column]):
+        for dataset in ref.datasets:
+            for batch in _iter_table_record_batches(
+                lance.dataset(dataset.uri, version=dataset.version), columns=[ref.key_column]
+            ):
                 for row in batch.to_pylist():
                     key = row[ref.key_column]
                     positions = requested_positions[ref.column].get(key)
                     if positions is not None:
                         if key in resolved_keys:
-                            msg = f"[DuplicateLanceRefKey] duplicate key {key!r} in {uri}:{ref.key_column}"
+                            msg = f"[DuplicateLanceRefKey] duplicate key {key!r} in {dataset.uri}:{ref.key_column}"
                             raise ValueError(msg)
                         resolved_keys.add(key)
                         entries_by_column[ref.column][positions] = row_index
@@ -364,7 +318,9 @@ def _build_ref_index_bucketed(
         global_row_index = 0
         main_columns = [ref.column for ref in active_refs]
         for dataset in source.datasets:
-            for batch in _iter_table_record_batches(lance.dataset(dataset.uri), columns=main_columns):
+            for batch in _iter_table_record_batches(
+                lance.dataset(dataset.uri, version=dataset.version), columns=main_columns
+            ):
                 for row in batch.to_pylist():
                     global_row_index += 1
                     for ref in active_refs:
@@ -427,8 +383,10 @@ def _write_ref_buckets(ref: LanceRefSpec, bucket_dir: Path, *, bucket_count: int
     """Write reference keys to hash buckets."""
     row_index = 0
     with _BucketWriter(bucket_dir) as writer:
-        for uri in _ref_uris(ref):
-            for batch in _iter_table_record_batches(lance.dataset(uri), columns=[ref.key_column]):
+        for dataset in ref.datasets:
+            for batch in _iter_table_record_batches(
+                lance.dataset(dataset.uri, version=dataset.version), columns=[ref.key_column]
+            ):
                 for row in batch.to_pylist():
                     key = row[ref.key_column]
                     key_token = _key_token(key)
@@ -496,7 +454,9 @@ def prepare_ref_indexes(
     active_refs = tuple(ref for ref in source.ref_columns if ref.column in ref_name_set)
     if not active_refs:
         return LanceSource(datasets=source.datasets, ref_columns=())
-
+    if any(not ref.datasets for ref in active_refs):
+        msg = "[UnresolvedLanceRefVersion] reference versions must be resolved before index preparation"
+        raise RuntimeError(msg)
     ref_files = {
         ref.column: {
             "kind": "csr_row_index",
@@ -508,7 +468,14 @@ def prepare_ref_indexes(
     }
     manifest = {
         "builder_version": REF_INDEX_BUILDER_VERSION,
-        "main_datasets": [_dataset_manifest_fingerprint(dataset.uri) for dataset in source.datasets],
+        "main_datasets": [
+            {
+                "uri": dataset.uri,
+                "num_rows": dataset.num_rows,
+                "version": dataset.version,
+            }
+            for dataset in source.datasets
+        ],
         "main_total_rows": source.total_rows,
         "refs": {
             ref.column: {
@@ -573,6 +540,7 @@ def prepare_ref_indexes(
                 uri=ref.uri,
                 key_column=ref.key_column,
                 value_column=ref.value_column,
+                datasets=ref.datasets,
                 index_uri=str(index_dir),
                 index_offsets_path=str(offsets_path),
                 index_entries_path=str(entries_path),

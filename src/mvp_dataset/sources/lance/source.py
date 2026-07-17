@@ -23,6 +23,7 @@ def list_lance_sources(dataset_uris: Sequence[PathLikeStr]) -> list[LanceSource]
                 uri=str(uri),
                 num_rows=num_rows,
                 row_offset=row_offset,
+                version=dataset.version,
             )
         )
         row_offset += num_rows

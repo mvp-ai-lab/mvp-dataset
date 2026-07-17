@@ -18,6 +18,10 @@ class LanceBatchReader:
 
     def __init__(self, source: LanceSource) -> None:
         self.source = source
+        self._datasets = tuple(
+            dataset.handle if dataset.handle is not None else lance.dataset(dataset.uri, version=dataset.version)
+            for dataset in source.datasets
+        )
 
     def read(self, indexes: Sequence[LanceIndexItem], *, columns: Sequence[str] | None = None) -> list[Sample]:
         """Read a batch of Lance rows and restore input index order."""
@@ -31,8 +35,7 @@ class LanceBatchReader:
         per_dataset_rows: dict[int, list[Sample]] = {}
         take_indices_type = pa.int64()
         for dataset_i, local_indices in per_dataset_indices.items():
-            dataset = self.source.datasets[dataset_i]
-            dataset_handle = dataset.handle if dataset.handle is not None else lance.dataset(dataset.uri)
+            dataset_handle = self._datasets[dataset_i]
 
             if isinstance(dataset_handle, pa.Table):
                 table = dataset_handle

@@ -12,7 +12,13 @@ import numpy as np
 
 from mvp_dataset.core.context import RuntimeContext
 
-from .types import LanceIndexItem, LanceSelection, LanceShuffleMode, LanceSource
+from .types import (
+    LanceFilterIndex,
+    LanceIndexItem,
+    LanceSelection,
+    LanceShuffleMode,
+    LanceSource,
+)
 
 DEFAULT_CHUNK_SHUFFLE_CHUNK_SIZE: Final[int] = 250_000
 DEFAULT_CHUNK_SHUFFLE_K: Final[int] = 8
@@ -91,20 +97,41 @@ def build_lance_index_order(
     *,
     chunk_config: ChunkShuffleConfig | None = None,
     selection: LanceSelection | None = None,
+    filter_index: LanceFilterIndex | None = None,
 ) -> LanceIndexOrder:
     """Build the index order implementation for a Lance shuffle mode."""
+    base_total = source.total_rows if filter_index is None else filter_index.count
     resolved_selection = selection or LanceSelection(
         start=0,
-        count=source.total_rows,
-        total=source.total_rows,
+        count=base_total,
+        total=base_total,
     )
+    if resolved_selection.total != base_total or resolved_selection.start + resolved_selection.count > base_total:
+        msg = "[InvalidLanceSelection] selection must fit the active Lance row space"
+        raise ValueError(msg)
     if shuffle_mode == "none":
-        return SequentialIndexOrder(source=source, context=context, selection=resolved_selection)
+        return SequentialIndexOrder(
+            source=source,
+            context=context,
+            selection=resolved_selection,
+            filter_index=filter_index,
+        )
     if shuffle_mode == "global":
-        return GlobalShuffleIndexOrder(source=source, context=context, selection=resolved_selection)
+        return GlobalShuffleIndexOrder(
+            source=source,
+            context=context,
+            selection=resolved_selection,
+            filter_index=filter_index,
+        )
     if shuffle_mode == "chunk":
         config = resolve_chunk_shuffle_config(chunk_config)
-        return ChunkShuffleIndexOrder(source=source, context=context, selection=resolved_selection, config=config)
+        return ChunkShuffleIndexOrder(
+            source=source,
+            context=context,
+            selection=resolved_selection,
+            config=config,
+            filter_index=filter_index,
+        )
 
     msg = f"[InvalidLanceShuffleMode] expected none, global, or chunk, got {shuffle_mode!r}"
     raise ValueError(msg)
@@ -170,10 +197,32 @@ class LanceIndexOrder(ABC):
 
     _epoch_sorted: bool = False
 
-    def __init__(self, *, source: LanceSource, context: RuntimeContext, selection: LanceSelection) -> None:
+    def __init__(
+        self,
+        *,
+        source: LanceSource,
+        context: RuntimeContext,
+        selection: LanceSelection,
+        filter_index: LanceFilterIndex | None,
+    ) -> None:
         self.source = source
         self.context = context
         self.selection = selection
+        self.filter_index = filter_index
+        self.base_total = source.total_rows if filter_index is None else filter_index.count
+        self._filter_parts: tuple[object, ...] = ()
+        if filter_index is not None:
+            self._filter_parts = tuple(
+                np.empty(0, dtype=np.int64)
+                if filter_index.offsets[index + 1] == filter_index.offsets[index]
+                else np.memmap(
+                    path,
+                    dtype=np.int64,
+                    mode="r",
+                    shape=(filter_index.offsets[index + 1] - filter_index.offsets[index],),
+                )
+                for index, path in enumerate(filter_index.paths)
+            )
 
     def round_size(self, round_index: int) -> int:
         """Return item count assigned to this runtime slot in one round."""
@@ -194,10 +243,22 @@ class LanceIndexOrder(ABC):
                 permute_index(selection.start + effective_index, total_rows=selection.total, seed=selection.seed)
                 for effective_index in effective_indexes
             ]
-        global_indexes = self._global_indexes(round_index, source_positions)
+        global_indexes = self._map_filtered_positions(self._global_indexes(round_index, source_positions))
         if self._epoch_sorted and selection.seed is None:
             return _map_sorted_global_indexes(self.source, global_indexes)
         return map_global_indexes(self.source, global_indexes)
+
+    def _map_filtered_positions(self, positions: Sequence[int]) -> list[int]:
+        if self.filter_index is None or not positions:
+            return list(positions)
+        position_array = np.asarray(positions, dtype=np.int64)
+        offsets = np.asarray(self.filter_index.offsets, dtype=np.int64)
+        part_ids = np.searchsorted(offsets, position_array, side="right") - 1
+        global_indexes = np.empty(len(position_array), dtype=np.int64)
+        for part_id in np.unique(part_ids):
+            mask = part_ids == part_id
+            global_indexes[mask] = self._filter_parts[int(part_id)][position_array[mask] - offsets[part_id]]
+        return [int(index) for index in global_indexes]
 
     @abstractmethod
     def _effective_indexes(self, round_index: int, start: int, count: int) -> list[int]:
@@ -237,7 +298,7 @@ class GlobalShuffleIndexOrder(LanceIndexOrder):
     def _global_indexes(self, round_index: int, source_positions: Sequence[int]) -> list[int]:
         """Map source logical positions to globally shuffled physical row indexes."""
         return [
-            permute_index(position, total_rows=self.source.total_rows, seed=self.context.seed + round_index)
+            permute_index(position, total_rows=self.base_total, seed=self.context.seed + round_index)
             for position in source_positions
         ]
 
@@ -252,8 +313,9 @@ class ChunkShuffleIndexOrder(LanceIndexOrder):
         context: RuntimeContext,
         selection: LanceSelection,
         config: ChunkShuffleConfig,
+        filter_index: LanceFilterIndex | None,
     ) -> None:
-        super().__init__(source=source, context=context, selection=selection)
+        super().__init__(source=source, context=context, selection=selection, filter_index=filter_index)
         self.config = config
         self._round_index: int | None = None
         self._round_order: _ChunkRoundOrder | None = None
@@ -276,7 +338,7 @@ class ChunkShuffleIndexOrder(LanceIndexOrder):
 
         chunk_size = self.config.chunk_size
         k = self.config.k
-        total_rows = self.source.total_rows
+        total_rows = self.base_total
         if total_rows <= 0:
             order = _ChunkRoundOrder(
                 chunk_size=chunk_size,
@@ -312,7 +374,7 @@ class ChunkShuffleIndexOrder(LanceIndexOrder):
         return order
 
     def _global_index_at(self, global_position: int, *, round_index: int, order: _ChunkRoundOrder) -> int:
-        if global_position < 0 or global_position >= self.source.total_rows:
+        if global_position < 0 or global_position >= self.base_total:
             msg = "[InvalidLanceChunkShuffle] global position is out of range"
             raise ValueError(msg)
         if self.config.row_order == "sequential":
@@ -345,9 +407,9 @@ class ChunkShuffleIndexOrder(LanceIndexOrder):
 
     def _chunk_row_count(self, chunk_id: int) -> int:
         start = chunk_id * self.config.chunk_size
-        if start >= self.source.total_rows:
+        if start >= self.base_total:
             return 0
-        return min(self.config.chunk_size, self.source.total_rows - start)
+        return min(self.config.chunk_size, self.base_total - start)
 
 
 def permute_index(position: int, *, total_rows: int, seed: int) -> int:
