@@ -69,7 +69,6 @@ def main(
     dist_backend: str | None,
     max_samples: int | None,
     log_level: str,
-    cache: bool,
     shuffle_mode: str,
     resample: bool,
     num_workers: int,
@@ -133,9 +132,6 @@ def main(
         ds = Dataset.from_source(source_kind, shards=source, resample=resample).map(map_func)
         if shuffle_mode != "none":
             ds = ds.shuffle(1000)
-    if cache:
-        ds = ds.cache(cache_num_workers=8)
-
     loader = TorchLoader(
         ds,
         num_workers=num_workers,
@@ -201,12 +197,6 @@ if __name__ == "__main__":
         type=str,
         default="INFO",
         help="Package log level, for example DEBUG, INFO, WARNING, or ERROR.",
-    )
-    parser.add_argument(
-        "--cache",
-        action="store_true",
-        help="Whether to cache the dataset after loading. Caching is recommended for better "
-        "performance when the dataset is large and/or expensive to load.",
     )
     parser.add_argument(
         "--shuffle-mode",
@@ -289,7 +279,6 @@ if __name__ == "__main__":
         dist_backend=args.dist_backend,
         max_samples=args.max_samples,
         log_level=args.log_level,
-        cache=args.cache,
         shuffle_mode=args.shuffle_mode,
         resample=args.resample,
         num_workers=args.num_workers,
