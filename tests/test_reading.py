@@ -72,6 +72,80 @@ def test_sources_shard_across_ranks(tmp_path, monkeypatch, source_kind: str) -> 
     assert {sample["id"] for sample in observed_rank0}.isdisjoint({sample["id"] for sample in observed_rank1})
 
 
+def test_jsonl_resume_and_sample_identity_ignore_mount_and_cache_roots(tmp_path, monkeypatch) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    write_jsonl_file(source_root, build_records(count=8))
+    mount_a = tmp_path / "mount-a"
+    mount_b = tmp_path / "mount-b"
+    mount_a.symlink_to(source_root, target_is_directory=True)
+    mount_b.symlink_to(source_root, target_is_directory=True)
+    context = RuntimeContext(rank=0, world_size=2, seed=17)
+
+    monkeypatch.setenv("MVP_DATASET_CACHE_FINGERPRINT_MODE", "content")
+    monkeypatch.setenv("MVP_DATASET_CACHE_DIR", str(tmp_path / "cache-a"))
+    first_dataset = Dataset.from_source(
+        "jsonl",
+        str(mount_a / "samples.jsonl"),
+        context=context,
+        shuffle_mode="none",
+    )
+    first_iterator = iter(first_dataset)
+    first_sample = next(first_iterator)
+    state = first_iterator.state_dict()
+    expected_remainder = list(first_iterator)
+
+    monkeypatch.setenv("MVP_DATASET_CACHE_DIR", str(tmp_path / "cache-b"))
+    second_dataset = Dataset.from_source(
+        "jsonl",
+        str(mount_b / "samples.jsonl"),
+        context=context,
+        shuffle_mode="none",
+    )
+    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
+        resumed = second_dataset.load_state_dict(state)
+
+    assert list(resumed) == expected_remainder
+    assert first_dataset._pipeline_fingerprint() == second_dataset._pipeline_fingerprint()
+    assert first_sample["__file__"] == "samples.jsonl"
+    assert first_sample["__index_in_file__"] == 0
+    assert str(tmp_path / "cache-a") not in first_sample["__key__"]
+
+
+def test_jsonl_sample_identity_ignores_split_layout(tmp_path, monkeypatch) -> None:
+    source = write_jsonl_file(tmp_path, build_records(count=8))
+    monkeypatch.setenv("MVP_DATASET_CACHE_FINGERPRINT_MODE", "content")
+    monkeypatch.setenv("MVP_DATASET_CACHE_DIR", str(tmp_path / "cache"))
+
+    single = list(
+        Dataset.from_source(
+            "jsonl",
+            source,
+            context=RuntimeContext(world_size=1),
+            shuffle_mode="none",
+        )
+    )
+    distributed = [
+        sample
+        for rank in range(2)
+        for sample in Dataset.from_source(
+            "jsonl",
+            source,
+            context=RuntimeContext(rank=rank, world_size=2),
+            shuffle_mode="none",
+        )
+    ]
+
+    single_metadata = {
+        int(sample["value"]): (sample["__file__"], sample["__index_in_file__"], sample["__key__"]) for sample in single
+    }
+    distributed_metadata = {
+        int(sample["value"]): (sample["__file__"], sample["__index_in_file__"], sample["__key__"])
+        for sample in distributed
+    }
+    assert distributed_metadata == single_metadata
+
+
 @pytest.mark.parametrize(
     ("source_kind", "explicit_mode", "metadata_key"),
     [
@@ -357,7 +431,6 @@ def test_lance_bucketed_ref_index_loads_with_shuffle_modes(tmp_path, shuffle_mod
         ["image_ref"],
         resolve_batch_size=2,
         index={
-            "scope": "process",
             "build_strategy": "bucketed",
             "bucket_count": 2,
         },
@@ -368,7 +441,7 @@ def test_lance_bucketed_ref_index_loads_with_shuffle_modes(tmp_path, shuffle_mod
     assert [sample["image_ref"] for sample in observed] == [f"resolved-{index % 4}" for index in range(12)]
 
 
-def test_lance_ref_index_cache_dir_env(tmp_path, monkeypatch) -> None:
+def test_lance_ref_index_uses_unified_cache_dir(tmp_path, monkeypatch) -> None:
     pytest.importorskip("lance")
 
     main_path = write_lance_table(
@@ -381,8 +454,10 @@ def test_lance_ref_index_cache_dir_env(tmp_path, monkeypatch) -> None:
         "refs.lance",
         [{"image_id": f"img-{index}", "image_value": f"resolved-{index}"} for index in range(3)],
     )
-    cache_dir = tmp_path / "ref-index-cache"
-    monkeypatch.setenv("MVP_DATASET_LANCE_REF_INDEX_CACHE_DIR", str(cache_dir))
+    cache_dir = tmp_path / "mvp-cache"
+    legacy_cache_dir = tmp_path / "legacy-ref-index-cache"
+    monkeypatch.setenv("MVP_DATASET_CACHE_DIR", str(cache_dir))
+    monkeypatch.setenv("MVP_DATASET_LANCE_REF_INDEX_CACHE_DIR", str(legacy_cache_dir))
 
     dataset = Dataset.from_source(
         "lance",
@@ -397,9 +472,37 @@ def test_lance_ref_index_cache_dir_env(tmp_path, monkeypatch) -> None:
     ).resolve_ref(
         ["image_ref"],
         resolve_batch_size=2,
-        index={"scope": "process", "build_strategy": "in_memory"},
+        index={"build_strategy": "in_memory"},
     )
 
     assert [sample["image_ref"] for sample in dataset] == [f"resolved-{index}" for index in range(3)]
-    assert list(cache_dir.glob("ref-index-*"))
+    entries = list(cache_dir.glob("*/lance-ref-index-v1/*"))
+    assert len(entries) == 1
+    assert (entries[0] / "manifest.json").is_file()
+    assert (entries[0] / "complete").is_file()
+    assert not legacy_cache_dir.exists()
     assert not (tmp_path / "main.lance" / "_mvp_ref_index").exists()
+
+
+def test_lance_ref_index_rejects_removed_scope_config(tmp_path) -> None:
+    pytest.importorskip("lance")
+    main_path = write_lance_table(tmp_path, "main.lance", [{"id": "sample", "image_ref": "image"}])
+    ref_path = write_lance_table(
+        tmp_path,
+        "refs.lance",
+        [{"image_id": "image", "image_value": "resolved"}],
+    )
+    dataset = Dataset.from_source(
+        "lance",
+        shards=main_path,
+        ref_columns={
+            "image_ref": {
+                "uri": ref_path,
+                "key_column": "image_id",
+                "value_column": "image_value",
+            }
+        },
+    )
+
+    with pytest.raises(ValueError, match=r"\[InvalidLanceRefIndexConfig\].*scope"):
+        dataset.resolve_ref(["image_ref"], index={"scope": "shared"})

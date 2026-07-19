@@ -50,6 +50,8 @@ JSONL source notes:
 
 - Inputs must end with `.jsonl`.
 - Files are split into slot-aligned logical shards.
+- Cached split files keep the original source-relative file and line identity, so sample keys and resume fingerprints do
+  not depend on the cache root or source mount prefix.
 - Samples are JSON objects represented as Python dictionaries.
 
 ## Parquet
@@ -116,10 +118,8 @@ Lance source notes:
 - `dataset.filter(predicate)` accepts a Lance SQL WHERE expression or a sequence of expressions. Sequence entries are
   OR-combined logically and executed as independent native filtered scans, which supports bounded ID `IN (...)`
   batches. Matching rows are deduplicated in source order and stored in a disk-backed row index.
-- Filter indexes are split into deterministic fragment parts and memory-mapped at runtime. Set
-  `MVP_DATASET_LANCE_FILTER_INDEX_CACHE_DIR` when the Lance source is remote or read-only.
-- Select filter index scope with `index={"scope": "process" | "node_local" | "shared"}`. The default is `"shared"`;
-  storage visibility is not detected automatically.
+- Filter indexes are split into deterministic fragment parts, built cooperatively by concurrent ranks and workers,
+  memory-mapped at runtime, and stored under the unified `MVP_DATASET_CACHE_DIR` root.
 - Filtering Lance datasets with deleted rows is not supported.
 - Lance reference columns can be resolved with `resolve_ref(...)`.
 - Use `chunk_shuffle={"chunk_size": 65536, "k": 4, "row_order": "sequential"}` to tune chunk shuffle.
@@ -144,7 +144,6 @@ dataset = dataset.resolve_ref(
     ["image"],
     resolve_batch_size=1024,
     index={
-        "scope": "shared",
         "build_strategy": "auto",
         "bucket_count": 4096,
     },
@@ -154,11 +153,9 @@ dataset = dataset.resolve_ref(
 `resolve_ref(...)` appends a stateful assembly stage that resolves configured reference values lazily.
 The `index` dict supports:
 
-- `scope`: `"shared"` (default), `"node_local"`, or `"process"`.
 - `build_strategy`: `"auto"` (default), `"in_memory"`, or `"bucketed"`.
 - `bucket_count`: positive integer for `"bucketed"` builds. Defaults to `4096`.
 
 With `build_strategy="auto"`, small sources use the in-memory builder, while larger sources use a bucketed on-disk
 join to avoid keeping all reference keys in memory.
-By default, index cache files are stored under the main Lance dataset. Set
-`MVP_DATASET_LANCE_REF_INDEX_CACHE_DIR` to place them in another directory.
+Filter and reference indexes use the unified persistent cache described in [Persistent Cache](cache.md).

@@ -15,27 +15,28 @@ from mvp_dataset.core.types import TarUriRefFieldSpec
 
 from .reader import _parse_jsonl_line
 from .refs import TarManager, resolve_ref_field_value
-from .types import JsonlShuffleMode
+from .types import JsonlShard, JsonlShuffleMode
 
 
 @dataclass(slots=True)
 class _JsonlSourceIterator:
     """Stateful iterator over JSONL shards."""
 
-    shards: Sequence[str]
+    shards: Sequence[JsonlShard]
     context: RuntimeContext
     resample: bool
     shuffle_mode: JsonlShuffleMode = "shard_aware"
     ref_fields: tuple[TarUriRefFieldSpec, ...] = ()
+    source_identity: str = ""
     source_fingerprint: str = ""
     round_index: int = 0
     shard_index: int = 0
     byte_offset: int = 0
     line_index: int = 0
     _handle: BinaryIO | None = None
-    _current_shard: str | None = None
+    _current_shard: JsonlShard | None = None
     _tar_manager: TarManager | None = None
-    _round_shards_cache: list[str] = field(default_factory=list)
+    _round_shards_cache: list[JsonlShard] = field(default_factory=list)
     _round_shards_round: int | None = None
 
     def __post_init__(self) -> None:
@@ -54,7 +55,7 @@ class _JsonlSourceIterator:
     def __next__(self) -> object:
         """Return the next output item."""
         while True:
-            shard = self._current_shard_path()
+            shard = self._current_shard_item()
             if shard is None:
                 self._close()
                 raise StopIteration
@@ -69,7 +70,14 @@ class _JsonlSourceIterator:
                 self._advance_shard()
                 continue
 
-            sample = _parse_jsonl_line(shard, self.line_index, line.decode("utf-8"), allow_preannotated=True)
+            original_line_index = shard.line_start + self.line_index
+            sample = _parse_jsonl_line(
+                shard.logical_path,
+                original_line_index,
+                line.decode("utf-8"),
+                allow_preannotated=True,
+                key=f"{self.source_identity}:{shard.source_index}:{original_line_index}",
+            )
             sample = self._resolve_refs(sample)
             self.byte_offset = self._handle.tell()
             self.line_index += 1
@@ -120,7 +128,10 @@ class _JsonlSourceIterator:
         if not isinstance(byte_offset, int) or byte_offset < 0:
             msg = "[InvalidResumeState] byte_offset must be a non-negative integer"
             raise ResumeStateError(msg)
-        if shard_index < len(round_shards) and byte_offset > Path(round_shards[shard_index]).stat().st_size:
+        if (
+            shard_index < len(round_shards)
+            and byte_offset > Path(round_shards[shard_index].physical_path).stat().st_size
+        ):
             msg = "[InvalidResumeState] byte_offset is out of range"
             raise ResumeStateError(msg)
         if shard_index == len(round_shards) and byte_offset != 0:
@@ -145,8 +156,8 @@ class _JsonlSourceIterator:
         """Return a stable fingerprint for resume compatibility checks."""
         return self.source_fingerprint
 
-    def _current_shard_path(self) -> str | None:
-        """Return the path for the currently active shard."""
+    def _current_shard_item(self) -> JsonlShard | None:
+        """Return the currently active physical shard and logical identity."""
         while True:
             round_shards = self._round_shards(self.round_index)
             if self.shard_index < len(round_shards):
@@ -159,7 +170,7 @@ class _JsonlSourceIterator:
             self.line_index = 0
             self._close_handle()
 
-    def _round_shards(self, round_index: int) -> list[str]:
+    def _round_shards(self, round_index: int) -> list[JsonlShard]:
         """Return the shard order for one resampling round."""
         if self._round_shards_round == round_index:
             return self._round_shards_cache
@@ -179,10 +190,10 @@ class _JsonlSourceIterator:
         self._round_shards_round = round_index
         return self._round_shards_cache
 
-    def _open_shard(self, shard: str) -> None:
+    def _open_shard(self, shard: JsonlShard) -> None:
         """Open the current shard for reading."""
         self._close_handle()
-        self._handle = open(shard, "rb")
+        self._handle = open(shard.physical_path, "rb")
         self._handle.seek(self.byte_offset)
         self._current_shard = shard
 

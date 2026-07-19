@@ -33,7 +33,6 @@ Source-specific arguments are documented in [Source Formats](source-formats.md).
 ```python
 dataset = Dataset.from_source("lance", "/data/train.lance").filter(
     "score >= 0.8 AND label IS NOT NULL",
-    index={"scope": "shared"},
 )
 ```
 
@@ -56,11 +55,8 @@ Overlapping predicate results are deduplicated and source order is preserved. Re
 with `AND`, so `filter([p1, p2]).filter(q)` means `(p1 AND q) OR (p2 AND q)`. A Lance scalar index on the ID column is
 recommended because each predicate is a separate query.
 
-The optional index scope controls how the disk-backed filtered-row index is built:
-
-- `"process"`: the current process prepares all missing parts.
-- `"node_local"`: local ranks build parts together; the cache must be visible within the node.
-- `"shared"` (default): all ranks build parts together; the cache must be visible across nodes.
+The disk-backed filtered-row index uses the unified persistent cache. Concurrent ranks and workers using the same
+cache root cooperatively build independent fragment parts and share the completed index.
 
 `filter(...).split(...)` and `filter(...).sample(...)` operate on the filtered row space. Lance source shuffle modes
 `none`, `global`, and `chunk` remain supported.
@@ -160,8 +156,8 @@ Selection granularity depends on what the source can read efficiently:
   and `sample(f)` keeps exactly `round(f * num_rows)` rows, reading only those rows.
 - **parquet** — chunk-level, weighted by row count.
 - **tar** / **jsonl** — whole-shard level. Fractions are approximate and bounded
-  by the shard/file count; a single tar or `.jsonl` file is one shard and cannot
-  be split internally.
+  by the prepared shard count. JSONL files may be split into cached logical shards
+  to satisfy the runtime slot count; tar files are not split internally.
 
 A subset must keep at least `context.total_slots` units (shards/chunks) for
 unit-based sources, otherwise a `ValueError` is raised. `split`/`sample` cannot

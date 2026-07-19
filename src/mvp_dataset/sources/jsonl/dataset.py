@@ -2,7 +2,6 @@
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 
 from mvp_dataset.core.context import RuntimeContext
 from mvp_dataset.core.dataset import Dataset
@@ -11,7 +10,7 @@ from mvp_dataset.core.types import ShardInput, TarUriRefFieldSpec
 from mvp_dataset.utils.url import normalize_paths
 
 from .iterator import _JsonlSourceIterator
-from .sharding import split_jsonl_files
+from .sharding import JSONL_SPLIT_FORMAT_VERSION, split_jsonl_files
 from .types import JsonlShuffleMode
 
 
@@ -21,6 +20,7 @@ class JsonlDataset(Dataset):
 
     _ref_fields: tuple[TarUriRefFieldSpec, ...] = ()
     _shuffle_mode: JsonlShuffleMode = "shard_aware"
+    _source_identity: str = ""
 
     @classmethod
     def from_source(
@@ -54,18 +54,19 @@ class JsonlDataset(Dataset):
             msg = f"[InvalidSourceType] expected .jsonl inputs, got={normalized_shards!r}"
             raise ValueError(msg)
 
-        source_items = split_jsonl_files(normalized_shards, runtime_context.total_slots)
+        source_plan = split_jsonl_files(normalized_shards, runtime_context.total_slots)
 
         ref_fields_tuple = tuple(ref_fields) if ref_fields else ()
 
         return cls(
             context=runtime_context,
-            _source=source_items,
+            _source=source_plan.shards,
             _resample=resample,
             _source_kind="jsonl",
             _stages=(),
             _ref_fields=ref_fields_tuple,
             _shuffle_mode=shuffle_mode,
+            _source_identity=source_plan.source.value,
         )
 
     def _build_source_stream(self, *, context: RuntimeContext) -> Iterable[object]:
@@ -76,6 +77,7 @@ class JsonlDataset(Dataset):
             resample=self._resample,
             shuffle_mode=self._shuffle_mode,
             ref_fields=self._ref_fields,
+            source_identity=self._source_identity,
             source_fingerprint=stable_fingerprint(self._source_fingerprint()),
         )
 
@@ -86,13 +88,15 @@ class JsonlDataset(Dataset):
             "resample": self._resample,
             "shuffle_mode": self._shuffle_mode,
             "ref_fields": [(field, str(base_dir)) for field, base_dir in self._ref_fields],
+            "source_fingerprint": self._source_identity,
+            "split_format_version": JSONL_SPLIT_FORMAT_VERSION,
             "shards": [
                 {
-                    "path": shard,
-                    "mtime_ns": stat.st_mtime_ns,
-                    "size": stat.st_size,
+                    "source_index": shard.source_index,
+                    "logical_path": shard.logical_path,
+                    "line_start": shard.line_start,
+                    "line_count": shard.line_count,
                 }
                 for shard in self._source
-                for stat in (Path(shard).stat(),)
             ],
         }

@@ -459,7 +459,6 @@ def test_lance_shuffle_resume_with_and_without_resolve_ref(
             ["image_ref"],
             resolve_batch_size=3,
             index={
-                "scope": "process",
                 "build_strategy": "bucketed",
                 "bucket_count": 3,
             },
