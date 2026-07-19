@@ -54,6 +54,7 @@ def _parse_jsonl_line(
     line: str,
     *,
     allow_preannotated: bool = False,
+    key: str | None = None,
 ) -> Sample:
     """Parse one JSONL line into a sample dictionary."""
     try:
@@ -71,7 +72,7 @@ def _parse_jsonl_line(
 
     sample["__index_in_file__"] = index_in_file
     sample["__file__"] = file
-    sample["__key__"] = f"{file}:{index_in_file}"
+    sample["__key__"] = f"{file}:{index_in_file}" if key is None else key
     return sample
 
 

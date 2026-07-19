@@ -1,5 +1,6 @@
 """Public package interface for mvp-dataset."""
 
+from .cache import CacheConfig, CacheEntryInfo, clear_cache, list_cache_entries
 from .core import (
     Consumer,
     DataLoadMesh,
@@ -20,6 +21,8 @@ from .log import (
 
 __all__ = [
     "DataLoadMesh",
+    "CacheConfig",
+    "CacheEntryInfo",
     "Consumer",
     "Dataset",
     "ResumeStateError",
@@ -28,6 +31,8 @@ __all__ = [
     "UnsupportedResume",
     "get_log_level",
     "get_logger",
+    "clear_cache",
+    "list_cache_entries",
     "reset_log_level",
     "reset_logger",
     "set_log_level",

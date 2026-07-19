@@ -2,7 +2,7 @@
 
 import math
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 
 from mvp_dataset.core.context import RuntimeContext
@@ -13,7 +13,7 @@ from mvp_dataset.core.subset import split_offsets
 from mvp_dataset.core.types import ShardInput, StageSpec
 
 from .config import resolve_lance_source_config
-from .filter import prepare_filter_index, resolve_filter_index_config
+from .filter import prepare_filter_index, validate_filter_index_config
 from .iterator import _LanceSourceIterator
 from .order import ChunkShuffleConfig, ChunkShuffleInput, resolve_chunk_shuffle_config
 from .refs import (
@@ -24,7 +24,6 @@ from .refs import (
 )
 from .source import list_lance_sources
 from .types import (
-    LanceFilterIndexConfig,
     LanceRefIndexConfigInput,
     LanceRefResolverConfig,
     LanceSelection,
@@ -42,7 +41,6 @@ class LanceDataset(Dataset):
     _chunk_shuffle: ChunkShuffleConfig | None = None
     _selection: LanceSelection | None = None
     _filter_predicate_groups: tuple[tuple[str, ...], ...] = ()
-    _filter_index_config: LanceFilterIndexConfig = field(default_factory=LanceFilterIndexConfig)
 
     @classmethod
     def from_source(
@@ -120,8 +118,6 @@ class LanceDataset(Dataset):
             prepare_filter_index(
                 source,
                 predicate_groups=self._filter_predicate_groups,
-                context=context,
-                config=self._filter_index_config,
             )
             if self._filter_predicate_groups
             else None
@@ -212,7 +208,7 @@ class LanceDataset(Dataset):
 
         Args:
             predicate: A Lance SQL WHERE expression, or a non-empty sequence of expressions combined with ``OR``.
-            index: Optional filter-index config containing ``scope``.
+            index: Reserved filter-index configuration. Non-empty mappings are rejected.
 
         Returns:
             A new filtered dataset."""
@@ -246,11 +242,10 @@ class LanceDataset(Dataset):
         if groups and len(groups[-1]) == 1 and len(group) == 1:
             group = (f"({groups[-1][0]}) AND ({group[0]})",)
             groups = groups[:-1]
-        config = self._filter_index_config if index is None else resolve_filter_index_config(index)
+        validate_filter_index_config(index)
         return dataclass_replace(
             self,
             _filter_predicate_groups=groups + (group,),
-            _filter_index_config=config,
             _resume_state=None,
         )
 
@@ -261,8 +256,6 @@ class LanceDataset(Dataset):
         return prepare_filter_index(
             self._source[0],
             predicate_groups=self._filter_predicate_groups,
-            context=self.context,
-            config=self._filter_index_config,
         ).count
 
     def split(self, fractions: Sequence[float]) -> tuple[Dataset, ...]:
@@ -340,16 +333,12 @@ class LanceDataset(Dataset):
             resolve_batch_size: Number of source samples to collect before resolving reference values.
             context: Runtime context used for sharding and deterministic randomness.
             index: Optional reference index configuration. Supported keys are:
-                ``scope``: where workers coordinate index building. Use ``"shared"`` for one
-                builder across all ranks, ``"node_local"`` for one builder per node, or
-                ``"process"`` for each process to build independently. Defaults to ``"shared"``.
                 ``build_strategy``: missing-index build strategy. Use ``"auto"``, ``"in_memory"``,
                 or ``"bucketed"``. Defaults to ``"auto"``, which uses ``"in_memory"`` for small
                 sources and ``"bucketed"`` for large sources.
                 ``bucket_count``: positive integer number of hash buckets used by ``"bucketed"``
                 builds. Defaults to ``4096``.
-                Index cache files are stored under the main Lance dataset by default. Set
-                ``MVP_DATASET_LANCE_REF_INDEX_CACHE_DIR`` to use another cache directory.
+                Index cache files use the unified ``MVP_DATASET_CACHE_DIR`` cache root.
 
         Returns:
             A dataset that resolves the requested Lance reference columns."""

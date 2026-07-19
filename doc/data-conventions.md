@@ -98,5 +98,7 @@ Runtime context may read common distributed environment variables when explicit 
 
 Source behavior variables:
 
+- `MVP_DATASET_CACHE_DIR`: root for all persistent cache artifacts.
+- `MVP_DATASET_CACHE_FINGERPRINT_MODE`: `metadata` (default) or `content` for local source fingerprints.
 - `LOADER_TAR_KEY_DOT_LEVEL`: tar key parsing level, default `1`.
 - `MVP_DATASET_TAR_MAX_OPEN_FILES`: maximum cached tar file handles used while resolving JSONL tar references.

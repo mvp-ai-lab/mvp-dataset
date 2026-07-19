@@ -80,6 +80,7 @@ Detailed docs live in [`doc/`](doc/):
 - [TorchLoader](doc/torch-loader.md)
 - [Resume and Checkpointing](doc/resume.md)
 - [Distributed Loading](doc/distributed.md)
+- [Persistent Cache](doc/cache.md)
 - [Data Conventions](doc/data-conventions.md)
 
 ## Development

@@ -80,7 +80,7 @@ def attach_lance_ref_columns(source: LanceSource, ref_columns: object) -> LanceS
 def resolve_ref_index_config(index: LanceRefIndexConfigInput) -> LanceRefIndexConfig:
     """Return validated reference index configuration.
 
-    ``index`` may contain ``scope``, ``build_strategy``, and ``bucket_count``.
+    ``index`` may contain ``build_strategy`` and ``bucket_count``.
     See ``LanceDataset.resolve_ref`` for accepted values and defaults.
     """
     if index is None:
@@ -88,16 +88,12 @@ def resolve_ref_index_config(index: LanceRefIndexConfigInput) -> LanceRefIndexCo
     if not isinstance(index, dict):
         msg = "[InvalidLanceRefIndexConfig] index must be a mapping"
         raise TypeError(msg)
-    allowed_keys = {"scope", "build_strategy", "bucket_count"}
+    allowed_keys = {"build_strategy", "bucket_count"}
     unknown_keys = sorted(set(index) - allowed_keys)
     if unknown_keys:
         msg = f"[InvalidLanceRefIndexConfig] unknown config key(s): {', '.join(unknown_keys)}"
         raise ValueError(msg)
 
-    scope = index.get("scope")
-    if scope is not None and scope not in ("shared", "node_local", "process"):
-        msg = f"[InvalidLanceRefIndexScope] expected shared, node_local, or process, got {scope!r}"
-        raise ValueError(msg)
     build_strategy = index.get("build_strategy")
     if build_strategy is not None and build_strategy not in ("auto", "in_memory", "bucketed"):
         msg = f"[InvalidLanceRefIndexBuildStrategy] expected auto, in_memory, or bucketed, got {build_strategy!r}"
@@ -110,7 +106,6 @@ def resolve_ref_index_config(index: LanceRefIndexConfigInput) -> LanceRefIndexCo
             raise ValueError(msg)
 
     return LanceRefIndexConfig(
-        scope=scope,
         build_strategy=build_strategy,
         bucket_count=bucket_count,
     )

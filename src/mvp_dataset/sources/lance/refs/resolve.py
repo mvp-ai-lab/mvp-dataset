@@ -139,13 +139,12 @@ class LanceResolveRefFactory:
     ref_names: tuple[str, ...]
     config: LanceRefResolverConfig
 
-    def __call__(self, context: RuntimeContext) -> LanceRefResolverAssembler:
+    def __call__(self, _context: RuntimeContext) -> LanceRefResolverAssembler:
         """Apply this callable object."""
         return LanceRefResolverAssembler(
             source=self.source,
             ref_names=self.ref_names,
             config=self.config,
-            context=context,
         )
 
 
@@ -158,7 +157,6 @@ class LanceRefResolverAssembler:
         source: LanceSource,
         ref_names: Sequence[str],
         config: LanceRefResolverConfig,
-        context: RuntimeContext | None = None,
     ) -> None:
         """Initialize the object."""
         if config.resolve_batch_size <= 0:
@@ -169,7 +167,6 @@ class LanceRefResolverAssembler:
         self.source = prepare_ref_indexes(
             source,
             ref_names=self.ref_names,
-            context=context,
             config=config.index,
         )
         self.config = config
@@ -204,7 +201,6 @@ class LanceRefResolverAssembler:
                 "ref_names": list(self.ref_names),
                 "resolve_batch_size": self.config.resolve_batch_size,
                 "ref_index": {
-                    "scope": self.config.index.scope,
                     "build_strategy": self.config.index.build_strategy,
                     "bucket_count": self.config.index.bucket_count,
                 },

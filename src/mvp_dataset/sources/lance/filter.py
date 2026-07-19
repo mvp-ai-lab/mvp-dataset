@@ -2,37 +2,24 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import os
-import time
 import uuid
 from bisect import bisect_left
 from dataclasses import dataclass, field
 from itertools import groupby
 from pathlib import Path
-from urllib.parse import urlsplit
 
 import lance
 import numpy as np
 
-from mvp_dataset.core.context import RuntimeContext
+from mvp_dataset.cache import CacheBuildResult, CacheEntry, CacheManager
 
-from .types import (
-    LanceFilterIndex,
-    LanceFilterIndexConfig,
-    LanceFilterIndexConfigInput,
-    LanceSource,
-)
+from .cache import fingerprint_lance_source
+from .types import LanceFilterIndex, LanceSource
 
-FILTER_INDEX_BUILDER_VERSION = 1
-FILTER_INDEX_DIR = "_mvp_filter_index"
-FILTER_INDEX_CACHE_DIR_ENV = "MVP_DATASET_LANCE_FILTER_INDEX_CACHE_DIR"
+FILTER_INDEX_FORMAT_VERSION = 1
 FILTER_INDEX_BUILD_BATCH_SIZE = 65_536
 FILTER_INDEX_MAX_PARTS = 64
-FILTER_INDEX_POLL_SECONDS = 0.25
-FILTER_INDEX_WAIT_TIMEOUT_SECONDS = 30 * 60
-FILTER_INDEX_MANIFEST = "manifest.json"
 _ROW_OFFSET_MASK = (1 << 32) - 1
 
 
@@ -46,22 +33,17 @@ class _Fragment:
     handle: object = field(repr=False, compare=False)
 
 
-def resolve_filter_index_config(index: LanceFilterIndexConfigInput) -> LanceFilterIndexConfig:
-    """Return validated Lance filter-index settings."""
+def validate_filter_index_config(index: dict[str, object] | None) -> None:
+    """Reject removed filter-index options while preserving the common filter API shape."""
     if index is None:
-        return LanceFilterIndexConfig()
+        return
     if not isinstance(index, dict):
         msg = "[InvalidLanceFilterIndexConfig] index must be a mapping"
         raise TypeError(msg)
-    unknown_keys = sorted(set(index) - {"scope"})
+    unknown_keys = sorted(index)
     if unknown_keys:
         msg = f"[InvalidLanceFilterIndexConfig] unknown config key(s): {', '.join(unknown_keys)}"
         raise ValueError(msg)
-    scope = index.get("scope", "shared")
-    if scope not in ("shared", "node_local", "process"):
-        msg = f"[InvalidLanceFilterIndexScope] expected shared, node_local, or process, got {scope!r}"
-        raise ValueError(msg)
-    return LanceFilterIndexConfig(scope=scope)
 
 
 def _plan_parts(source: LanceSource) -> tuple[tuple[_Fragment, ...], ...]:
@@ -108,30 +90,39 @@ def _plan_parts(source: LanceSource) -> tuple[tuple[_Fragment, ...], ...]:
     return tuple(tuple(fragments[start:stop]) for start, stop in zip(boundaries[:-1], boundaries[1:], strict=True))
 
 
-def _load_filter_index(index_dir: Path, identity: dict[str, object]) -> tuple[LanceFilterIndex | None, dict[str, int]]:
-    manifest_path = index_dir / FILTER_INDEX_MANIFEST
-    if not manifest_path.is_file():
-        return None, {}
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        parts = [(str(part["file"]), int(part["count"])) for part in manifest["parts"]]
-    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
-        return None, {}
-    if manifest.get("identity") != identity:
-        return None, {}
+def _open_filter_index(entry: CacheEntry) -> LanceFilterIndex:
+    manifest = entry.read_manifest()
+    metadata = manifest.get("metadata")
+    if not isinstance(metadata, dict):
+        msg = f"[InvalidLanceFilterIndex] missing metadata at {entry.path}"
+        raise RuntimeError(msg)
+    raw_parts = metadata.get("parts")
+    if not isinstance(raw_parts, list):
+        msg = f"[InvalidLanceFilterIndex] invalid part metadata at {entry.path}"
+        raise RuntimeError(msg)
 
-    expected_counts = dict(parts)
     paths: list[str] = []
     offsets = [0]
-    for file_name, count in parts:
-        path = index_dir / file_name
+    for part in raw_parts:
+        if (
+            not isinstance(part, dict)
+            or not isinstance(part.get("files"), list)
+            or len(part["files"]) != 1
+            or not isinstance(part["files"][0], str)
+            or not isinstance(part.get("metadata"), dict)
+            or not isinstance(part["metadata"].get("count"), int)
+        ):
+            msg = f"[InvalidLanceFilterIndex] invalid part entry at {entry.path}"
+            raise RuntimeError(msg)
+        file_name = part["files"][0]
+        count = part["metadata"]["count"]
+        path = entry.path / file_name
         if count < 0 or not path.is_file() or path.stat().st_size != count * np.dtype(np.int64).itemsize:
-            return None, expected_counts
+            msg = f"[InvalidLanceFilterIndex] invalid part file at {path}"
+            raise RuntimeError(msg)
         paths.append(str(path))
         offsets.append(offsets[-1] + count)
-    if manifest.get("offsets") != offsets:
-        return None, expected_counts
-    return LanceFilterIndex(paths=tuple(paths), offsets=tuple(offsets), count=offsets[-1]), expected_counts
+    return LanceFilterIndex(paths=tuple(paths), offsets=tuple(offsets), count=offsets[-1])
 
 
 def _build_parts(
@@ -229,145 +220,50 @@ def _build_parts(
             tmp_path.unlink(missing_ok=True)
 
 
-def _build_part(
-    path: Path,
-    fragments: tuple[_Fragment, ...],
-    predicate_groups: tuple[tuple[str, ...], ...],
-    expected_count: int | None = None,
-) -> None:
-    _build_parts(((path, fragments, expected_count),), predicate_groups)
-
-
 def prepare_filter_index(
     source: LanceSource,
     *,
     predicate_groups: tuple[tuple[str, ...], ...],
-    context: RuntimeContext | None,
-    config: LanceFilterIndexConfig,
 ) -> LanceFilterIndex:
     """Build or open the disk-backed row mapping for Lance filter batches."""
-    predicate_hash = hashlib.sha256(
-        json.dumps(predicate_groups, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    identity: dict[str, object] = {
-        "builder_version": FILTER_INDEX_BUILDER_VERSION,
-        "predicate_hash": predicate_hash,
-        "predicate_group_count": len(predicate_groups),
-        "predicate_count": sum(len(group) for group in predicate_groups),
-        "datasets": [
-            {
-                "uri": dataset.uri,
-                "version": dataset.version,
-                "num_rows": dataset.num_rows,
-            }
-            for dataset in source.datasets
-        ],
+    source_fingerprint = fingerprint_lance_source(source.datasets)
+    parameters = {
+        "predicate_groups": [list(group) for group in predicate_groups],
     }
-    digest = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[
-        :32
-    ]
-    raw_cache_dir = os.environ.get(FILTER_INDEX_CACHE_DIR_ENV)
-    if raw_cache_dir:
-        index_root = Path(raw_cache_dir).expanduser()
-    else:
-        source_uri = source.datasets[0].uri
-        if urlsplit(source_uri).scheme:
-            msg = f"[MissingLanceFilterIndexCacheDir] set {FILTER_INDEX_CACHE_DIR_ENV} for URI source {source_uri!r}"
-            raise ValueError(msg)
-        index_root = Path(source_uri) / FILTER_INDEX_DIR
-    index_dir = index_root / f"filter-index-{digest}"
-    index_dir.mkdir(parents=True, exist_ok=True)
 
-    cached, expected_counts = _load_filter_index(index_dir, identity)
-    if cached is not None:
-        return cached
+    planned_parts: dict[str, tuple[_Fragment, ...]] = {}
 
-    parts = _plan_parts(source)
-    part_names = [f"part-{part_i:03d}.i64" for part_i in range(len(parts))]
-    if not parts:
-        for dataset in source.datasets:
-            handle = lance.dataset(dataset.uri, version=dataset.version)
-            for group in predicate_groups:
-                for predicate in group:
-                    handle.count_rows(predicate)
+    def _parts() -> tuple[str, ...]:
+        fragment_parts = _plan_parts(source)
+        if not fragment_parts:
+            fragment_parts = ((),)
+        planned_parts.update({f"part-{part_i:03d}": fragments for part_i, fragments in enumerate(fragment_parts)})
+        return tuple(planned_parts)
 
-    scope = config.scope
-    if context is None or scope == "process":
-        assignment: tuple[int, int] | None = (0, 1)
-        leader = True
-    elif scope == "shared":
-        assignment = (
-            context.rank * context.num_workers + context.worker_id,
-            context.world_size * context.num_workers,
-        )
-        leader = context.rank == 0 and context.worker_id == 0
-    else:
-        assignment = (
-            context.local_rank * context.num_workers + context.worker_id,
-            context.local_world_size * context.num_workers,
-        )
-        leader = context.local_rank == 0 and context.worker_id == 0
-
-    if leader and expected_counts:
-        _build_parts(
-            tuple(
-                (index_dir / part_name, part, expected_counts[part_name])
-                for part_name, part in zip(part_names, parts, strict=True)
-                if part_name in expected_counts
-            ),
-            predicate_groups,
-        )
-
-    if assignment is not None:
-        builder_id, builder_count = assignment
-        if len(predicate_groups) == 1 and len(predicate_groups[0]) == 1:
-            for part_i in range(builder_id, len(parts), builder_count):
-                part_name = part_names[part_i]
-                _build_part(index_dir / part_name, parts[part_i], predicate_groups, expected_counts.get(part_name))
+    def _build_part(part: str, temporary_dir: Path) -> CacheBuildResult:
+        fragments = planned_parts[part]
+        output = temporary_dir / "rows.i64"
+        if not fragments:
+            for dataset in source.datasets:
+                handle = lance.dataset(dataset.uri, version=dataset.version)
+                for group in predicate_groups:
+                    for predicate in group:
+                        handle.count_rows(predicate)
+            output.touch()
         else:
-            start = len(parts) * builder_id // builder_count
-            stop = len(parts) * (builder_id + 1) // builder_count
-            _build_parts(
-                tuple(
-                    (
-                        index_dir / part_names[part_i],
-                        parts[part_i],
-                        expected_counts.get(part_names[part_i]),
-                    )
-                    for part_i in range(start, stop)
-                ),
-                predicate_groups,
-            )
+            _build_parts(((output, fragments, None),), predicate_groups)
+        size = output.stat().st_size
+        if size % np.dtype(np.int64).itemsize != 0:
+            msg = f"[InvalidLanceFilterIndex] invalid part size for {part}"
+            raise RuntimeError(msg)
+        return CacheBuildResult.from_files([output.name], metadata={"count": size // 8})
 
-    deadline = time.monotonic() + FILTER_INDEX_WAIT_TIMEOUT_SECONDS
-    while True:
-        cached, _ = _load_filter_index(index_dir, identity)
-        if cached is not None:
-            return cached
-
-        part_paths = [index_dir / part_name for part_name in part_names]
-        if leader and all(path.is_file() and path.stat().st_size % 8 == 0 for path in part_paths):
-            counts = [path.stat().st_size // 8 for path in part_paths]
-            offsets = [0]
-            for count in counts:
-                offsets.append(offsets[-1] + count)
-            manifest = {
-                "identity": identity,
-                "parts": [
-                    {"file": part_name, "count": count} for part_name, count in zip(part_names, counts, strict=True)
-                ],
-                "offsets": offsets,
-            }
-            manifest_path = index_dir / FILTER_INDEX_MANIFEST
-            tmp_path = manifest_path.with_name(f"{manifest_path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
-            try:
-                tmp_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
-                os.replace(tmp_path, manifest_path)
-            finally:
-                tmp_path.unlink(missing_ok=True)
-            continue
-
-        if time.monotonic() >= deadline:
-            msg = f"[LanceFilterIndexTimeout] scope={scope!r} cache={str(index_dir)!r}"
-            raise TimeoutError(msg)
-        time.sleep(FILTER_INDEX_POLL_SECONDS)
+    entry = CacheManager().ensure(
+        source=source_fingerprint,
+        kind="lance-filter-index",
+        format_version=FILTER_INDEX_FORMAT_VERSION,
+        parameters=parameters,
+        parts=_parts,
+        build=_build_part,
+    )
+    return _open_filter_index(entry)
