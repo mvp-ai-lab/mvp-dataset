@@ -114,6 +114,21 @@ def test_balance_planner_handles_tail_drop_and_dummy() -> None:
     assert dummy_plan.finished_after_chunk
 
 
+def test_balance_planner_consumes_sparse_tail_without_dropping_items() -> None:
+    plan = plan_balance_chunk(
+        [_status(rank, 3 if rank == 0 else 0) for rank in range(8)],
+        chunk_size=16,
+        max_transfer_per_round=8,
+        drop_last=False,
+        topology="none",
+    )
+
+    assert plan.local_take == {rank: 3 if rank == 0 else 0 for rank in range(8)}
+    assert plan.transfers == []
+    assert plan.dummy_counts == {rank: 0 if rank == 0 else 3 for rank in range(8)}
+    assert plan.finished_after_chunk
+
+
 def test_balance_api_validation_and_resume_rejection() -> None:
     if torch is None:
         pytest.skip("torch is not installed")
@@ -225,6 +240,21 @@ def test_balance_distributed_dummy_tail(tmp_path) -> None:
 
     assert [len(items) for items in outputs.values()] == [4, 4]
     assert sum(int(item["dummy"]) for items in outputs.values() for item in items) == 1
+
+
+@pytest.mark.skipif(dist is None or mp is None, reason="torch distributed is not installed")
+def test_balance_distributed_sparse_tail_preserves_real_items(tmp_path) -> None:
+    outputs = _run_balance_spawn(tmp_path, counts=[3, 0, 0, 0], drop_last=False, chunk_size=2)
+
+    assert [len(items) for items in outputs.values()] == [3, 3, 3, 3]
+    real_items = [
+        (item["source_rank"], item["index"])
+        for items in outputs.values()
+        for item in items
+        if not item["dummy"]
+    ]
+    assert sorted(real_items) == [(0, 0), (0, 1), (0, 2)]
+    assert sum(int(item["dummy"]) for items in outputs.values() for item in items) == 9
 
 
 @pytest.mark.skipif(dist is None or mp is None, reason="torch distributed is not installed")
