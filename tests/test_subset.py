@@ -238,6 +238,132 @@ def test_lance_sample_distributed_union_matches_single_process(tmp_path, monkeyp
     assert sharded == single
 
 
+@pytest.mark.parametrize("shuffle_mode", ["none", "global", "chunk"])
+def test_lance_sample_resample_preserves_fixed_membership(tmp_path, shuffle_mode: str) -> None:
+    records = build_records(count=100)
+    source = _build_source(tmp_path, "lance", records)
+    chunk_shuffle = {"chunk_size": 7, "k": 3} if shuffle_mode == "chunk" else None
+    sampled = Dataset.from_source(
+        "lance",
+        shards=source,
+        context=RuntimeContext(seed=19),
+        resample=True,
+        shuffle_mode=shuffle_mode,
+        chunk_shuffle=chunk_shuffle,
+    ).sample(0.25, seed=7)
+
+    iterator = iter(sampled)
+    rounds = [
+        [int(normalize_sample(next(iterator))["value"]) for _ in range(25)]
+        for _ in range(3)
+    ]
+    expected = set(
+        _values(
+            Dataset.from_source("lance", shards=source, shuffle_mode="none").sample(0.25, seed=7)
+        )
+    )
+
+    assert all(len(set(values)) == 25 for values in rounds)
+    assert all(set(values) == expected for values in rounds)
+
+
+def test_lance_sample_membership_is_independent_of_shuffle_seed(tmp_path) -> None:
+    records = build_records(count=100)
+    source = _build_source(tmp_path, "lance", records)
+
+    def read(seed: int) -> set[int]:
+        sampled = Dataset.from_source(
+            "lance",
+            shards=source,
+            context=RuntimeContext(seed=seed),
+            resample=True,
+            shuffle_mode="global",
+        ).sample(0.3, seed=11)
+        iterator = iter(sampled)
+        return {int(normalize_sample(next(iterator))["value"]) for _ in range(30)}
+
+    assert read(3) == read(29)
+
+
+def test_lance_filtered_sample_resample_preserves_fixed_membership(tmp_path) -> None:
+    records = build_records(count=100)
+    source = _build_source(tmp_path, "lance", records)
+    sampled = (
+        Dataset.from_source(
+            "lance",
+            shards=source,
+            context=RuntimeContext(seed=17),
+            resample=True,
+            shuffle_mode="global",
+        )
+        .filter("value >= 50")
+        .sample(0.2, seed=5)
+    )
+
+    iterator = iter(sampled)
+    first = {int(normalize_sample(next(iterator))["value"]) for _ in range(10)}
+    second = {int(normalize_sample(next(iterator))["value"]) for _ in range(10)}
+
+    assert first == second
+    assert all(value >= 50 for value in first)
+
+
+def test_lance_sample_resample_distributed_rounds_match_fixed_subset(tmp_path, monkeypatch) -> None:
+    records = build_records(count=100)
+    source = _build_source(tmp_path, "lance", records)
+    expected = set(
+        _values(
+            Dataset.from_source("lance", shards=source, shuffle_mode="none").sample(0.4, seed=2)
+        )
+    )
+
+    def read_rank(rank: int) -> list[set[int]]:
+        monkeypatch.setenv("WORLD_SIZE", "2")
+        monkeypatch.setenv("RANK", str(rank))
+        sampled = Dataset.from_source(
+            "lance",
+            shards=source,
+            context=RuntimeContext(rank=rank, world_size=2, seed=5),
+            resample=True,
+            shuffle_mode="global",
+        ).sample(0.4, seed=2)
+        iterator = iter(sampled)
+        return [
+            {int(normalize_sample(next(iterator))["value"]) for _ in range(20)}
+            for _ in range(2)
+        ]
+
+    rank0 = read_rank(0)
+    rank1 = read_rank(1)
+
+    assert rank0[0] | rank1[0] == expected
+    assert rank0[1] | rank1[1] == expected
+    assert rank0[0].isdisjoint(rank1[0])
+    assert rank0[1].isdisjoint(rank1[1])
+
+
+def test_lance_sample_resample_resume_matches_continuation(tmp_path) -> None:
+    source = _build_source(tmp_path, "lance", build_records(count=100))
+    sampled = Dataset.from_source(
+        "lance",
+        shards=source,
+        context=RuntimeContext(seed=13),
+        resample=True,
+        shuffle_mode="global",
+    ).sample(0.2, seed=7)
+
+    iterator = iter(sampled)
+    for _ in range(27):
+        next(iterator)
+    state = iterator.state_dict()
+    expected = [int(normalize_sample(next(iterator))["value"]) for _ in range(35)]
+
+    resumed = iter(sampled.load_state_dict(state))
+    actual = [int(normalize_sample(next(resumed))["value"]) for _ in range(35)]
+
+    assert actual == expected
+
+
 def test_lance_split_resume_matches_continuation(tmp_path) -> None:
     source = _build_source(tmp_path, "lance", build_records(count=100))
     train, _ = Dataset.from_source("lance", shards=source, shuffle_mode="global").split([0.8, 0.2])
