@@ -186,6 +186,32 @@ def test_snapshot_materializes_non_lance_upstream(tmp_path, monkeypatch) -> None
     assert [sample["value"] for sample in outputs] == [0, 1, 2]
 
 
+def test_snapshot_round_trips_torch_tensors(tmp_path, monkeypatch) -> None:
+    torch = pytest.importorskip("torch")
+    monkeypatch.setenv("MVP_DATASET_CACHE_DIR", str(tmp_path / "cache"))
+    source = write_lance_dataset(tmp_path, build_records(count=1))
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    def add_tensors(sample: object) -> object:
+        assert isinstance(sample, dict)
+        return {
+            **sample,
+            "tensor": torch.arange(6, dtype=torch.float16, device=device).reshape(2, 3),
+            "nested": {"mask": torch.tensor([True, False], dtype=torch.bool, device=device)},
+        }
+
+    output = next(iter(Dataset.from_source("lance", source).map(add_tensors).snapshot(lambda: "tensor-v1")))
+
+    assert isinstance(output["tensor"], torch.Tensor)
+    assert output["tensor"].dtype == torch.float16
+    assert tuple(output["tensor"].shape) == (2, 3)
+    assert output["tensor"].device.type == device.type
+    assert torch.equal(output["tensor"], torch.arange(6, dtype=torch.float16, device=device).reshape(2, 3))
+    assert isinstance(output["nested"]["mask"], torch.Tensor)
+    assert output["nested"]["mask"].dtype == torch.bool
+    assert output["nested"]["mask"].device.type == device.type
+
+
 def test_snapshot_concurrent_readers_build_upstream_once(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("MVP_DATASET_CACHE_DIR", str(tmp_path / "cache"))
     source = write_lance_dataset(tmp_path, build_records(count=4))

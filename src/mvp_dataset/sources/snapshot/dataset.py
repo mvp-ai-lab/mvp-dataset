@@ -21,6 +21,7 @@ from mvp_dataset.sources.lance.iterator import _LanceSourceIterator
 from mvp_dataset.sources.lance.source import list_lance_sources
 from mvp_dataset.sources.lance.types import LanceSelection
 
+from .iterator import _SnapshotSourceIterator
 from .materialize import (
     SNAPSHOT_CACHE_PARAMETERS,
     SNAPSHOT_FORMAT_VERSION,
@@ -108,15 +109,17 @@ class SnapshotDataset(Dataset):
             build_context=context,
         )
         source = list_lance_sources(snapshot_lance_paths(entry))[0]
-        return _LanceSourceIterator(
-            source=source,
-            context=context,
-            resample=False,
-            columns=None,
-            read_batch_size=1024,
-            source_fingerprint=stable_fingerprint(self._source_fingerprint()),
-            shuffle_mode="none",
-            selection=self._resolve_selection(source.total_rows),
+        return _SnapshotSourceIterator(
+            _LanceSourceIterator(
+                source=source,
+                context=context,
+                resample=False,
+                columns=None,
+                read_batch_size=1024,
+                source_fingerprint=stable_fingerprint(self._source_fingerprint()),
+                shuffle_mode="none",
+                selection=self._resolve_selection(source.total_rows),
+            )
         )
 
     def _source_fingerprint(self) -> dict[str, object]:

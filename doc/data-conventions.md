@@ -97,6 +97,10 @@ Snapshot rows retain upstream provenance as `__source_key__` and `__source_file_
 new Lance source, its reader assigns new `__key__`, `__file__`, `__local_index__`, and `__global_index__` metadata.
 Snapshot `split()` and `sample()` use the same row-level selection rules as Lance sources.
 
+Snapshot values may contain PyTorch tensors, including tensors nested in dictionaries or lists. Tensor dtype, shape,
+and device type are restored when reading; device indices are intentionally not preserved. PyTorch and the recorded
+device type must be available in the reader process.
+
 ## Environment Variables
 
 Runtime context may read common distributed environment variables when explicit values are not provided:

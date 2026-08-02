@@ -19,6 +19,8 @@ from mvp_dataset.core.context import RuntimeContext
 from mvp_dataset.core.dataset import Dataset
 from mvp_dataset.core.iterator import DatasetIterator
 
+from .codecs import encode_snapshot_value
+
 SNAPSHOT_FORMAT_VERSION = 1
 SNAPSHOT_CACHE_KIND = "dataset-snapshot"
 SNAPSHOT_LANCE_DIRECTORY = "data.lance"
@@ -28,6 +30,7 @@ SNAPSHOT_CACHE_PARAMETERS = {
     "format": "lance",
     "row_order": "slot-major",
     "source_metadata": "aliased",
+    "value_codec": "torch-tensor-v2",
     "write_batch_size": SNAPSHOT_WRITE_BATCH_SIZE,
 }
 _SOURCE_METADATA_ALIASES = {
@@ -176,7 +179,11 @@ def _read_rows(stream: Iterator[object], count: int) -> list[dict[str, object]]:
         if not row:
             msg = "[InvalidSnapshotSample] snapshot samples must contain at least one field"
             raise ValueError(msg)
-        rows.append(row)
+        encoded = encode_snapshot_value(row)
+        if not isinstance(encoded, dict):
+            msg = "[SnapshotSerializationError] encoded snapshot sample must be a dict"
+            raise RuntimeError(msg)
+        rows.append(encoded)
     return rows
 
 

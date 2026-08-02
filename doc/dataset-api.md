@@ -151,6 +151,10 @@ equivalent. Snapshot inputs are treated as an unordered finite dataset and must 
 can be represented by Arrow. Upstream `__key__` and `__file__` values are stored as `__source_key__` and
 `__source_file__`; the snapshot Lance source supplies new `__key__` and `__file__` values.
 
+PyTorch tensors are encoded transparently and restored with their dtype, shape, and original device type. Device
+indices are not preserved; for example, a CUDA tensor is restored on the reader process's current CUDA device. Reading
+tensor values requires PyTorch and the recorded device type to be available.
+
 `split()` and `sample()` operate lazily on the published snapshot row space. They share the same cached Lance parts and
 read only their selected rows.
 
