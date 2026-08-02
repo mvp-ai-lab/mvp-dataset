@@ -4,6 +4,7 @@ from .cache import CacheConfig, CacheEntryInfo, clear_cache, list_cache_entries
 from .core import (
     Consumer,
     DataLoadMesh,
+    FingerprintProvider,
     ResumeStateError,
     RuntimeContext,
     UnsupportedResume,
@@ -25,6 +26,7 @@ __all__ = [
     "CacheEntryInfo",
     "Consumer",
     "Dataset",
+    "FingerprintProvider",
     "ResumeStateError",
     "RuntimeContext",
     "TorchLoader",

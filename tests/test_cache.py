@@ -307,6 +307,37 @@ def test_cache_manager_builds_parts_concurrently(tmp_path) -> None:
     assert not entries[0].temporary_parent.exists() or not any(entries[0].temporary_parent.iterdir())
 
 
+def test_cache_manager_builds_only_assigned_parts(tmp_path) -> None:
+    manager = CacheManager(_cache_config(tmp_path / "cache"))
+    part_names = ("part-0", "part-1")
+    built_by: dict[str, str] = {}
+    built_lock = threading.Lock()
+
+    def ensure(assigned_part: str):
+        def build_part(part: str, root: Path) -> CacheBuildResult:
+            with built_lock:
+                built_by[part] = assigned_part
+            (root / "payload.bin").write_text(part, encoding="utf-8")
+            return CacheBuildResult.from_files(["payload.bin"])
+
+        return manager.ensure(
+            source=_source(),
+            kind="assigned-partitioned-artifact",
+            format_version=1,
+            parameters={},
+            parts=lambda: part_names,
+            assigned_parts=(assigned_part,),
+            build=build_part,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        entries = list(executor.map(ensure, part_names))
+
+    assert entries[0].path == entries[1].path
+    assert built_by == {"part-0": "part-0", "part-1": "part-1"}
+    assert manager.is_valid(entries[0])
+
+
 def test_cache_manager_resumes_failed_partitioned_build(tmp_path) -> None:
     manager = CacheManager(_cache_config(tmp_path / "cache"))
     calls = {part: 0 for part in ("part-0", "part-1", "part-2")}
