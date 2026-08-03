@@ -6,6 +6,7 @@ from .resume import ResumeStateError, UnsupportedResume
 from .types import (
     Assembler,
     Consumer,
+    FingerprintProvider,
     GroupedSample,
     PathLikeStr,
     Sample,
@@ -18,6 +19,7 @@ __all__ = [
     "Assembler",
     "Consumer",
     "DataLoadMesh",
+    "FingerprintProvider",
     "GroupedSample",
     "PathLikeStr",
     "TarUriRefFieldSpec",

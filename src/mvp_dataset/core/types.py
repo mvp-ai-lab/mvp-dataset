@@ -35,6 +35,9 @@ TarUriRefFieldSpec = tuple[str, PathLikeStr]
 Stage = Callable[[Iterable[object]], Iterable[object]]
 """One lazy transformation stage in the iterator pipeline."""
 
+FingerprintProvider = Callable[[], str]
+"""Callable that returns a stable snapshot cache identity."""
+
 StageKind = Literal["map", "select", "shuffle", "batch", "assemble", "unbatch"]
 """Recognized pipeline stage kinds."""
 
@@ -144,4 +147,4 @@ class StatefulAssembler(Protocol):
         ...
 
 
-SourceKind = Literal["jsonl", "tar", "parquet", "lance", "mixed"]
+SourceKind = Literal["jsonl", "tar", "parquet", "lance", "mixed", "snapshot"]

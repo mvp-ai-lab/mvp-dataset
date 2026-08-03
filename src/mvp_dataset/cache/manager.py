@@ -206,6 +206,7 @@ class CacheManager:
         parameters: Mapping[str, Any],
         build: Callable[[Path], CacheBuildResult],
         parts: None = None,
+        assigned_parts: None = None,
     ) -> CacheEntry: ...
 
     @overload
@@ -218,6 +219,7 @@ class CacheManager:
         parameters: Mapping[str, Any],
         build: Callable[[str, Path], CacheBuildResult],
         parts: Callable[[], Sequence[str]],
+        assigned_parts: Sequence[str] | None = None,
     ) -> CacheEntry: ...
 
     def ensure(
@@ -229,6 +231,7 @@ class CacheManager:
         parameters: Mapping[str, Any],
         build: Callable[[Path], CacheBuildResult] | Callable[[str, Path], CacheBuildResult],
         parts: Callable[[], Sequence[str]] | None = None,
+        assigned_parts: Sequence[str] | None = None,
     ) -> CacheEntry:
         """Return a valid entry using either one builder or distributed part builders."""
         key = CacheKey.create(
@@ -244,7 +247,12 @@ class CacheManager:
                 entry,
                 parts=parts,
                 build=cast(Callable[[str, Path], CacheBuildResult], build),
+                assigned_parts=assigned_parts,
             )
+
+        if assigned_parts is not None:
+            msg = "[InvalidCacheAssignedParts] assigned_parts requires parts"
+            raise ValueError(msg)
 
         artifact_build = cast(Callable[[Path], CacheBuildResult], build)
 
@@ -272,11 +280,22 @@ class CacheManager:
         *,
         parts: Callable[[], Sequence[str]],
         build: Callable[[str, Path], CacheBuildResult],
+        assigned_parts: Sequence[str] | None,
     ) -> CacheEntry:
         if self.is_valid(entry):
             return entry
 
         partition_names = self._normalize_partition_names(parts())
+        build_part_names = (
+            partition_names if assigned_parts is None else self._normalize_partition_names(assigned_parts)
+        )
+        if not build_part_names:
+            msg = "[InvalidCacheAssignedParts] assigned_parts must be non-empty"
+            raise ValueError(msg)
+        unknown_parts = set(build_part_names) - set(partition_names)
+        if unknown_parts:
+            msg = f"[InvalidCacheAssignedParts] unknown parts={sorted(unknown_parts)!r}"
+            raise ValueError(msg)
         deadline = time.monotonic() + self.config.wait_timeout_seconds
 
         while True:
@@ -288,7 +307,7 @@ class CacheManager:
             completed = self._run_partition_attempt(
                 entry,
                 attempt,
-                partition_names,
+                build_part_names,
                 build,
                 deadline,
             )

@@ -87,6 +87,20 @@ Lance supports these source shuffle modes:
 - `chunk`: deterministic chunk-window shuffle with bounded row-permutation state.
 - `chunk` can be tuned with `chunk_shuffle={"chunk_size": ..., "k": ..., "row_order": ...}`.
 
+## Snapshot Rows
+
+`Dataset.snapshot()` treats its finite dictionary input as an unordered dataset. A cache miss writes one Lance part per
+build slot, then combines parts in stable slot-major order. Snapshot reads use the current runtime slot layout, so
+changing rank or worker counts repartitions the same published row space without rerunning the upstream pipeline.
+
+Snapshot rows retain upstream provenance as `__source_key__` and `__source_file__`. Because the published snapshot is a
+new Lance source, its reader assigns new `__key__`, `__file__`, `__local_index__`, and `__global_index__` metadata.
+Snapshot `split()` and `sample()` use the same row-level selection rules as Lance sources.
+
+Snapshot values may contain PyTorch tensors, including tensors nested in dictionaries or lists. Tensor dtype, shape,
+and device type are restored when reading; device indices are intentionally not preserved. PyTorch and the recorded
+device type must be available in the reader process.
+
 ## Environment Variables
 
 Runtime context may read common distributed environment variables when explicit values are not provided:

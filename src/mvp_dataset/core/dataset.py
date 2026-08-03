@@ -19,7 +19,7 @@ from .stages import (
     _UnbatchStage,
 )
 from .torch_compat import TorchIterableDataset
-from .types import Assembler, Consumer, SourceKind, StageSpec
+from .types import Assembler, Consumer, FingerprintProvider, SourceKind, StageSpec
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,6 +258,25 @@ class Dataset(TorchIterableDataset):
             apply=_UnbatchStage(),
         )
         return self._append_stage(spec)
+
+    def snapshot(self, fingerprint_provider: FingerprintProvider | None = None) -> Dataset:
+        """Materialize this finite pipeline into a reusable Lance snapshot.
+
+        The snapshot is built lazily during its first iteration. A cache hit
+        reads the materialized Lance source without executing this upstream
+        pipeline.
+
+        Args:
+            fingerprint_provider: Optional zero-argument callable returning a
+                stable cache identity. The upstream pipeline fingerprint is
+                used when omitted.
+
+        Returns:
+            A new dataset whose source is the materialized snapshot.
+        """
+        from ..sources.snapshot.dataset import SnapshotDataset
+
+        return SnapshotDataset.from_upstream(self, fingerprint_provider=fingerprint_provider)
 
     def split(self, fractions: Sequence[float]) -> tuple[Dataset, ...]:
         """Partition this dataset into disjoint subsets covering all data.

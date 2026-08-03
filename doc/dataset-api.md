@@ -117,6 +117,47 @@ dataset = dataset.unbatch()
 
 Expands list, tuple, or dictionary-style batches back into samples.
 
+### `snapshot(fingerprint_provider=None)`
+
+```python
+dataset = (
+    dataset
+    .map(expensive_preprocess)
+    .snapshot()
+    .map(train_transform)
+    .assemble(make_assembler)
+    .batch(32)
+)
+```
+
+Materializes the finite pipeline before `snapshot()` into the persistent cache as a Lance dataset. Materialization is
+lazy: the first iteration builds the snapshot, while later iterations open the cached Lance source without executing
+the upstream source or stages.
+
+On a cache miss, the first runtime topology plans one Lance part per slot. Each part executes the upstream shard for its
+slot, and completed parts are combined in stable slot-major order. Once published, each iteration repartitions that
+fixed row space using the current `RuntimeContext.slot` and `RuntimeContext.total_slots`; changing the read topology
+does not rebuild the snapshot. Every slot in the initial build topology must participate until all parts are complete.
+
+By default, the upstream pipeline fingerprint identifies the snapshot. A custom zero-argument provider can override
+that identity:
+
+```python
+dataset = dataset.snapshot(fingerprint_provider=lambda: "tokenizer-v3")
+```
+
+The provider must return a non-empty string. Reusing the same custom value explicitly declares the upstream outputs
+equivalent. Snapshot inputs are treated as an unordered finite dataset and must contain dictionary samples whose fields
+can be represented by Arrow. Upstream `__key__` and `__file__` values are stored as `__source_key__` and
+`__source_file__`; the snapshot Lance source supplies new `__key__` and `__file__` values.
+
+PyTorch tensors are encoded transparently and restored with their dtype, shape, and original device type. Device
+indices are not preserved; for example, a CUDA tensor is restored on the reader process's current CUDA device. Reading
+tensor values requires PyTorch and the recorded device type to be available.
+
+`split()` and `sample()` operate lazily on the published snapshot row space. They share the same cached Lance parts and
+read only their selected rows.
+
 ## Subset Operations
 
 `split` and `sample` derive new datasets that cover or sample the source. They

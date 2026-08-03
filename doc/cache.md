@@ -32,6 +32,13 @@ This cache has no legacy-path discovery or migration. Existing source-adjacent c
         manifest.json
         complete
         ...
+    dataset-snapshot-v1/
+      <artifact-fingerprint>/
+        manifest.json
+        complete
+        slot-00000000/data.lance/
+        slot-00000001/data.lance/
+        ...
   _locks/
   _tmp/
 ```
@@ -58,6 +65,7 @@ entry = manager.ensure(..., build=build_artifact)
 entry = manager.ensure(
     ...,
     parts=plan_parts,
+    assigned_parts=(current_part,),
     build=build_one_part,
 )
 ```
@@ -65,7 +73,8 @@ entry = manager.ensure(
 The presence of `parts` selects the callback signature: whole-artifact builds receive a temporary directory, while
 partitioned builds receive a part name and temporary directory. Both modes produce the same `CacheEntry` contract.
 Part builders automatically claim available work through per-part leases and continue with unfinished parts after
-completing their current part.
+completing their current part. `assigned_parts` optionally restricts a caller to specific parts; this is used when each
+runtime slot must build only its own upstream stream.
 
 ## Crash and Concurrency Safety
 
@@ -86,6 +95,11 @@ write them through part-specific temporary directories, and publish each part un
 completed before a process failure remain reusable, while abandoned part temporary directories are replaced by the
 next owner. A generation ID fences off workers from abandoned attempts, and the finalizer locks and validates every
 part before atomically publishing the complete artifact.
+
+Dataset snapshots use a partitioned build with one Lance part per slot in the topology that first creates the cache.
+Each participating slot consumes its existing upstream stream and writes only its named part. Published parts form one
+stable slot-major row space. Later readers may use a different runtime topology; a valid cache hit never plans new
+parts or constructs the upstream iterator.
 
 ## Management API
 
