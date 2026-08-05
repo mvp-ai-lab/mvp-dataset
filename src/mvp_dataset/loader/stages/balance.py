@@ -331,8 +331,10 @@ def plan_balance_chunk(
                     remaining[rank] -= 1
                 else:
                     dummy_counts[rank] += 1
-            finished = all(status.upstream_done for status in ordered)
-            break
+            if not any(remaining.values()):
+                finished = all(status.upstream_done for status in ordered)
+                break
+            continue
 
         deficits: list[int] = []
         for rank in ranks:
