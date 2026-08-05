@@ -188,6 +188,8 @@ Returns a dataset over a seeded random subset.
 
 - `fraction` must be in `(0, 1]` — sampling is without replacement and cannot oversample.
 - Reproducible for a given `seed`.
+- With `resample=True`, the sampled membership remains fixed across rounds. Source shuffle modes may change the
+  order within the subset each round, but they never select rows outside it.
 
 ### Granularity
 

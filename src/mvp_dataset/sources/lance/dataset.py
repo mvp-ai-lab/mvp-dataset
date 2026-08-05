@@ -296,6 +296,7 @@ class LanceDataset(Dataset):
 
         Sampling is row-exact and efficient: only the sampled rows are read. It is
         without replacement and cannot oversample (``0 < fraction <= 1``).
+        Resampled rounds preserve subset membership and may only change its order.
 
         Args:
             fraction: Fraction of rows to keep, in ``(0, 1]``.

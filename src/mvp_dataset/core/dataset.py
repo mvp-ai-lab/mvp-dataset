@@ -302,6 +302,7 @@ class Dataset(TorchIterableDataset):
 
         Sampling is without replacement and cannot oversample
         (``0 < fraction <= 1``). It is reproducible for a given ``seed``.
+        Resampled rounds preserve subset membership and may only change its order.
 
         The default implementation treats each ``_source`` element as one equally
         weighted unit; sources override this for other granularities or to opt out.
