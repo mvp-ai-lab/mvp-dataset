@@ -44,7 +44,7 @@ resumed_it = iter(resumed)
 }
 ```
 
-`Dataset.state_dict()` / `TorchLoader.state_dict()` save identity with `state=None` (no live iterator). Use the live iterator's `state_dict()` to checkpoint mid-epoch.
+`Dataset.state_dict()` / `TorchLoader.state_dict()` save the active iterator created by the last `iter()`. If there is no active iterator, or it is exhausted, `state` is `None`.
 
 ## Compatibility Checks
 

@@ -107,7 +107,7 @@ resumed_loader.load_state_dict(state)
 resumed_it = iter(resumed_loader)
 ```
 
-`TorchLoader.state_dict()` saves identity with `state=None`. Use the live iterator to checkpoint mid-epoch. Pending state is consumed by the next `iter(...)` only.
+`TorchLoader.state_dict()` saves the last `iter()` if it is still active; otherwise `state` is `None`. Pending state is consumed by the next `iter(...)` only.
 
 ## Practical Pattern
 

@@ -720,6 +720,27 @@ def test_dataset_state_dict_without_live_iterator_replays_from_start(tmp_path) -
     assert _remaining(iter(resumed_dataset)) == _remaining(iter(build_dataset()))
 
 
+def test_handle_state_dict_saves_active_iterator(tmp_path) -> None:
+    build_dataset = _source_factory(tmp_path, "jsonl")
+    dataset = build_dataset()
+    iterator = iter(dataset)
+    consumed = _consume(iterator, 3)
+    state = dataset.state_dict()
+    continued = _remaining(iterator)
+
+    assert state["state"] is not None
+    resumed = build_dataset()
+    resumed.load_state_dict(state)
+    assert _remaining(iter(resumed)) == continued
+    assert consumed + continued == _remaining(iter(build_dataset()))
+
+
+def test_handle_state_dict_is_fresh_after_iterator_exhausts(tmp_path) -> None:
+    dataset = _source_factory(tmp_path, "jsonl")()
+    _remaining(iter(dataset))
+    assert dataset.state_dict()["state"] is None
+
+
 class _ListLogger:
     def __init__(self) -> None:
         self.messages: list[str] = []

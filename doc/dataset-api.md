@@ -241,6 +241,5 @@ resumed = Dataset.from_source("tar", shards)
 resumed.load_state_dict(state)
 ```
 
-- Use `iterator.state_dict()` for active checkpoints.
-- `Dataset.state_dict()` saves identity with `state=None`.
+- `Dataset.state_dict()` saves the last `iter()` if it is still active; otherwise `state` is `None`.
 - `Dataset.load_state_dict(blob)` compares identity in place and stages pending live state for the next `iter(...)` only.

@@ -10,7 +10,7 @@ from ..core import RuntimeContext
 from ..core.resume import (
     UnsupportedResume,
     check_identity,
-    checkpoint,
+    checkpoint_from_active_iter,
     identity,
     parse_checkpoint,
     warn_if_iterator_replaced,
@@ -212,8 +212,8 @@ class TorchLoader:
         }
 
     def state_dict(self) -> dict[str, object]:
-        """Return a checkpoint with this identity and no live iterator state."""
-        return checkpoint(self.identity(), None)
+        """Return identity plus the active iterator's live state, if any."""
+        return checkpoint_from_active_iter(self.identity(), self._active_iter)
 
     def load_state_dict(self, blob: dict[str, object]) -> None:
         """Validate identity and stage pending live state on this loader."""

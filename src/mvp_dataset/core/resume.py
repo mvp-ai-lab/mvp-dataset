@@ -59,6 +59,15 @@ def checkpoint(identity_payload: object, state: object | None) -> dict[str, obje
     return {"version": RESUME_STATE_VERSION, "identity": identity_payload, "state": state}
 
 
+def checkpoint_from_active_iter(identity_payload: object, active_iter: object | None) -> dict[str, object]:
+    """Checkpoint the handle's current iterator, or a fresh start if none is active."""
+    if active_iter is not None and not getattr(active_iter, "_exhausted", True):
+        live_state = getattr(active_iter, "live_state", None)
+        if callable(live_state):
+            return checkpoint(identity_payload, live_state())
+    return checkpoint(identity_payload, None)
+
+
 def parse_checkpoint(blob: object) -> tuple[object, object | None]:
     """Validate a resume envelope and return ``(identity, state)``."""
     if not isinstance(blob, dict):
