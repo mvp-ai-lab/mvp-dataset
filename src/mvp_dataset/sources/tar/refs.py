@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
-from mvp_dataset.core.resume import callable_fingerprint
+from mvp_dataset.core.resume import identity
 from mvp_dataset.core.types import SidecarSpec
 
 
@@ -14,7 +14,7 @@ def _sidecar_fingerprint(sidecars: tuple[SidecarSpec, ...], shards: Sequence[str
     return [
         {
             "name": name,
-            "resolver": callable_fingerprint(resolver),
+            "resolver": identity(resolver),
             "shards": [
                 {
                     "path": sidecar_path,

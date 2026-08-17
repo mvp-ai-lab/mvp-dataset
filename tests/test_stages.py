@@ -117,7 +117,7 @@ class PairSumAssembler:
         pending = state.get("pending")
         self.pending = [] if not isinstance(pending, list) else list(pending)
 
-    def fingerprint(self) -> str:
+    def identity(self) -> str:
         return "pair-sum-assembler:v1"
 
 

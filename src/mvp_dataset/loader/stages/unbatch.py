@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from ...core.resume import stable_fingerprint
 from ...core.stages import _UnbatchStageIterator
 
 
@@ -17,6 +16,6 @@ class _LoaderUnbatchStage:
         """Apply this callable object."""
         return _UnbatchStageIterator(upstream=data)
 
-    def fingerprint(self) -> str:
-        """Return a stable fingerprint for resume compatibility checks."""
-        return stable_fingerprint({"kind": self.kind})
+    def identity(self) -> dict[str, object]:
+        """Return a process-stable identity for this stage."""
+        return {"kind": self.kind}

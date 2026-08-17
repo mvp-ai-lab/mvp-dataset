@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 
-from ..resume import ResumeStateError, callable_fingerprint, stable_fingerprint
+from ..resume import ResumeStateError, identity
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,16 +25,14 @@ class _BatchStage:
             collate_fn=self.collate_fn,
         )
 
-    def fingerprint(self) -> str:
-        """Return a stable fingerprint for resume compatibility checks."""
-        return stable_fingerprint(
-            {
-                "kind": "batch",
-                "batch_size": self.batch_size,
-                "drop_last": self.drop_last,
-                "collate_fn": callable_fingerprint(self.collate_fn),
-            }
-        )
+    def identity(self) -> dict[str, object]:
+        """Return a process-stable identity for this stage."""
+        return {
+            "kind": "batch",
+            "batch_size": self.batch_size,
+            "drop_last": self.drop_last,
+            "collate_fn": identity(self.collate_fn),
+        }
 
 
 class _BatchStageIterator:
@@ -102,14 +100,3 @@ class _BatchStageIterator:
             raise ResumeStateError(msg)
         self.pending = list(pending)
         self.emitted = emitted
-
-    def fingerprint(self) -> str:
-        """Return a stable fingerprint for resume compatibility checks."""
-        return stable_fingerprint(
-            {
-                "kind": "batch",
-                "batch_size": self.batch_size,
-                "drop_last": self.drop_last,
-                "collate_fn": callable_fingerprint(self.collate_fn),
-            }
-        )

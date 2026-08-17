@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from ...core import RuntimeContext
-from ...core.resume import UnsupportedResume, callable_fingerprint, stable_fingerprint
+from ...core.resume import UnsupportedResume, identity
 
 Topology = Literal["node", "none"]
 
@@ -131,19 +131,17 @@ class _LoaderBalanceStage:
             device_process_group=self.device_process_group,
         )
 
-    def fingerprint(self) -> str:
-        """Return a stable fingerprint for resume compatibility checks."""
-        return stable_fingerprint(
-            {
-                "kind": self.kind,
-                "drop_last": self.drop_last,
-                "dummy_factory": callable_fingerprint(self.dummy_factory),
-                "buffer_size": self.buffer_size,
-                "chunk_size": self.chunk_size,
-                "max_transfer_per_round": self.max_transfer_per_round,
-                "topology": self.topology,
-            }
-        )
+    def identity(self) -> dict[str, object]:
+        """Return a process-stable identity for this stage."""
+        return {
+            "kind": self.kind,
+            "drop_last": self.drop_last,
+            "dummy_factory": identity(self.dummy_factory),
+            "buffer_size": self.buffer_size,
+            "chunk_size": self.chunk_size,
+            "max_transfer_per_round": self.max_transfer_per_round,
+            "topology": self.topology,
+        }
 
 
 class _BalanceStageIterator:
@@ -207,20 +205,6 @@ class _BalanceStageIterator:
         """Reject resume for this stage."""
         msg = "[UnsupportedResume] loader stage kind='balance'"
         raise UnsupportedResume(msg)
-
-    def fingerprint(self) -> str:
-        """Return a stable fingerprint for resume compatibility checks."""
-        return stable_fingerprint(
-            {
-                "kind": "balance",
-                "drop_last": self.drop_last,
-                "dummy_factory": callable_fingerprint(self.dummy_factory),
-                "buffer_size": self.buffer_size,
-                "chunk_size": self.chunk_size,
-                "max_transfer_per_round": self.max_transfer_per_round,
-                "topology": self.topology,
-            }
-        )
 
     def _passthrough(self) -> bool:
         """Return whether distributed balancing is inactive."""

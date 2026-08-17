@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 
-from ...core.resume import callable_fingerprint, stable_fingerprint
+from ...core.resume import identity
 from ...core.stages import _BatchStageIterator
 
 
@@ -34,13 +34,11 @@ class _LoaderBatchStage:
             collate_fn=self.collate_fn,
         )
 
-    def fingerprint(self) -> str:
-        """Return a stable fingerprint for resume compatibility checks."""
-        return stable_fingerprint(
-            {
-                "kind": self.kind,
-                "batch_size": self.batch_size,
-                "drop_last": self.drop_last,
-                "collate_fn": callable_fingerprint(self.collate_fn),
-            }
-        )
+    def identity(self) -> dict[str, object]:
+        """Return a process-stable identity for this stage."""
+        return {
+            "kind": self.kind,
+            "batch_size": self.batch_size,
+            "drop_last": self.drop_last,
+            "collate_fn": identity(self.collate_fn),
+        }

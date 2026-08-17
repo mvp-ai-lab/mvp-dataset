@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 
-from ..resume import ResumeStateError, callable_fingerprint, stable_fingerprint
+from ..resume import ResumeStateError, identity
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,19 +16,29 @@ class _MapStage:
 
     def __call__(self, data: Iterable[object]) -> Iterable[object]:
         """Apply this callable object."""
-        for sample in data:
-            yield self.fn(sample)
+        return _MapStageIterator(upstream=data, fn=self.fn)
+
+    def identity(self) -> dict[str, object]:
+        """Return a process-stable identity for this stage."""
+        return {"kind": "map", "fn": identity(self.fn)}
+
+
+class _MapStageIterator:
+    """Live map iterator with empty resumable state."""
+
+    def __init__(self, *, upstream: Iterable[object], fn: Callable[[object], object]) -> None:
+        self.upstream = iter(upstream)
+        self.fn = fn
+
+    def __iter__(self) -> Iterator[object]:
+        return self
+
+    def __next__(self) -> object:
+        return self.fn(next(self.upstream))
 
     def state_dict(self) -> dict[str, object]:
-        """Return the resumable state for this object."""
         return {}
 
     def load_state_dict(self, state: dict[str, object]) -> None:
-        """Restore this object from a resumable state dictionary."""
         if state != {}:
-            msg = "[InvalidResumeState] map stage state must be empty"
-            raise ResumeStateError(msg)
-
-    def fingerprint(self) -> str:
-        """Return a stable fingerprint for resume compatibility checks."""
-        return stable_fingerprint({"kind": "map", "fn": callable_fingerprint(self.fn)})
+            raise ResumeStateError("[InvalidResumeState] map stage state must be empty")

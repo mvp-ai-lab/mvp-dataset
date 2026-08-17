@@ -1,6 +1,6 @@
 # Resume and Checkpointing
 
-Resume is based on explicit iterator state.
+Resume is based on two facts: the pipeline **identity** and the live iterator **state**.
 
 ## Dataset Resume
 
@@ -11,13 +11,14 @@ it = iter(dataset)
 for _ in range(100):
     next(it)
 
-state = it.state_dict()
+blob = it.state_dict()
 
-resumed_dataset = Dataset.from_source("parquet", "/data/train.parquet").load_state_dict(state)
-resumed_it = iter(resumed_dataset)
+resumed = Dataset.from_source("parquet", "/data/train.parquet")
+resumed.load_state_dict(blob)
+resumed_it = iter(resumed)
 ```
 
-The resumed iterator continues from the next item that the original iterator would have produced.
+`load_state_dict` mutates the handle in place. The restored state is consumed by the next `iter(...)` only. A later `iter(...)` starts a new epoch.
 
 ## TorchLoader Resume
 
@@ -26,36 +27,30 @@ loader = TorchLoader(dataset, num_workers=2, batch_size=8)
 it = iter(loader)
 
 batch = next(it)
-state = it.state_dict()
+blob = it.state_dict()
 
-resumed_loader = TorchLoader(dataset, num_workers=2, batch_size=8).load_state_dict(state)
-resumed_it = iter(resumed_loader)
+resumed = TorchLoader(dataset, num_workers=2, batch_size=8)
+resumed.load_state_dict(blob)
+resumed_it = iter(resumed)
 ```
 
-`TorchLoader` stores pending prefetched outputs in the checkpoint state so resumed output matches the original continued stream.
-
-## Initial-State Convenience APIs
-
-These APIs exist, but are not intended for active checkpointing:
+## Checkpoint shape
 
 ```python
-initial_dataset_state = dataset.state_dict()
-initial_loader_state = loader.state_dict()
+{
+  "version": 3,
+  "identity": { "runtime", "source", "stages", "loader" },
+  "state": { "num_yielded", "source", "stages", "loader" } | None,
+}
 ```
 
-They create fresh initial iterator states and emit warnings. In a training loop, store the iterator and call `iterator.state_dict()`.
+`Dataset.state_dict()` / `TorchLoader.state_dict()` save identity with `state=None` (no live iterator). Use the live iterator's `state_dict()` to checkpoint mid-epoch.
 
 ## Compatibility Checks
 
-Resume state stores fingerprints for:
+`load_state_dict(...)` compares identity once. A mismatch raises `ResumeStateError` with `[ResumeIdentityMismatch] path=...`.
 
-- resume schema version
-- runtime context
-- source configuration and source metadata
-- dataset stages
-- TorchLoader configuration and loader-side stages
-
-`load_state_dict(...)` raises `ResumeStateError` if the saved state does not match the new pipeline.
+`identity()` walks configuration: primitives, dataclasses, mappings, sequences, `partial`, and objects that implement `identity()`. A default object `repr` that embeds a memory address is rejected with `[UnstableResumeIdentity]`.
 
 `UnsupportedResume` is raised when a source, stage, or loader configuration cannot provide resumable state.
 
@@ -70,16 +65,12 @@ while training:
     train_step(batch)
 
     if should_checkpoint:
-        checkpoint = {
-            "step": step,
-            "loader": loader_iter.state_dict(),
-        }
-        save_checkpoint(checkpoint)
+        save_checkpoint({"step": step, "data": loader_iter.state_dict()})
 ```
 
 On restore:
 
 ```python
-loader = TorchLoader(dataset, num_workers=8, batch_size=32).load_state_dict(checkpoint["loader"])
+loader.load_state_dict(checkpoint["data"])
 loader_iter = iter(loader)
 ```

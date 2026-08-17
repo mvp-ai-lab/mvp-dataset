@@ -102,11 +102,10 @@ def test_jsonl_resume_and_sample_identity_ignore_mount_and_cache_roots(tmp_path,
         context=context,
         shuffle_mode="none",
     )
-    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
-        resumed = second_dataset.load_state_dict(state)
+    second_dataset.load_state_dict(state)
 
-    assert list(resumed) == expected_remainder
-    assert first_dataset._pipeline_fingerprint() == second_dataset._pipeline_fingerprint()
+    assert list(second_dataset) == expected_remainder
+    assert first_dataset.identity() == second_dataset.identity()
     assert first_sample["__file__"] == "samples.jsonl"
     assert first_sample["__index_in_file__"] == 0
     assert str(tmp_path / "cache-a") not in first_sample["__key__"]

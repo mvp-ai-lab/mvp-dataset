@@ -28,7 +28,6 @@ class _JsonlSourceIterator:
     shuffle_mode: JsonlShuffleMode = "shard_aware"
     ref_fields: tuple[TarUriRefFieldSpec, ...] = ()
     source_identity: str = ""
-    source_fingerprint: str = ""
     round_index: int = 0
     shard_index: int = 0
     byte_offset: int = 0
@@ -91,7 +90,6 @@ class _JsonlSourceIterator:
         """Return the resumable state for this object."""
         return {
             "kind": "jsonl",
-            "shuffle_mode": self.shuffle_mode,
             "round_index": self.round_index,
             "shard_index": self.shard_index,
             "byte_offset": self.byte_offset,
@@ -101,11 +99,7 @@ class _JsonlSourceIterator:
     def load_state_dict(self, state: dict[str, object]) -> None:
         """Restore this object from a resumable state dictionary."""
         if state.get("kind") != "jsonl":
-            msg = f"[InvalidResumeState] expected source kind='jsonl', got={state.get('kind')!r}"
-            raise ResumeStateError(msg)
-        if state.get("shuffle_mode") != self.shuffle_mode:
-            msg = "[InvalidResumeState] shuffle_mode does not match"
-            raise ResumeStateError(msg)
+            raise ResumeStateError(f"[InvalidResumeState] expected source kind='jsonl', got={state.get('kind')!r}")
 
         round_index = state.get("round_index")
         if not isinstance(round_index, int) or round_index < 0:
@@ -151,10 +145,6 @@ class _JsonlSourceIterator:
         self.byte_offset = byte_offset
         self.line_index = line_index
         self._close_handle()
-
-    def fingerprint(self) -> str:
-        """Return a stable fingerprint for resume compatibility checks."""
-        return self.source_fingerprint
 
     def _current_shard_item(self) -> JsonlShard | None:
         """Return the currently active physical shard and logical identity."""

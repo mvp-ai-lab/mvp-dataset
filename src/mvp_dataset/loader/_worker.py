@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-import warnings
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 
@@ -80,27 +79,25 @@ class _ResumeTrackingDataset(TorchIterableDataset):
         dataset = self.dataset
         worker_state = self.worker_states.get(str(worker_id))
         if worker_state is not None:
-            load_state_dict = getattr(dataset, "load_state_dict", None)
-            if load_state_dict is None:
-                msg = "[UnsupportedResume] TorchLoader dataset does not support load_state_dict"
-                raise UnsupportedResume(msg)
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", UserWarning)
-                dataset = load_state_dict(worker_state)
+            load_live_state = getattr(dataset, "load_live_state", None)
+            if load_live_state is None:
+                raise UnsupportedResume("[UnsupportedResume] TorchLoader dataset does not support load_live_state")
+            load_live_state(worker_state)
 
         iterator = iter(dataset)
-        state_dict = getattr(iterator, "state_dict", None)
+        live_state = getattr(iterator, "live_state", None)
 
         for item in self._iter_outputs(iterator):
             yield _WorkerItem(worker_id=worker_id, item=item)
             if self.snapshot_event.is_set():
-                if state_dict is None:
-                    msg = "[UnsupportedResume] TorchLoader dataset iterator does not support state_dict"
-                    raise UnsupportedResume(msg)
-                yield _WorkerState(worker_id=worker_id, state=state_dict())
+                if live_state is None:
+                    raise UnsupportedResume(
+                        "[UnsupportedResume] TorchLoader dataset iterator does not support live_state"
+                    )
+                yield _WorkerState(worker_id=worker_id, state=live_state())
                 while self.snapshot_event.is_set():
                     time.sleep(0.001)
-        yield _WorkerDone(worker_id=worker_id, state={} if state_dict is None else state_dict())
+        yield _WorkerDone(worker_id=worker_id, state={} if live_state is None else live_state())
 
     def _iter_outputs(self, iterator: Iterator[object]) -> Iterator[object]:
         """Yield user-visible outputs and snapshot messages for one worker."""

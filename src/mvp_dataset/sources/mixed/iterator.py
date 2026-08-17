@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import random
-import warnings
 from dataclasses import dataclass, field
 
 from mvp_dataset.core.context import RuntimeContext
@@ -32,7 +31,6 @@ class _MixedSourceIterator:
     sources: tuple[MixedSourceSpec, ...]
     context: RuntimeContext
     strategy: MixedStrategy
-    source_fingerprint: str
     _source_states: list[_WeightedSourceState] = field(init=False)
     _cursor: int = 0
     _rng: random.Random = field(init=False)
@@ -71,16 +69,13 @@ class _MixedSourceIterator:
         """Return the resumable state for this object."""
         return {
             "kind": "mixed",
-            "strategy": self.strategy,
             "cursor": self._cursor,
             "rng_state": self._rng.getstate(),
             "sources": [
                 {
-                    "name": state.spec.name,
-                    "weight": state.spec.weight,
                     "current": state.current,
                     "exhausted": state.exhausted,
-                    "state": state.iterator.state_dict(),
+                    "state": state.iterator.live_state(),
                 }
                 for state in self._source_states
             ],
@@ -89,67 +84,39 @@ class _MixedSourceIterator:
     def load_state_dict(self, state: dict[str, object]) -> None:
         """Restore this object from a resumable state dictionary."""
         if state.get("kind") != "mixed":
-            msg = f"[InvalidResumeState] expected source kind='mixed', got={state.get('kind')!r}"
-            raise ResumeStateError(msg)
-        if state.get("strategy") != self.strategy:
-            msg = "[InvalidResumeState] mixed strategy does not match"
-            raise ResumeStateError(msg)
+            raise ResumeStateError(f"[InvalidResumeState] expected source kind='mixed', got={state.get('kind')!r}")
 
         cursor = state.get("cursor")
         if not isinstance(cursor, int) or cursor < 0:
-            msg = "[InvalidResumeState] mixed cursor must be a non-negative integer"
-            raise ResumeStateError(msg)
+            raise ResumeStateError("[InvalidResumeState] mixed cursor must be a non-negative integer")
         try:
             self._rng.setstate(state.get("rng_state"))
         except (TypeError, ValueError) as error:
-            msg = "[InvalidResumeState] mixed rng_state is invalid"
-            raise ResumeStateError(msg) from error
+            raise ResumeStateError("[InvalidResumeState] mixed rng_state is invalid") from error
 
         raw_sources = state.get("sources")
         if not isinstance(raw_sources, list) or len(raw_sources) != len(self._source_states):
-            msg = "[InvalidResumeState] mixed sources must match configured sources"
-            raise ResumeStateError(msg)
+            raise ResumeStateError("[InvalidResumeState] mixed sources must match configured sources")
 
-        restored: list[_WeightedSourceState] = []
-        for configured, raw_source in zip(self.sources, raw_sources, strict=True):
+        for existing, raw_source in zip(self._source_states, raw_sources, strict=True):
             if not isinstance(raw_source, dict):
-                msg = "[InvalidResumeState] mixed source state must be a dict"
-                raise ResumeStateError(msg)
-            if raw_source.get("name") != configured.name or raw_source.get("weight") != configured.weight:
-                msg = "[ResumeSourceMismatch] mixed source name or weight does not match"
-                raise ResumeStateError(msg)
-
+                raise ResumeStateError("[InvalidResumeState] mixed source state must be a dict")
             current = raw_source.get("current")
             if not isinstance(current, int):
-                msg = "[InvalidResumeState] mixed source current must be an integer"
-                raise ResumeStateError(msg)
+                raise ResumeStateError("[InvalidResumeState] mixed source current must be an integer")
             exhausted = raw_source.get("exhausted")
             if not isinstance(exhausted, bool):
-                msg = "[InvalidResumeState] mixed source exhausted must be a boolean"
-                raise ResumeStateError(msg)
+                raise ResumeStateError("[InvalidResumeState] mixed source exhausted must be a boolean")
             child_state = raw_source.get("state")
             if not isinstance(child_state, dict):
-                msg = "[InvalidResumeState] mixed source child state must be a dict"
-                raise ResumeStateError(msg)
+                raise ResumeStateError("[InvalidResumeState] mixed source child state must be a dict")
+            if "identity" in child_state:
+                raise ResumeStateError("[InvalidResumeState] live state must not contain identity")
+            existing.iterator.load_state_dict(child_state)
+            existing.current = current
+            existing.exhausted = exhausted
 
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", UserWarning)
-                dataset = configured.dataset.load_state_dict(child_state)
-            restored.append(
-                _WeightedSourceState(
-                    spec=configured,
-                    iterator=DatasetIterator(dataset, context=self.context),
-                    current=current,
-                    exhausted=exhausted,
-                )
-            )
-
-        self._source_states = restored
         self._cursor = cursor
-
-    def fingerprint(self) -> str:
-        """Return a stable fingerprint for resume compatibility checks."""
-        return self.source_fingerprint
 
     def _pick_source(self) -> _WeightedSourceState | None:
         """Pick the next source for the configured strategy."""

@@ -23,7 +23,6 @@ class _TarSourceIterator:
     resample: bool
     sidecars: tuple[SidecarSpec, ...] = ()
     shuffle_mode: TarShuffleMode = "shard_aware"
-    source_fingerprint: str = ""
     round_index: int = 0
     shard_index: int = 0
     sample_index: int = 0
@@ -71,7 +70,6 @@ class _TarSourceIterator:
         """Return the resumable state for this object."""
         return {
             "kind": "tar",
-            "shuffle_mode": self.shuffle_mode,
             "round_index": self.round_index,
             "shard_index": self.shard_index,
             "sample_index": self.sample_index,
@@ -80,11 +78,7 @@ class _TarSourceIterator:
     def load_state_dict(self, state: dict[str, object]) -> None:
         """Restore this object from a resumable state dictionary."""
         if state.get("kind") != "tar":
-            msg = f"[InvalidResumeState] expected source kind='tar', got={state.get('kind')!r}"
-            raise ResumeStateError(msg)
-        if state.get("shuffle_mode") != self.shuffle_mode:
-            msg = "[InvalidResumeState] shuffle_mode does not match"
-            raise ResumeStateError(msg)
+            raise ResumeStateError(f"[InvalidResumeState] expected source kind='tar', got={state.get('kind')!r}")
 
         round_index = state.get("round_index")
         if not isinstance(round_index, int) or round_index < 0:
@@ -115,10 +109,6 @@ class _TarSourceIterator:
         self.shard_index = shard_index
         self.sample_index = sample_index
         self._close_iterator()
-
-    def fingerprint(self) -> str:
-        """Return a stable fingerprint for resume compatibility checks."""
-        return self.source_fingerprint
 
     def _current_shard_path(self) -> str | None:
         """Return the path for the currently active shard."""

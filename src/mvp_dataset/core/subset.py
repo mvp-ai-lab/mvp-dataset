@@ -120,4 +120,4 @@ def _subset_dataset(dataset: Dataset, unit_indices: Sequence[int]) -> Dataset:
         )
         raise ValueError(msg)
     subset = tuple(dataset._source[index] for index in sorted(unit_indices))
-    return dataclass_replace(dataset, _source=subset, _resume_state=None)
+    return dataclass_replace(dataset, _source=subset, _pending_state=None)

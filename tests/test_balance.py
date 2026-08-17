@@ -139,8 +139,9 @@ def test_balance_api_validation_and_resume_rejection() -> None:
         TorchLoader([{"x": 1}], num_workers=0).balance(buffer_size=1, chunk_size=2)
 
     loader = TorchLoader([{"x": 1}], num_workers=0).balance(buffer_size=1, chunk_size=1)
-    with pytest.warns(UserWarning), pytest.raises(UnsupportedResume, match="balance"):
-        loader.state_dict()
+    iterator = iter(loader)
+    with pytest.raises(UnsupportedResume, match=r"\[UnsupportedResume\]"):
+        iterator.state_dict()
 
 
 class _RankItems:
@@ -248,10 +249,7 @@ def test_balance_distributed_sparse_tail_preserves_real_items(tmp_path) -> None:
 
     assert [len(items) for items in outputs.values()] == [3, 3, 3, 3]
     real_items = [
-        (item["source_rank"], item["index"])
-        for items in outputs.values()
-        for item in items
-        if not item["dummy"]
+        (item["source_rank"], item["index"]) for items in outputs.values() for item in items if not item["dummy"]
     ]
     assert sorted(real_items) == [(0, 0), (0, 1), (0, 2)]
     assert sum(int(item["dummy"]) for items in outputs.values() for item in items) == 9

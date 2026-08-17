@@ -5,7 +5,6 @@ from dataclasses import dataclass
 
 from mvp_dataset.core.context import RuntimeContext
 from mvp_dataset.core.dataset import Dataset
-from mvp_dataset.core.resume import stable_fingerprint
 from mvp_dataset.core.types import ShardInput
 from mvp_dataset.utils.url import normalize_paths
 
@@ -96,11 +95,10 @@ class ParquetDataset(Dataset):
             resample=self._resample,
             columns=self._columns,
             use_threads=self._use_threads,
-            source_fingerprint=stable_fingerprint(self._source_fingerprint()),
             shuffle_mode=self._shuffle_mode,
         )
 
-    def _source_fingerprint(self) -> dict[str, object]:
+    def _source_identity(self) -> dict[str, object]:
         """Return the source portion of the pipeline fingerprint."""
         return {
             "kind": "parquet",

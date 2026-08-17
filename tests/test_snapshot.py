@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import shutil
-import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -44,7 +43,7 @@ class _PairAssembler:
         assert pending is None or isinstance(pending, dict)
         self.pending = pending
 
-    def fingerprint(self) -> str:
+    def identity(self) -> str:
         return "pair-assembler-v1"
 
 
@@ -273,11 +272,10 @@ def test_snapshot_source_supports_resume(tmp_path, monkeypatch) -> None:
     prefix = [next(iterator), next(iterator)]
     state = iterator.state_dict()
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        resumed = snapshot.load_state_dict(state)
-
-    assert prefix + list(resumed) == list(snapshot)
+    snapshot.load_state_dict(state)
+    resumed = list(snapshot)
+    fresh = Dataset.from_source("lance", source).snapshot()
+    assert prefix + resumed == list(fresh)
 
 
 def test_snapshot_split_uses_materialized_row_space(tmp_path, monkeypatch) -> None:
@@ -324,8 +322,8 @@ def test_snapshot_rejects_invalid_configuration(tmp_path, monkeypatch) -> None:
     with pytest.raises(ValueError, match="SnapshotSourceMetadataConflict"):
         list(dataset.map(lambda sample: {**sample, "__source_key__": "existing"}).snapshot(lambda: "conflict"))
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        resumed = dataset.load_state_dict(dataset.state_dict())
+    iterator = iter(dataset)
+    next(iterator)
+    dataset.load_state_dict(iterator.state_dict())
     with pytest.raises(ValueError, match="pending resume state"):
-        resumed.snapshot()
+        dataset.snapshot()

@@ -6,12 +6,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 
 from ..context import RuntimeContext
-from ..resume import (
-    ResumeStateError,
-    UnsupportedResume,
-    callable_fingerprint,
-    stable_fingerprint,
-)
+from ..resume import ResumeStateError, UnsupportedResume, identity
 from ..types import Assembler, StatefulAssembler
 
 
@@ -33,25 +28,21 @@ class _AssembleStage:
         return _AssembleStageIterator(
             upstream=data,
             assembler=assembler,
-            factory=self.factory,
             drop_last=self.drop_last,
         )
 
-    def fingerprint(self) -> str:
-        """Return a stable fingerprint for resume compatibility checks."""
+    def identity(self) -> dict[str, object]:
+        """Return a process-stable identity for this stage."""
         runtime_context = RuntimeContext.from_runtime(base=self.context)
         assembler = self.factory(runtime_context)
         if not isinstance(assembler, StatefulAssembler):
-            msg = "[UnsupportedResume] stage kind='assemble' requires a stateful assembler"
-            raise UnsupportedResume(msg)
-        return stable_fingerprint(
-            {
-                "kind": "assemble",
-                "drop_last": self.drop_last,
-                "factory": callable_fingerprint(self.factory),
-                "assembler": assembler.fingerprint(),
-            }
-        )
+            raise UnsupportedResume("[UnsupportedResume] stage kind='assemble' requires a stateful assembler")
+        return {
+            "kind": "assemble",
+            "drop_last": self.drop_last,
+            "factory": identity(self.factory),
+            "assembler": identity(assembler),
+        }
 
 
 class _AssembleStageIterator:
@@ -62,13 +53,11 @@ class _AssembleStageIterator:
         *,
         upstream: Iterable[object],
         assembler: StatefulAssembler,
-        factory: Callable[[RuntimeContext], Assembler[object, object]],
         drop_last: bool,
     ) -> None:
         """Initialize the object."""
         self.upstream = iter(upstream)
         self.assembler = assembler
-        self.factory = factory
         self.drop_last = drop_last
         self.pending_outputs: list[object] = []
         self.finished = False
@@ -116,14 +105,3 @@ class _AssembleStageIterator:
         self.assembler.load_state_dict(assembler_state)
         self.pending_outputs = list(pending_outputs)
         self.finished = finished
-
-    def fingerprint(self) -> str:
-        """Return a stable fingerprint for resume compatibility checks."""
-        return stable_fingerprint(
-            {
-                "kind": "assemble",
-                "drop_last": self.drop_last,
-                "factory": callable_fingerprint(self.factory),
-                "assembler": self.assembler.fingerprint(),
-            }
-        )
