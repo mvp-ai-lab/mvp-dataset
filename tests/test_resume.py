@@ -19,6 +19,8 @@ from mvp_dataset import (
     RuntimeContext,
     TorchLoader,
     UnsupportedResume,
+    reset_logger,
+    set_logger,
 )
 from mvp_dataset.core.resume import RESUME_STATE_VERSION, check_identity, identity
 
@@ -716,6 +718,40 @@ def test_dataset_state_dict_without_live_iterator_replays_from_start(tmp_path) -
 
     assert state["state"] is None
     assert _remaining(iter(resumed_dataset)) == _remaining(iter(build_dataset()))
+
+
+class _ListLogger:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def debug(self, msg: object, *args: object, **kwargs: object) -> None:
+        return None
+
+    def info(self, msg: object, *args: object, **kwargs: object) -> None:
+        return None
+
+    def warning(self, msg: object, *args: object, **kwargs: object) -> None:
+        self.messages.append(str(msg))
+
+    def error(self, msg: object, *args: object, **kwargs: object) -> None:
+        return None
+
+
+def test_iter_warns_only_while_previous_iterator_is_active(tmp_path) -> None:
+    logger = _ListLogger()
+    set_logger(logger)
+    try:
+        dataset = _source_factory(tmp_path, "jsonl")()
+        first = iter(dataset)
+        second = iter(dataset)
+        assert any("previous iterator is still active" in message for message in logger.messages)
+        _remaining(first)
+        _remaining(second)
+        logger.messages.clear()
+        iter(dataset)
+        assert not any("previous iterator is still active" in message for message in logger.messages)
+    finally:
+        reset_logger()
 
 
 def test_iterators_can_checkpoint_independently(tmp_path) -> None:

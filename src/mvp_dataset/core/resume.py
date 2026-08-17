@@ -11,6 +11,8 @@ import textwrap
 from collections.abc import Mapping, Sequence, Set
 from typing import Protocol, runtime_checkable
 
+from mvp_dataset.log import get_logger
+
 RESUME_STATE_VERSION = 3
 _MAX_IDENTITY_DEPTH = 16
 
@@ -21,6 +23,16 @@ class UnsupportedResume(RuntimeError):
 
 class ResumeStateError(ValueError):
     """Raised when a resume state is malformed or incompatible."""
+
+
+def warn_if_iterator_replaced(previous: object | None) -> None:
+    """Warn when iter() replaces an iterator that has not reached StopIteration."""
+    if previous is None or getattr(previous, "_exhausted", True):
+        return
+    get_logger().warning(
+        "iter() called while a previous iterator is still active; "
+        "state_dict() on this handle will follow the new iterator."
+    )
 
 
 @runtime_checkable

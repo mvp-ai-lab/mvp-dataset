@@ -8,7 +8,12 @@ from dataclasses import replace as dataclass_replace
 
 from .context import RuntimeContext
 from .iterator import DatasetIterator
-from .resume import check_identity, checkpoint, parse_checkpoint
+from .resume import (
+    check_identity,
+    checkpoint,
+    parse_checkpoint,
+    warn_if_iterator_replaced,
+)
 from .stages import (
     _AssembleStage,
     _BatchStage,
@@ -38,6 +43,7 @@ class Dataset(TorchIterableDataset):
     _stages: tuple[StageSpec, ...]
     _resample: bool
     _pending_state: object | None = None
+    _active_iter: object | None = None
 
     def _build_source_stream(self, *, context: RuntimeContext) -> Iterable[object]:
         """Build the source iterator for a runtime context."""
@@ -46,7 +52,7 @@ class Dataset(TorchIterableDataset):
 
     def _append_stage(self, spec: StageSpec) -> Dataset:
         """Return a new dataset with one additional stage."""
-        return dataclass_replace(self, _stages=self._stages + (spec,), _pending_state=None)
+        return dataclass_replace(self, _stages=self._stages + (spec,), _pending_state=None, _active_iter=None)
 
     def _source_identity(self) -> dict[str, object]:
         """Return the source portion of the pipeline identity."""
@@ -281,7 +287,10 @@ class Dataset(TorchIterableDataset):
 
     def __iter__(self) -> Iterator[object]:
         """Materialize and run the full lazy pipeline."""
-        return DatasetIterator(self)
+        warn_if_iterator_replaced(self._active_iter)
+        iterator = DatasetIterator(self)
+        object.__setattr__(self, "_active_iter", iterator)
+        return iterator
 
     @classmethod
     def from_source(cls, source_kind: SourceKind, *args, **kwargs) -> Dataset:

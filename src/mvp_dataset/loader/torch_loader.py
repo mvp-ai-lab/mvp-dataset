@@ -13,6 +13,7 @@ from ..core.resume import (
     checkpoint,
     identity,
     parse_checkpoint,
+    warn_if_iterator_replaced,
 )
 from ..core.torch_compat import TORCH_AVAILABLE, TorchDataLoader
 from ..core.types import Assembler
@@ -108,6 +109,7 @@ class TorchLoader:
         self._loader_kwargs: dict[str, object] = dict(loader_kwargs)
         self._stages = tuple() if _stages is None else _stages
         self._pending_state = _pending_state
+        self._active_iter: object | None = None
 
     def _append_stage(self, stage: LoaderStage) -> TorchLoader:
         """Return a new loader with one additional post-merge stage.
@@ -384,4 +386,7 @@ class TorchLoader:
             stages have been applied in order.
         """
 
-        return _TorchLoaderIterator(self)
+        warn_if_iterator_replaced(self._active_iter)
+        iterator = _TorchLoaderIterator(self)
+        self._active_iter = iterator
+        return iterator
