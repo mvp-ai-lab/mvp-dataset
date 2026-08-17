@@ -5,6 +5,7 @@ from pathlib import Path
 from .config import (
     CACHE_DIR_ENV,
     CACHE_FINGERPRINT_MODE_ENV,
+    CACHE_WAIT_TIMEOUT_SECONDS_ENV,
     CacheConfig,
     FingerprintMode,
 )
@@ -42,6 +43,7 @@ def clear_cache(
 __all__ = [
     "CACHE_DIR_ENV",
     "CACHE_FINGERPRINT_MODE_ENV",
+    "CACHE_WAIT_TIMEOUT_SECONDS_ENV",
     "CacheBuildResult",
     "CacheConfig",
     "CacheEntry",

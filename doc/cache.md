@@ -55,6 +55,13 @@ export MVP_DATASET_CACHE_FINGERPRINT_MODE=content
 
 Supported values are `metadata` and `content`.
 
+Cache builders and waiters time out after 30 minutes by default. Override the timeout in seconds when large artifacts
+need more time to build:
+
+```bash
+export MVP_DATASET_CACHE_WAIT_TIMEOUT_SECONDS=10800
+```
+
 ## Builder API
 
 `CacheManager.ensure()` supports both complete-artifact and distributed part builders:

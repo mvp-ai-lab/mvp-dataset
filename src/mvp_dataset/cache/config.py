@@ -9,7 +9,10 @@ from typing import Literal
 
 CACHE_DIR_ENV = "MVP_DATASET_CACHE_DIR"
 CACHE_FINGERPRINT_MODE_ENV = "MVP_DATASET_CACHE_FINGERPRINT_MODE"
+CACHE_WAIT_TIMEOUT_SECONDS_ENV = "MVP_DATASET_CACHE_WAIT_TIMEOUT_SECONDS"
 FingerprintMode = Literal["metadata", "content"]
+_DEFAULT_FINGERPRINT_MODE: FingerprintMode = "metadata"
+_DEFAULT_WAIT_TIMEOUT_SECONDS = 30 * 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,8 +20,8 @@ class CacheConfig:
     """Configuration shared by all persistent cache artifacts."""
 
     root: Path
-    fingerprint_mode: FingerprintMode = "metadata"
-    wait_timeout_seconds: float = 30 * 60
+    fingerprint_mode: FingerprintMode = _DEFAULT_FINGERPRINT_MODE
+    wait_timeout_seconds: float = _DEFAULT_WAIT_TIMEOUT_SECONDS
     poll_interval_seconds: float = 0.25
 
     def __post_init__(self) -> None:
@@ -50,5 +53,12 @@ class CacheConfig:
             root = Path(xdg_cache_home) / "mvp-dataset"
         else:
             root = Path.home() / ".cache" / "mvp-dataset"
-        resolved_mode = fingerprint_mode or os.environ.get(CACHE_FINGERPRINT_MODE_ENV, "metadata")
-        return cls(root=root, fingerprint_mode=resolved_mode)
+        resolved_mode = fingerprint_mode or os.environ.get(CACHE_FINGERPRINT_MODE_ENV, _DEFAULT_FINGERPRINT_MODE)
+        resolved_wait_timeout_seconds = float(
+            os.environ.get(CACHE_WAIT_TIMEOUT_SECONDS_ENV, str(_DEFAULT_WAIT_TIMEOUT_SECONDS))
+        )
+        return cls(
+            root=root,
+            fingerprint_mode=resolved_mode,
+            wait_timeout_seconds=resolved_wait_timeout_seconds,
+        )
