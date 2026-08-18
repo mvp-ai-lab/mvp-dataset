@@ -31,6 +31,22 @@ def _cache_config(root: Path) -> CacheConfig:
     )
 
 
+def test_cache_config_resolves_wait_timeout_from_environment(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("MVP_DATASET_CACHE_WAIT_TIMEOUT_SECONDS", "10800")
+
+    config = CacheConfig.resolve(tmp_path / "cache")
+
+    assert config.wait_timeout_seconds == 10800
+
+
+@pytest.mark.parametrize("value", ["invalid", "0", "-1"])
+def test_cache_config_rejects_invalid_wait_timeout_environment(tmp_path, monkeypatch, value: str) -> None:
+    monkeypatch.setenv("MVP_DATASET_CACHE_WAIT_TIMEOUT_SECONDS", value)
+
+    with pytest.raises(ValueError):
+        CacheConfig.resolve(tmp_path / "cache")
+
+
 def _source():
     return fingerprint_source_manifest(
         {
