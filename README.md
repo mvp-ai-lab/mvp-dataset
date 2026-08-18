@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/mvp-ai-lab/mvp-dataset/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/mvp-ai-lab/mvp-dataset?style=flat-square"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.1.0-111827?style=flat-square">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.2.2-111827?style=flat-square">
   <img alt="Python" src="https://img.shields.io/badge/python-3.12-3776AB?style=flat-square&logo=python&logoColor=white">
   <img alt="Sources" src="https://img.shields.io/badge/sources-tar%20%7C%20jsonl%20%7C%20parquet%20%7C%20lance-F5C86B?style=flat-square">
 </p>
