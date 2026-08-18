@@ -311,6 +311,22 @@ class _ScalarCollator:
         return batch
 
 
+def test_identity_methodcaller_includes_name_and_kwargs() -> None:
+    from operator import methodcaller
+
+    first = identity(methodcaller("to_model_inputs"))
+    second = identity(methodcaller("to_model_inputs"))
+    renamed = identity(methodcaller("to_tokens"))
+    flagged = identity(methodcaller("to_model_inputs", load_media=True))
+
+    assert first == second
+    assert first != renamed
+    assert first != flagged
+    assert first["kind"] == "methodcaller"
+    assert first["name"] == "to_model_inputs"
+    assert flagged["keywords"] == [{"key": "load_media", "value": True}]
+
+
 def test_identity_uses_nested_identity_not_repr() -> None:
     first = identity(partial(_from_row, sample_spec=_SampleSpec(_StableHandler(1))))
     second = identity(partial(_from_row, sample_spec=_SampleSpec(_StableHandler(1))))

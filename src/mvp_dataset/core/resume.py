@@ -7,6 +7,7 @@ import functools
 import hashlib
 import inspect
 import json
+import operator
 import textwrap
 from collections.abc import Mapping, Sequence, Set
 from typing import Protocol, runtime_checkable
@@ -135,6 +136,8 @@ def _identity(value: object, *, depth: int, seen: frozenset[int]) -> object:
                 for key, item in sorted(keywords.items(), key=lambda item: str(item[0]))
             ],
         }
+    if type(value) is operator.methodcaller:
+        return _methodcaller_identity(value, depth=depth, seen=next_seen)
     if inspect.isfunction(value) or inspect.ismethod(value) or inspect.isclass(value):
         return _callable_identity(value, depth=depth, seen=next_seen)
     if isinstance(value, Mapping):
@@ -189,6 +192,30 @@ def _object_identity(value: object) -> object | None:
     if inspect.isfunction(method) and _required_positional_count(method) > 0:
         return None
     return method()
+
+
+def _methodcaller_identity(value: object, *, depth: int, seen: frozenset[int]) -> dict[str, object]:
+    constructor, args = value.__reduce__()[:2]
+    if constructor is operator.methodcaller:
+        name, *positional = args
+        keywords: dict[str, object] = {}
+    elif isinstance(constructor, functools.partial) and constructor.func is operator.methodcaller:
+        name, *positional = constructor.args
+        keywords = dict(constructor.keywords or {})
+        positional = [*positional, *args]
+    else:
+        raise ResumeStateError(f"[UnstableResumeIdentity] unsupported methodcaller reduce {type(constructor).__name__}")
+    if not isinstance(name, str):
+        raise ResumeStateError("[UnstableResumeIdentity] methodcaller name must be a string")
+    return {
+        "kind": "methodcaller",
+        "name": name,
+        "args": [_identity(arg, depth=depth + 1, seen=seen) for arg in positional],
+        "keywords": [
+            {"key": str(key), "value": _identity(item, depth=depth + 1, seen=seen)}
+            for key, item in sorted(keywords.items(), key=lambda item: str(item[0]))
+        ],
+    }
 
 
 def _callable_identity(fn: object, *, depth: int, seen: frozenset[int]) -> dict[str, object]:
