@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from mvp_dataset.core.resume import StatefulIterator
+from mvp_dataset.core.resume import Stateful
 
 from .codecs import decode_snapshot_value
 
@@ -13,7 +13,7 @@ from .codecs import decode_snapshot_value
 class _SnapshotSourceIterator:
     """Decode materialized values while preserving Lance iterator state."""
 
-    upstream: StatefulIterator
+    upstream: Stateful
 
     def __iter__(self) -> _SnapshotSourceIterator:
         """Return this iterator."""
@@ -30,7 +30,3 @@ class _SnapshotSourceIterator:
     def load_state_dict(self, state: dict[str, object]) -> None:
         """Restore the delegated Lance source state."""
         self.upstream.load_state_dict(state)
-
-    def fingerprint(self) -> str:
-        """Return the delegated Lance source fingerprint."""
-        return self.upstream.fingerprint()

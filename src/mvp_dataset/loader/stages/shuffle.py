@@ -5,12 +5,11 @@ from __future__ import annotations
 import random
 from collections.abc import Iterable
 
-from ...core.resume import stable_fingerprint
 from ...core.stages import _ShuffleStageIterator
 
 
 class _LoaderShuffleStageIterator(_ShuffleStageIterator):
-    """TorchLoader shuffle iterator with loader-specific fingerprinting."""
+    """TorchLoader shuffle iterator."""
 
     def __init__(
         self,
@@ -21,23 +20,11 @@ class _LoaderShuffleStageIterator(_ShuffleStageIterator):
         seed: int,
     ) -> None:
         """Initialize the object."""
-        self.seed = seed
         super().__init__(
             upstream=upstream,
             buffer_size=buffer_size,
             initial=initial,
             rng=random.Random(seed),
-        )
-
-    def fingerprint(self) -> str:
-        """Return a stable fingerprint for resume compatibility checks."""
-        return stable_fingerprint(
-            {
-                "kind": "shuffle",
-                "buffer_size": self.buffer_size,
-                "initial": self.initial_config,
-                "seed": self.seed,
-            }
         )
 
 
@@ -61,13 +48,11 @@ class _LoaderShuffleStage:
             seed=self.seed,
         )
 
-    def fingerprint(self) -> str:
-        """Return a stable fingerprint for resume compatibility checks."""
-        return stable_fingerprint(
-            {
-                "kind": self.kind,
-                "buffer_size": self.buffer_size,
-                "initial": self.initial,
-                "seed": self.seed,
-            }
-        )
+    def identity(self) -> dict[str, object]:
+        """Return a process-stable identity for this stage."""
+        return {
+            "kind": self.kind,
+            "buffer_size": self.buffer_size,
+            "initial": self.initial,
+            "seed": self.seed,
+        }

@@ -6,12 +6,7 @@ from collections import deque
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
-from ..core.resume import (
-    RESUME_STATE_VERSION,
-    ResumeStateError,
-    StatefulStage,
-    UnsupportedResume,
-)
+from ..core.resume import ResumeStateError, Stateful, UnsupportedResume, checkpoint
 from ._worker import _ResumeTrackingDataset, _WorkerDone, _WorkerItem, _WorkerState
 
 if TYPE_CHECKING:
@@ -69,11 +64,12 @@ class _ResumeMergeIterator:
                 if item.worker_id == self.next_worker:
                     self.next_worker = self._advance_worker(item.worker_id)
             else:
-                msg = f"[InvalidTorchLoaderResumeItem] expected resume envelope, got={type(item).__name__}"
-                raise ResumeStateError(msg)
+                raise ResumeStateError(
+                    f"[InvalidTorchLoaderResumeItem] expected resume envelope, got={type(item).__name__}"
+                )
 
     def state_dict(self) -> dict[str, object]:
-        """Return the resumable state for this object."""
+        """Return the resumable loader merge state."""
         self.snapshot_event.set()
         try:
             waiting_for = {worker_id for worker_id in range(self.num_workers) if worker_id not in self.done}
@@ -89,8 +85,9 @@ class _ResumeMergeIterator:
                     self.done.add(item.worker_id)
                     waiting_for.discard(item.worker_id)
                 else:
-                    msg = f"[InvalidTorchLoaderResumeItem] expected resume control item, got={type(item).__name__}"
-                    raise ResumeStateError(msg)
+                    raise ResumeStateError(
+                        f"[InvalidTorchLoaderResumeItem] expected resume control item, got={type(item).__name__}"
+                    )
         finally:
             self.snapshot_event.clear()
         return {
@@ -111,7 +108,7 @@ class _ResumeMergeIterator:
         return None
 
     def _advance_worker(self, worker_id: int) -> int:
-        """Read one control item from a worker stream."""
+        """Advance to the next worker that may still produce output."""
         for offset in range(1, self.num_workers + 1):
             candidate = (worker_id + offset) % self.num_workers
             if self.buffers[candidate] or candidate not in self.done:
@@ -126,7 +123,9 @@ class _TorchLoaderIterator:
         """Initialize the object."""
         self.loader = loader
         self.num_yielded = 0
-        worker_states, next_worker, pending_outputs, stage_states = self._load_resume_state(loader._resume_state)
+        self._exhausted = False
+        pending = loader._peek_pending_state()
+        worker_states, next_worker, pending_outputs, stage_states = self._parse_live_state(pending)
         self.snapshot_event = loader._multiprocessing_event()
         self.merge_stream = _ResumeMergeIterator(
             loader._build_torch_dataloader(
@@ -151,10 +150,12 @@ class _TorchLoaderIterator:
         self.stages: list[object] = []
         for stage in loader._stages:
             stream = stage(stream)
-            self.stages.append(stream if isinstance(stream, StatefulStage) else stage)
+            self.stages.append(stream if isinstance(stream, Stateful) else stage)
         if stage_states is not None:
-            self._load_stage_resume_state(stage_states)
+            self._load_stage_state(stage_states)
         self.stream = iter(stream)
+        if pending is not None:
+            self.loader._take_pending_state()
 
     def __iter__(self) -> _TorchLoaderIterator:
         """Return the iterator object."""
@@ -162,118 +163,123 @@ class _TorchLoaderIterator:
 
     def __next__(self) -> object:
         """Return the next output item."""
-        item = next(self.stream)
+        try:
+            item = next(self.stream)
+        except StopIteration:
+            self._exhausted = True
+            raise
         self.num_yielded += 1
         return item
 
     def state_dict(self) -> dict[str, object]:
-        """Return the resumable state for this object."""
-        merge_state = self.merge_stream.state_dict()
+        """Return a full resume envelope for this live iterator."""
+        return checkpoint(self.loader.identity(), None if self._exhausted else self.live_state())
+
+    def live_state(self) -> dict[str, object]:
         return {
-            "version": RESUME_STATE_VERSION,
-            "loader_fingerprint": self.loader._loader_fingerprint(),
             "num_yielded": self.num_yielded,
-            "stages": self._stage_state_dicts(),
-            **merge_state,
+            "stages": self._stage_states(),
+            "loader": self.merge_stream.state_dict(),
         }
 
-    def _load_resume_state(
-        self,
-        state: dict[str, object] | None,
-    ) -> tuple[dict[str, dict[str, object]], int, dict[str, list[object]], list[object] | None]:
-        """Validate and load pending resume state."""
-        if state is None:
-            return {}, 0, {}, None
-        self.loader._validate_resume_state(state)
+    def load_state_dict(self, state: object) -> None:
+        """Restore loader-side stage state on this live iterator.
 
+        Worker streams are established at construction; restore them via
+        ``TorchLoader.load_state_dict`` + ``iter(loader)``.
+        """
+        if isinstance(state, dict) and "identity" in state and "state" in state and "version" in state:
+            from ..core.resume import check_identity, parse_checkpoint
+
+            expected, inner = parse_checkpoint(state)
+            check_identity(expected, self.loader.identity())
+            if inner is None:
+                raise ResumeStateError("[InvalidResumeState] live iterator cannot load state=None")
+            state = inner
+        if not isinstance(state, dict):
+            raise ResumeStateError("[InvalidResumeState] live state must be a dict")
+        if "identity" in state:
+            raise ResumeStateError("[InvalidResumeState] live state must not contain identity")
         num_yielded = state.get("num_yielded")
         if not isinstance(num_yielded, int) or num_yielded < 0:
-            msg = "[InvalidResumeState] num_yielded must be a non-negative integer"
-            raise ResumeStateError(msg)
-        next_worker = state.get("next_worker")
+            raise ResumeStateError("[InvalidResumeState] num_yielded must be a non-negative integer")
+        stages = state.get("stages")
+        if not isinstance(stages, list) or len(stages) != len(self.loader._stages):
+            raise ResumeStateError("[InvalidResumeState] loader stage count does not match")
+        self.num_yielded = num_yielded
+        self._exhausted = False
+        self._load_stage_state(stages)
+
+    def _parse_live_state(
+        self,
+        state: object | None,
+    ) -> tuple[dict[str, dict[str, object]], int, dict[str, list[object]], list[object] | None]:
+        if state is None:
+            return {}, 0, {}, None
+        if not isinstance(state, dict):
+            raise ResumeStateError("[InvalidResumeState] live state must be a dict")
+        if "identity" in state:
+            raise ResumeStateError("[InvalidResumeState] live state must not contain identity")
+        num_yielded = state.get("num_yielded")
+        if not isinstance(num_yielded, int) or num_yielded < 0:
+            raise ResumeStateError("[InvalidResumeState] num_yielded must be a non-negative integer")
+        loader_state = state.get("loader")
+        if not isinstance(loader_state, dict):
+            raise ResumeStateError("[InvalidResumeState] loader state must be a dict")
+        next_worker = loader_state.get("next_worker")
         if not isinstance(next_worker, int) or next_worker < 0 or next_worker >= self.loader._state_worker_count():
-            msg = "[InvalidResumeState] next_worker is out of range"
-            raise ResumeStateError(msg)
-        workers = state.get("workers")
+            raise ResumeStateError("[InvalidResumeState] next_worker is out of range")
+        workers = loader_state.get("workers")
         if not isinstance(workers, dict):
-            msg = "[InvalidResumeState] workers must be a dict"
-            raise ResumeStateError(msg)
-        pending_outputs = state.get("pending_outputs", {})
+            raise ResumeStateError("[InvalidResumeState] workers must be a dict")
+        pending_outputs = loader_state.get("pending_outputs", {})
         if not isinstance(pending_outputs, dict):
-            msg = "[InvalidResumeState] pending_outputs must be a dict"
-            raise ResumeStateError(msg)
+            raise ResumeStateError("[InvalidResumeState] pending_outputs must be a dict")
         stages = state.get("stages")
         if not isinstance(stages, list):
-            msg = "[InvalidResumeState] stages must be a list"
-            raise ResumeStateError(msg)
+            raise ResumeStateError("[InvalidResumeState] stages must be a list")
         if len(stages) != len(self.loader._stages):
-            msg = "[ResumeStageMismatch] loader stage count does not match"
-            raise ResumeStateError(msg)
+            raise ResumeStateError("[InvalidResumeState] loader stage count does not match")
 
         worker_states: dict[str, dict[str, object]] = {}
         for worker_id, worker_state in workers.items():
             if not isinstance(worker_id, str) or not worker_id.isdigit():
-                msg = "[InvalidResumeState] worker id must be a numeric string"
-                raise ResumeStateError(msg)
+                raise ResumeStateError("[InvalidResumeState] worker id must be a numeric string")
             numeric_worker_id = int(worker_id)
             if numeric_worker_id < 0 or numeric_worker_id >= self.loader._state_worker_count():
-                msg = "[InvalidResumeState] worker id is out of range"
-                raise ResumeStateError(msg)
+                raise ResumeStateError("[InvalidResumeState] worker id is out of range")
             if not isinstance(worker_state, dict):
-                msg = "[InvalidResumeState] worker state must be a dict"
-                raise ResumeStateError(msg)
+                raise ResumeStateError("[InvalidResumeState] worker state must be a dict")
+            if "identity" in worker_state:
+                raise ResumeStateError("[InvalidResumeState] live state must not contain identity")
             worker_states[worker_id] = worker_state
         parsed_pending: dict[str, list[object]] = {}
         for worker_id, items in pending_outputs.items():
             if not isinstance(worker_id, str) or not worker_id.isdigit():
-                msg = "[InvalidResumeState] pending worker id must be a numeric string"
-                raise ResumeStateError(msg)
+                raise ResumeStateError("[InvalidResumeState] pending worker id must be a numeric string")
             numeric_worker_id = int(worker_id)
             if numeric_worker_id < 0 or numeric_worker_id >= self.loader._state_worker_count():
-                msg = "[InvalidResumeState] pending worker id is out of range"
-                raise ResumeStateError(msg)
+                raise ResumeStateError("[InvalidResumeState] pending worker id is out of range")
             if not isinstance(items, list):
-                msg = "[InvalidResumeState] pending_outputs entry must be a list"
-                raise ResumeStateError(msg)
+                raise ResumeStateError("[InvalidResumeState] pending_outputs entry must be a list")
             parsed_pending[worker_id] = items
         self.num_yielded = num_yielded
         return worker_states, next_worker, parsed_pending, stages
 
-    def _stage_state_dicts(self) -> list[dict[str, object]]:
-        """Collect resumable state from loader-side stages."""
-        stage_states: list[dict[str, object]] = []
+    def _stage_states(self) -> list[object]:
+        stage_states: list[object] = []
         for index, (stage_factory, stage) in enumerate(zip(self.loader._stages, self.stages, strict=True)):
-            if not isinstance(stage, StatefulStage):
-                msg = f"[UnsupportedResume] loader stage kind={getattr(stage_factory, 'kind', None)!r} index={index}"
-                raise UnsupportedResume(msg)
-            stage_states.append(
-                {
-                    "kind": stage_factory.kind,
-                    "fingerprint": stage.fingerprint(),
-                    "state": stage.state_dict(),
-                }
-            )
+            if not isinstance(stage, Stateful):
+                raise UnsupportedResume(
+                    f"[UnsupportedResume] loader stage kind={getattr(stage_factory, 'kind', None)!r} index={index}"
+                )
+            stage_states.append(stage.state_dict())
         return stage_states
 
-    def _load_stage_resume_state(self, stages: list[object]) -> None:
-        """Load resumable state into materialized stages."""
-        for index, (stage_factory, stage, stage_state) in enumerate(
-            zip(self.loader._stages, self.stages, stages, strict=True)
-        ):
+    def _load_stage_state(self, stages: list[object]) -> None:
+        for stage_factory, stage, stage_state in zip(self.loader._stages, self.stages, stages, strict=True):
+            if not isinstance(stage, Stateful):
+                raise UnsupportedResume(f"[UnsupportedResume] loader stage kind={stage_factory.kind!r}")
             if not isinstance(stage_state, dict):
-                msg = "[InvalidResumeState] loader stage must be a dict"
-                raise ResumeStateError(msg)
-            if stage_state.get("kind") != stage_factory.kind:
-                msg = f"[ResumeStageMismatch] loader stage kind does not match index={index}"
-                raise ResumeStateError(msg)
-            if not isinstance(stage, StatefulStage):
-                msg = f"[UnsupportedResume] loader stage kind={stage_factory.kind!r} index={index}"
-                raise UnsupportedResume(msg)
-            if stage_state.get("fingerprint") != stage.fingerprint():
-                msg = f"[ResumeStageMismatch] loader stage fingerprint does not match index={index}"
-                raise ResumeStateError(msg)
-            raw_stage_state = stage_state.get("state")
-            if not isinstance(raw_stage_state, dict):
-                msg = "[InvalidResumeState] loader stage.state must be a dict"
-                raise ResumeStateError(msg)
-            stage.load_state_dict(raw_stage_state)
+                raise ResumeStateError("[InvalidResumeState] loader stage state must be a dict")
+            stage.load_state_dict(stage_state)

@@ -6,7 +6,6 @@ from pathlib import Path
 
 from mvp_dataset.core.context import RuntimeContext
 from mvp_dataset.core.dataset import Dataset
-from mvp_dataset.core.resume import stable_fingerprint
 from mvp_dataset.core.types import ShardInput, SidecarSpec
 from mvp_dataset.utils.url import normalize_paths
 
@@ -81,10 +80,9 @@ class TarDataset(Dataset):
             resample=self._resample,
             sidecars=self._sidecar_specs,
             shuffle_mode=self._shuffle_mode,
-            source_fingerprint=stable_fingerprint(self._source_fingerprint()),
         )
 
-    def _source_fingerprint(self) -> dict[str, object]:
+    def _source_identity(self) -> dict[str, object]:
         """Return the source portion of the pipeline fingerprint."""
         return {
             "kind": "tar",

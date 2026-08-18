@@ -1,7 +1,15 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
+import subprocess
+import sys
+import textwrap
 from collections.abc import Callable
+from dataclasses import dataclass
+from functools import partial
+from pathlib import Path
 
 import pytest
 
@@ -11,8 +19,10 @@ from mvp_dataset import (
     RuntimeContext,
     TorchLoader,
     UnsupportedResume,
+    reset_logger,
+    set_logger,
 )
-from mvp_dataset.core.resume import RESUME_STATE_VERSION, callable_fingerprint
+from mvp_dataset.core.resume import RESUME_STATE_VERSION, check_identity, identity
 
 from .helpers import (
     build_records,
@@ -105,7 +115,7 @@ class _PairOutputAssembler:
             raise ResumeStateError("[InvalidResumeState] assembler pending must be a list")
         self.pending = [str(item) for item in pending]
 
-    def fingerprint(self) -> str:
+    def identity(self) -> str:
         return f"pair-output-assembler:{_ASSEMBLER_FINGERPRINT_VERSION}"
 
 
@@ -211,8 +221,8 @@ def _assert_dataset_resume_matches_continued(
     continued = _remaining(iterator)
     expected = _remaining(iter(build_dataset()))
 
-    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
-        resumed_dataset = build_dataset().load_state_dict(state)
+    resumed_dataset = build_dataset()
+    resumed_dataset.load_state_dict(state)
     resumed = _remaining(iter(resumed_dataset))
 
     assert consumed + continued == expected
@@ -247,8 +257,8 @@ def _assert_loader_resume_matches_continued(
     continued = _remaining(iterator)
     expected = _remaining(iter(build_loader()))
 
-    with pytest.warns(UserWarning, match="TorchLoader.load_state_dict"):
-        resumed_loader = build_loader().load_state_dict(state)
+    resumed_loader = build_loader()
+    resumed_loader.load_state_dict(state)
     resumed = _remaining(iter(resumed_loader))
 
     assert consumed + continued == expected
@@ -256,16 +266,162 @@ def _assert_loader_resume_matches_continued(
     return state
 
 
-def test_callable_fingerprint_includes_function_and_callable_class_code() -> None:
-    first_fn = callable_fingerprint(_add_marker)
-    second_fn = callable_fingerprint(_add_marker_v2)
-    first_callable = callable_fingerprint(_CallablePlusOne())
-    second_callable = callable_fingerprint(_CallablePlusTwo())
+def test_identity_includes_function_and_callable_class_code() -> None:
+    first_fn = identity(_add_marker)
+    second_fn = identity(_add_marker_v2)
+    first_callable = identity(_CallablePlusOne())
+    second_callable = identity(_CallablePlusTwo())
 
     assert first_fn != second_fn
     assert first_callable != second_callable
     assert first_fn["source_hash"] is not None
     assert first_callable["source_hash"] is not None
+
+
+class _AddressedHandler:
+    def __init__(self, pad: int) -> None:
+        self.pad = pad
+        self.live = object()
+
+
+class _StableHandler:
+    def __init__(self, pad: int) -> None:
+        self.pad = pad
+
+    def identity(self) -> str:
+        return f"handler:{self.pad}"
+
+
+@dataclass
+class _SampleSpec:
+    schema_handler: object
+
+
+def _from_row(row: object, *, sample_spec: _SampleSpec) -> object:
+    del sample_spec
+    return row
+
+
+class _ScalarCollator:
+    def __init__(self, pad_token_id: int, ignore_index: int = -100) -> None:
+        self.pad_token_id = pad_token_id
+        self.ignore_index = ignore_index
+
+    def __call__(self, batch: list[object]) -> list[object]:
+        return batch
+
+
+def test_identity_uses_nested_identity_not_repr() -> None:
+    first = identity(partial(_from_row, sample_spec=_SampleSpec(_StableHandler(1))))
+    second = identity(partial(_from_row, sample_spec=_SampleSpec(_StableHandler(1))))
+    changed = identity(partial(_from_row, sample_spec=_SampleSpec(_StableHandler(2))))
+
+    encoded = json.dumps(first)
+    assert first == second
+    assert first != changed
+    assert " at 0x" not in encoded
+    keywords = {item["key"]: item["value"] for item in first["keywords"]}
+    assert keywords["sample_spec"]["fields"]["schema_handler"]["id"] == "handler:1"
+
+
+def test_identity_rejects_address_bearing_nested_object() -> None:
+    fn = partial(_from_row, sample_spec=_SampleSpec(_AddressedHandler(1)))
+    with pytest.raises(ResumeStateError, match=r"\[UnstableResumeIdentity\]"):
+        identity(fn)
+
+
+def test_identity_typeerror_from_method_propagates() -> None:
+    class _Broken:
+        def identity(self) -> str:
+            raise TypeError("broken identity")
+
+    with pytest.raises(TypeError, match="broken identity"):
+        identity(_Broken())
+
+
+def test_check_identity_includes_both_values() -> None:
+    with pytest.raises(ResumeStateError, match=r"path=identity.seed expected=1 actual=2"):
+        check_identity({"seed": 1}, {"seed": 2})
+
+
+def test_identity_distinguishes_bound_methods() -> None:
+    class _Owner:
+        def __init__(self, value: int) -> None:
+            self.value = value
+
+        def method(self, sample: object) -> object:
+            return sample
+
+    assert identity(_Owner(1).method) != identity(_Owner(2).method)
+
+
+def test_identity_distinguishes_closures() -> None:
+    def make_fn(marker: int):
+        def fn(sample: object) -> object:
+            return {**sample, "marker": marker} if isinstance(sample, dict) else sample
+
+        return fn
+
+    assert identity(make_fn(1)) != identity(make_fn(2))
+
+
+def test_identity_rejects_non_scalar_mapping_keys() -> None:
+    with pytest.raises(ResumeStateError, match=r"\[UnstableResumeIdentity\]"):
+        identity({object(): 1})
+
+
+def test_identity_distinguishes_int_and_str_mapping_keys() -> None:
+    assert identity({1: "a"}) != identity({"1": "a"})
+
+
+def test_identity_includes_callable_instance_state() -> None:
+    assert identity(_ScalarCollator(0)) == identity(_ScalarCollator(0))
+    assert identity(_ScalarCollator(0)) != identity(_ScalarCollator(1))
+
+
+def test_identity_walks_dataclass_and_collections() -> None:
+    payload = identity({"flags": {"b", "a"}, "spec": _SampleSpec(_StableHandler(3))})
+    items = {item["key"]: item["value"] for item in payload["items"]}
+    assert items["flags"]["items"] == ["a", "b"]
+    assert items["spec"]["fields"]["schema_handler"]["id"] == "handler:3"
+
+
+def test_identity_partial_is_stable_across_hash_seeds() -> None:
+    script = textwrap.dedent(
+        """
+        from dataclasses import dataclass
+        from functools import partial
+        from mvp_dataset.core.resume import digest, identity
+
+        class Handler:
+            def __init__(self, pad: int) -> None:
+                self.pad = pad
+            def identity(self) -> str:
+                return f"handler:{self.pad}"
+
+        @dataclass
+        class Spec:
+            schema_handler: object
+
+        def from_row(row, *, sample_spec):
+            return row
+
+        print(digest(identity(partial(from_row, sample_spec=Spec(Handler(1))))))
+        """
+    )
+    env_base = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+    outputs = []
+    for seed in ("1", "2"):
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            env={**env_base, "PYTHONHASHSEED": seed},
+        )
+        outputs.append(result.stdout.strip())
+    assert outputs[0]
+    assert outputs[0] == outputs[1]
 
 
 def test_load_state_dict_rejects_unknown_schema_version(tmp_path) -> None:
@@ -275,39 +431,80 @@ def test_load_state_dict_rejects_unknown_schema_version(tmp_path) -> None:
         dataset.load_state_dict({"version": RESUME_STATE_VERSION + 1})
 
 
-def test_load_state_dict_rejects_runtime_fingerprint_mismatch(tmp_path) -> None:
+def test_load_state_dict_rejects_runtime_identity_mismatch(tmp_path) -> None:
     build_dataset = _source_factory(tmp_path, "jsonl", seed=1)
     state = iter(build_dataset()).state_dict()
     changed_runtime = _source_factory(tmp_path, "jsonl", seed=2)()
 
-    with pytest.raises(ResumeStateError, match=r"\[ResumeRuntimeMismatch\]"):
+    with pytest.raises(ResumeStateError, match=r"\[ResumeIdentityMismatch\]"):
         changed_runtime.load_state_dict(state)
 
 
-def test_load_state_dict_rejects_pipeline_fingerprint_mismatch(tmp_path) -> None:
+def test_load_state_dict_rejects_pipeline_identity_mismatch(tmp_path) -> None:
     build_dataset = _source_factory(tmp_path, "jsonl")
     state = iter(_full_dataset_pipeline(build_dataset())).state_dict()
     changed_pipeline = build_dataset().map(_add_marker).select(["id", "marker"]).shuffle(buffer_size=4)
 
-    with pytest.raises(ResumeStateError, match=r"\[ResumePipelineMismatch\]"):
+    with pytest.raises(ResumeStateError, match=r"\[ResumeIdentityMismatch\]"):
         changed_pipeline.load_state_dict(state)
 
 
-def test_load_state_dict_attaches_validated_state_to_new_dataset(tmp_path) -> None:
+def test_load_state_dict_stages_pending_on_same_dataset(tmp_path) -> None:
     dataset = _source_factory(tmp_path, "jsonl")()
     state = iter(dataset).state_dict()
-
-    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
-        resumed = dataset.load_state_dict(state)
-
-    assert resumed is not dataset
-    assert resumed._resume_state == state
-    assert dataset._resume_state is None
+    dataset.load_state_dict(state)
+    assert dataset._pending_state == state["state"]
 
 
-def test_runtime_context_fingerprint_is_stable_and_seed_sensitive() -> None:
-    assert RuntimeContext(seed=1).fingerprint() == RuntimeContext(seed=1).fingerprint()
-    assert RuntimeContext(seed=1).fingerprint() != RuntimeContext(seed=2).fingerprint()
+def test_pending_state_is_consumed_once(tmp_path) -> None:
+    build_dataset = _source_factory(tmp_path, "jsonl")
+    iterator = iter(build_dataset())
+    _consume(iterator, 3)
+    state = iterator.state_dict()
+    continued = _remaining(iterator)
+
+    resumed = build_dataset()
+    resumed.load_state_dict(state)
+    first = _remaining(iter(resumed))
+    second = _remaining(iter(resumed))
+
+    assert first == continued
+    assert second == _remaining(iter(build_dataset()))
+
+
+def test_dataset_iterator_load_accepts_own_envelope(tmp_path) -> None:
+    build_dataset = _source_factory(tmp_path, "jsonl")
+    iterator = iter(build_dataset())
+    _consume(iterator, 2)
+    blob = iterator.state_dict()
+    continued = _remaining(iterator)
+
+    resumed_iter = iter(build_dataset())
+    resumed_iter.load_state_dict(blob)
+    assert _remaining(resumed_iter) == continued
+
+
+def test_live_state_does_not_embed_identity(tmp_path) -> None:
+    iterator = iter(_source_factory(tmp_path, "jsonl")())
+    live = iterator.live_state()
+    assert "identity" not in live
+    assert "version" not in live
+
+
+def test_exhausted_iterator_checkpoint_has_null_state(tmp_path) -> None:
+    build_dataset = _source_factory(tmp_path, "jsonl")
+    iterator = iter(build_dataset())
+    _remaining(iterator)
+    blob = iterator.state_dict()
+    assert blob["state"] is None
+    resumed = build_dataset()
+    resumed.load_state_dict(blob)
+    assert _remaining(iter(resumed)) == _remaining(iter(build_dataset()))
+
+
+def test_runtime_context_identity_is_stable_and_seed_sensitive() -> None:
+    assert RuntimeContext(seed=1).identity() == RuntimeContext(seed=1).identity()
+    assert RuntimeContext(seed=1).identity() != RuntimeContext(seed=2).identity()
 
 
 @pytest.mark.parametrize("total_rows", [1, 2, 7, 8, 100])
@@ -337,7 +534,14 @@ def test_dataset_resume_full_pipeline_matches_continued_stream(tmp_path, source:
 
     state = _assert_dataset_resume_matches_continued(lambda: _full_dataset_pipeline(build_source()), checkpoint_after=1)
 
-    assert [stage["kind"] for stage in state["stages"]] == ["map", "select", "shuffle", "batch", "unbatch", "assemble"]
+    assert [stage["kind"] for stage in state["identity"]["stages"]] == [
+        "map",
+        "select",
+        "shuffle",
+        "batch",
+        "unbatch",
+        "assemble",
+    ]
 
 
 @pytest.mark.parametrize("checkpoint_after", [0, 9])
@@ -353,7 +557,7 @@ def test_dataset_resume_full_pipeline_with_distributed_context(tmp_path, rank: i
 
     state = _assert_dataset_resume_matches_continued(lambda: _full_dataset_pipeline(build_source()), checkpoint_after=1)
 
-    assert state["runtime_fingerprint"] == _full_dataset_pipeline(build_source()).context.fingerprint()
+    assert state["identity"]["runtime"] == _full_dataset_pipeline(build_source()).context.identity()
 
 
 @pytest.mark.parametrize(
@@ -380,11 +584,11 @@ def test_source_resume_supports_resample_across_rounds(tmp_path, source: str, la
     state = iterator.state_dict()
     continued = _consume(iterator, 6)
 
-    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
-        resumed_dataset = build_source().load_state_dict(state)
+    resumed_dataset = build_source()
+    resumed_dataset.load_state_dict(state)
     resumed = _consume(iter(resumed_dataset), 6)
 
-    assert state["source"]["state"]["round_index"] >= 1
+    assert state["state"]["source"]["round_index"] >= 1
     assert resumed == continued
 
 
@@ -471,8 +675,8 @@ def test_lance_shuffle_resume_with_and_without_resolve_ref(
     observed_image_refs = {sample["image_ref"] for sample in _remaining(iter(build_dataset()))}
 
     assert observed_image_refs == expected_image_refs
-    assert state["source"]["state"]["shuffle_mode"] == shuffle_mode
-    assert [stage["kind"] for stage in state["stages"]] == (["assemble"] if resolve_ref else [])
+    assert state["identity"]["source"]["shuffle_mode"] == shuffle_mode
+    assert [stage["kind"] for stage in state["identity"]["stages"]] == (["assemble"] if resolve_ref else [])
 
 
 @pytest.mark.parametrize("shuffle_mode", ["none", "global", "chunk"])
@@ -497,31 +701,78 @@ def test_lance_non_global_shuffle_do_not_materialize_full_round_order(tmp_path, 
     assert not hasattr(iterator.source, "_index_order_round")
 
 
-def test_resume_rejects_source_fingerprint_mismatch(tmp_path) -> None:
+def test_resume_rejects_source_identity_mismatch(tmp_path) -> None:
+    build_dataset = _source_factory(tmp_path, "jsonl")
+    state = build_dataset().state_dict()
+    state["identity"]["source"]["source_fingerprint"] = "changed"
+    resumed_dataset = build_dataset()
+    with pytest.raises(ResumeStateError, match=r"\[ResumeIdentityMismatch\]"):
+        resumed_dataset.load_state_dict(state)
+
+
+def test_dataset_state_dict_without_live_iterator_replays_from_start(tmp_path) -> None:
+    build_dataset = _source_factory(tmp_path, "jsonl")
+    state = build_dataset().state_dict()
+    resumed_dataset = build_dataset()
+    resumed_dataset.load_state_dict(state)
+
+    assert state["state"] is None
+    assert _remaining(iter(resumed_dataset)) == _remaining(iter(build_dataset()))
+
+
+def test_handle_state_dict_saves_active_iterator(tmp_path) -> None:
     build_dataset = _source_factory(tmp_path, "jsonl")
     dataset = build_dataset()
-    with pytest.warns(UserWarning, match="Dataset.state_dict"):
-        state = dataset.state_dict()
-    state["source"]["fingerprint"] = "changed"
+    iterator = iter(dataset)
+    consumed = _consume(iterator, 3)
+    state = dataset.state_dict()
+    continued = _remaining(iterator)
 
-    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
-        resumed_dataset = build_dataset().load_state_dict(state)
+    assert state["state"] is not None
+    resumed = build_dataset()
+    resumed.load_state_dict(state)
+    assert _remaining(iter(resumed)) == continued
+    assert consumed + continued == _remaining(iter(build_dataset()))
 
-    with pytest.raises(ResumeStateError, match=r"\[ResumeSourceMismatch\]"):
-        list(resumed_dataset)
+
+def test_handle_state_dict_is_fresh_after_iterator_exhausts(tmp_path) -> None:
+    dataset = _source_factory(tmp_path, "jsonl")()
+    _remaining(iter(dataset))
+    assert dataset.state_dict()["state"] is None
 
 
-def test_dataset_state_dict_returns_initial_iterator_state(tmp_path) -> None:
-    build_dataset = _source_factory(tmp_path, "jsonl")
+class _ListLogger:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
 
-    with pytest.warns(UserWarning, match="Dataset.state_dict"):
-        state = build_dataset().state_dict()
-    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
-        resumed_dataset = build_dataset().load_state_dict(state)
+    def debug(self, msg: object, *args: object, **kwargs: object) -> None:
+        return None
 
-    assert state["num_yielded"] == 0
-    assert state["source"]["state"]
-    assert _remaining(iter(resumed_dataset)) == _remaining(iter(build_dataset()))
+    def info(self, msg: object, *args: object, **kwargs: object) -> None:
+        return None
+
+    def warning(self, msg: object, *args: object, **kwargs: object) -> None:
+        self.messages.append(str(msg))
+
+    def error(self, msg: object, *args: object, **kwargs: object) -> None:
+        return None
+
+
+def test_iter_warns_only_while_previous_iterator_is_active(tmp_path) -> None:
+    logger = _ListLogger()
+    set_logger(logger)
+    try:
+        dataset = _source_factory(tmp_path, "jsonl")()
+        first = iter(dataset)
+        second = iter(dataset)
+        assert any("previous iterator is still active" in message for message in logger.messages)
+        _remaining(first)
+        _remaining(second)
+        logger.messages.clear()
+        iter(dataset)
+        assert not any("previous iterator is still active" in message for message in logger.messages)
+    finally:
+        reset_logger()
 
 
 def test_iterators_can_checkpoint_independently(tmp_path) -> None:
@@ -538,10 +789,12 @@ def test_iterators_can_checkpoint_independently(tmp_path) -> None:
     second_continued = _remaining(second_iterator)
     expected = _remaining(iter(build_dataset()))
 
-    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
-        first_resumed = _remaining(iter(build_dataset().load_state_dict(first_state)))
-    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
-        second_resumed = _remaining(iter(build_dataset().load_state_dict(second_state)))
+    first_handle = build_dataset()
+    first_handle.load_state_dict(first_state)
+    first_resumed = _remaining(iter(first_handle))
+    second_handle = build_dataset()
+    second_handle.load_state_dict(second_state)
+    second_resumed = _remaining(iter(second_handle))
 
     assert first_consumed + first_continued == expected
     assert second_consumed + second_continued == expected
@@ -567,8 +820,9 @@ def test_assemble_rejects_assembler_fingerprint_change(tmp_path) -> None:
 
     _ASSEMBLER_FINGERPRINT_VERSION = "v2"
     try:
-        with pytest.raises(ResumeStateError, match=r"\[ResumePipelineMismatch\]"):
-            build_source().assemble(_build_pair_output_assembler).load_state_dict(state)
+        changed = build_source().assemble(_build_pair_output_assembler)
+        with pytest.raises(ResumeStateError, match=r"\[ResumeIdentityMismatch\]"):
+            changed.load_state_dict(state)
     finally:
         _ASSEMBLER_FINGERPRINT_VERSION = "v1"
 
@@ -592,7 +846,13 @@ def test_torch_loader_resume_full_pipeline_matches_continued_stream(tmp_path, nu
 
     state = _assert_loader_resume_matches_continued(build_loader, checkpoint_after=1)
 
-    assert [stage["kind"] for stage in state["stages"]] == ["unbatch", "shuffle", "batch", "unbatch", "assemble"]
+    assert [stage["kind"] for stage in state["identity"]["loader"]["stages"]] == [
+        "unbatch",
+        "shuffle",
+        "batch",
+        "unbatch",
+        "assemble",
+    ]
 
 
 @pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
@@ -603,22 +863,19 @@ def test_torch_loader_state_dict_is_initial_not_active_iterator_state(tmp_path) 
 
     next(iterator)
     iterator_state = iterator.state_dict()
-    with pytest.warns(UserWarning, match="TorchLoader.state_dict"):
-        loader_state = loader.state_dict()
+    loader_state = loader.state_dict()
 
-    assert iterator_state["num_yielded"] == 1
-    assert loader_state["num_yielded"] == 0
-    assert loader_state["workers"] == {}
+    assert iterator_state["state"]["num_yielded"] == 1
+    assert loader_state["state"] is None
 
 
 @pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
 def test_torch_loader_resume_rejects_loader_config_change(tmp_path) -> None:
     build_dataset = _source_factory(tmp_path, "jsonl", seed=47)
-    with pytest.warns(UserWarning, match="TorchLoader.state_dict"):
-        state = _resume_torch_loader(build_dataset(), num_workers=0, batch_size=2).state_dict()
+    state = _resume_torch_loader(build_dataset(), num_workers=0, batch_size=2).state_dict()
     changed_loader = _resume_torch_loader(build_dataset(), num_workers=0, batch_size=3)
 
-    with pytest.raises(ResumeStateError, match=r"\[ResumeLoaderMismatch\]"):
+    with pytest.raises(ResumeStateError, match=r"\[ResumeIdentityMismatch\]"):
         changed_loader.load_state_dict(state)
 
 
@@ -628,7 +885,9 @@ def test_torch_loader_plain_iterable_iteration_does_not_support_resume_state() -
 
     iterator = iter(TorchLoader([1, 2, 3], num_workers=0))
     assert next(iterator) == 1
-    with pytest.raises(UnsupportedResume, match=r"\[UnsupportedResume\] TorchLoader dataset iterator"):
+    with pytest.raises(
+        UnsupportedResume, match=r"\[UnsupportedResume\] TorchLoader dataset does not implement identity"
+    ):
         iterator.state_dict()
 
 

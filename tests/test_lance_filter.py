@@ -178,9 +178,10 @@ def test_lance_filter_split_sample_and_resume(tmp_path, monkeypatch) -> None:
     iterator = iter(left)
     consumed = [int(next(iterator)["value"]) for _ in range(4)]
     state = iterator.state_dict()
-    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
-        resumed = left.load_state_dict(state)
-    assert consumed + _values(resumed) == _values(left)
+    left.load_state_dict(state)
+    remainder = _values(left)
+    fresh, _ = dataset.split([2, 1])
+    assert consumed + remainder == _values(fresh)
 
 
 def test_lance_filter_preserves_multi_source_global_indexes(tmp_path, monkeypatch) -> None:

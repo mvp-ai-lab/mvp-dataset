@@ -9,7 +9,7 @@ The core abstraction is `Dataset`: an immutable configuration object that become
 - Keep dataset construction declarative and immutable.
 - Make distributed sharding deterministic and inspectable.
 - Keep source readers local and format-specific.
-- Make resume compatibility explicit through runtime and pipeline fingerprints.
+- Make resume compatibility explicit through pipeline identity and live iterator state.
 - Preserve PyTorch interoperability without requiring PyTorch for core dataset usage.
 
 ## Main Concepts

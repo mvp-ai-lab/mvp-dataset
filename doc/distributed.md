@@ -48,4 +48,4 @@ For finite datasets, each slot receives its assigned portion. With `resample=Tru
 
 ## Seeds
 
-`RuntimeContext.seed` feeds deterministic source and stage shuffle behavior. Changing the seed changes fingerprints and shuffle order, and incompatible resume states are rejected.
+`RuntimeContext.seed` feeds deterministic source and stage shuffle behavior. Changing the seed changes identity and shuffle order, and incompatible resume states are rejected.

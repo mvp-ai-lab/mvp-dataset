@@ -230,16 +230,16 @@ for sample in dataset:
     consume(sample)
 ```
 
-Each `iter(dataset)` call creates a fresh `DatasetIterator`. A second iterator starts from the beginning unless the dataset was created with `load_state_dict(...)`.
+Each `iter(dataset)` call creates a fresh `DatasetIterator`. A second iterator starts from the beginning unless pending live state was staged with `load_state_dict(...)`.
 
 ## State APIs
 
 ```python
 it = iter(dataset)
 state = it.state_dict()
-resumed = Dataset.from_source("tar", shards).load_state_dict(state)
+resumed = Dataset.from_source("tar", shards)
+resumed.load_state_dict(state)
 ```
 
-- Use `iterator.state_dict()` for active checkpoints.
-- `Dataset.state_dict()` creates a fresh initial iterator state and emits a warning.
-- `Dataset.load_state_dict(state)` validates runtime and pipeline fingerprints and returns a new dataset with pending resume state.
+- `Dataset.state_dict()` saves the last `iter()` if it is still active; otherwise `state` is `None`.
+- `Dataset.load_state_dict(blob)` compares identity in place and stages pending live state for the next `iter(...)` only.

@@ -5,7 +5,6 @@ from dataclasses import dataclass
 
 from mvp_dataset.core.context import RuntimeContext
 from mvp_dataset.core.dataset import Dataset
-from mvp_dataset.core.resume import stable_fingerprint
 from mvp_dataset.core.types import ShardInput, TarUriRefFieldSpec
 from mvp_dataset.utils.url import normalize_paths
 
@@ -20,7 +19,7 @@ class JsonlDataset(Dataset):
 
     _ref_fields: tuple[TarUriRefFieldSpec, ...] = ()
     _shuffle_mode: JsonlShuffleMode = "shard_aware"
-    _source_identity: str = ""
+    _source_digest: str = ""
 
     @classmethod
     def from_source(
@@ -66,7 +65,7 @@ class JsonlDataset(Dataset):
             _stages=(),
             _ref_fields=ref_fields_tuple,
             _shuffle_mode=shuffle_mode,
-            _source_identity=source_plan.source.value,
+            _source_digest=source_plan.source.value,
         )
 
     def _build_source_stream(self, *, context: RuntimeContext) -> Iterable[object]:
@@ -77,18 +76,17 @@ class JsonlDataset(Dataset):
             resample=self._resample,
             shuffle_mode=self._shuffle_mode,
             ref_fields=self._ref_fields,
-            source_identity=self._source_identity,
-            source_fingerprint=stable_fingerprint(self._source_fingerprint()),
+            source_identity=self._source_digest,
         )
 
-    def _source_fingerprint(self) -> dict[str, object]:
-        """Return the source portion of the pipeline fingerprint."""
+    def _source_identity(self) -> dict[str, object]:
+        """Return the source portion of the pipeline identity."""
         return {
             "kind": "jsonl",
             "resample": self._resample,
             "shuffle_mode": self._shuffle_mode,
             "ref_fields": [(field, str(base_dir)) for field, base_dir in self._ref_fields],
-            "source_fingerprint": self._source_identity,
+            "source_fingerprint": self._source_digest,
             "split_format_version": JSONL_SPLIT_FORMAT_VERSION,
             "shards": [
                 {

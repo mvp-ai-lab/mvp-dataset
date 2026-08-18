@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 
-from ..resume import ResumeStateError, stable_fingerprint
+from ..resume import ResumeStateError
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,9 +16,9 @@ class _UnbatchStage:
         """Apply this callable object."""
         return _UnbatchStageIterator(upstream=data)
 
-    def fingerprint(self) -> str:
-        """Return a stable fingerprint for resume compatibility checks."""
-        return stable_fingerprint({"kind": "unbatch"})
+    def identity(self) -> dict[str, object]:
+        """Return a process-stable identity for this stage."""
+        return {"kind": "unbatch"}
 
 
 class _UnbatchStageIterator:
@@ -50,10 +50,6 @@ class _UnbatchStageIterator:
             msg = "[InvalidResumeState] unbatch stage pending must be a list"
             raise ResumeStateError(msg)
         self.pending = list(pending)
-
-    def fingerprint(self) -> str:
-        """Return a stable fingerprint for resume compatibility checks."""
-        return stable_fingerprint({"kind": "unbatch"})
 
     def _expand_batch(self, batch: object) -> list[object]:
         """Expand one batch object into a list of samples."""

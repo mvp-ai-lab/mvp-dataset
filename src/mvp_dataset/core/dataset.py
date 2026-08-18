@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 
 from .context import RuntimeContext
 from .iterator import DatasetIterator
-from .resume import RESUME_STATE_VERSION, ResumeStateError, stable_fingerprint
+from .resume import (
+    check_identity,
+    checkpoint_from_active_iter,
+    parse_checkpoint,
+    warn_if_iterator_replaced,
+)
 from .stages import (
     _AssembleStage,
     _BatchStage,
@@ -38,7 +42,8 @@ class Dataset(TorchIterableDataset):
     _source: object
     _stages: tuple[StageSpec, ...]
     _resample: bool
-    _resume_state: dict[str, object] | None = None
+    _pending_state: object | None = None
+    _active_iter: object | None = None
 
     def _build_source_stream(self, *, context: RuntimeContext) -> Iterable[object]:
         """Build the source iterator for a runtime context."""
@@ -47,100 +52,46 @@ class Dataset(TorchIterableDataset):
 
     def _append_stage(self, spec: StageSpec) -> Dataset:
         """Return a new dataset with one additional stage."""
-        return dataclass_replace(self, _stages=self._stages + (spec,), _resume_state=None)
+        return dataclass_replace(self, _stages=self._stages + (spec,), _pending_state=None, _active_iter=None)
 
-    def _source_fingerprint(self) -> dict[str, object]:
-        """Return the source portion of the pipeline fingerprint."""
-        msg = f"[UnsupportedSourceKind] source kind {self._source_kind!r} does not implement fingerprinting"
-        raise NotImplementedError(msg)
+    def _source_identity(self) -> dict[str, object]:
+        """Return the source portion of the pipeline identity."""
+        raise NotImplementedError(
+            f"[UnsupportedSourceKind] source kind {self._source_kind!r} does not implement identity"
+        )
 
-    def _stages_fingerprint(self) -> list[dict[str, object]]:
-        """Return the stage portion of the pipeline fingerprint."""
-        result: list[dict[str, object]] = []
-        for spec in self._stages:
-            fingerprint = getattr(spec.apply, "fingerprint", None)
-            if callable(fingerprint):
-                result.append({"kind": spec.kind, "fingerprint": fingerprint()})
-            else:
-                result.append(
-                    {
-                        "kind": spec.kind,
-                        "apply_class": f"{spec.apply.__class__.__module__}.{spec.apply.__class__.__qualname__}",
-                        "apply_config": repr(spec.apply),
-                    }
-                )
-        return result
-
-    def _pipeline_fingerprint(self) -> str:
-        """Return the combined source and stage fingerprint."""
-        payload = {
-            "source": self._source_fingerprint(),
-            "stages": self._stages_fingerprint(),
+    def identity(self) -> dict[str, object]:
+        """Return the process-stable identity of this pipeline configuration."""
+        return {
+            "runtime": self.context.identity(),
+            "source": self._source_identity(),
+            "stages": [spec.apply.identity() for spec in self._stages],
+            "loader": None,
         }
-        return stable_fingerprint(payload)
 
     def state_dict(self) -> dict[str, object]:
-        """Return the resumable state for future pipeline outputs.
+        """Return identity plus the active iterator's live state, if any."""
+        return checkpoint_from_active_iter(self.identity(), self._active_iter)
 
-        Returns:
-            A dictionary that can be passed to load_state_dict()."""
-        warnings.warn(
-            "Dataset.state_dict() creates a fresh initial iterator state. "
-            "Use iterator.state_dict() to checkpoint an in-progress iteration.",
-            UserWarning,
-            stacklevel=2,
-        )
-        return DatasetIterator(self).state_dict()
+    def load_state_dict(self, blob: dict[str, object]) -> None:
+        """Validate identity and stage pending live state on this dataset."""
+        expected_identity, state = parse_checkpoint(blob)
+        check_identity(expected_identity, self.identity())
+        object.__setattr__(self, "_pending_state", state)
 
-    def load_state_dict(self, state: dict[str, object]) -> Dataset:
-        """Return a dataset with validated resume state attached.
+    def load_live_state(self, state: object) -> None:
+        """Stage inner live state without an identity check."""
+        object.__setattr__(self, "_pending_state", state)
 
-        Args:
-            state: Resume state dictionary to validate and load.
+    def _peek_pending_state(self) -> object | None:
+        """Return pending live state without consuming it."""
+        return self._pending_state
 
-        Returns:
-            None."""
-
-        if not isinstance(state, dict):
-            msg = "[InvalidResumeState] state must be a dict"
-            raise ResumeStateError(msg)
-        version = state.get("version")
-        if version != RESUME_STATE_VERSION:
-            msg = f"[InvalidResumeStateVersion] expected={RESUME_STATE_VERSION} got={version!r}"
-            raise ResumeStateError(msg)
-
-        runtime_fingerprint = state.get("runtime_fingerprint")
-        if not isinstance(runtime_fingerprint, str):
-            msg = "[InvalidResumeState] runtime_fingerprint must be a string"
-            raise ResumeStateError(msg)
-        if runtime_fingerprint != self.context.fingerprint():
-            msg = "[ResumeRuntimeMismatch] runtime fingerprint does not match"
-            raise ResumeStateError(msg)
-
-        pipeline_fingerprint = state.get("pipeline_fingerprint")
-        if not isinstance(pipeline_fingerprint, str):
-            msg = "[InvalidResumeState] pipeline_fingerprint must be a string"
-            raise ResumeStateError(msg)
-        if pipeline_fingerprint != self._pipeline_fingerprint():
-            msg = "[ResumePipelineMismatch] pipeline fingerprint does not match"
-            raise ResumeStateError(msg)
-
-        source = state.get("source")
-        if not isinstance(source, dict):
-            msg = "[InvalidResumeState] source must be a dict"
-            raise ResumeStateError(msg)
-        stages = state.get("stages")
-        if not isinstance(stages, list):
-            msg = "[InvalidResumeState] stages must be a list"
-            raise ResumeStateError(msg)
-
-        warnings.warn(
-            "Dataset.load_state_dict() stores pending resume state. "
-            "The source cursor is restored when iter(dataset) creates a DatasetIterator.",
-            UserWarning,
-            stacklevel=2,
-        )
-        return dataclass_replace(self, _resume_state=state)
+    def _take_pending_state(self) -> object | None:
+        """Return and clear pending live state."""
+        pending = self._pending_state
+        object.__setattr__(self, "_pending_state", None)
+        return pending
 
     def map(self, fn: Callable[[object], object]) -> Dataset:
         """Append a lazy map stage.
@@ -336,7 +287,10 @@ class Dataset(TorchIterableDataset):
 
     def __iter__(self) -> Iterator[object]:
         """Materialize and run the full lazy pipeline."""
-        return DatasetIterator(self)
+        warn_if_iterator_replaced(self._active_iter)
+        iterator = DatasetIterator(self)
+        object.__setattr__(self, "_active_iter", iterator)
+        return iterator
 
     @classmethod
     def from_source(cls, source_kind: SourceKind, *args, **kwargs) -> Dataset:

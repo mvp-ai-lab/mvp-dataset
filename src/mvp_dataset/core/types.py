@@ -139,11 +139,8 @@ class StatefulAssembler(Protocol):
             None."""
         ...
 
-    def fingerprint(self) -> str:
-        """Return a stable fingerprint for resume compatibility checks.
-
-        Returns:
-            A stable fingerprint string."""
+    def identity(self) -> object:
+        """Return a process-stable identity for this assembler configuration."""
         ...
 
 

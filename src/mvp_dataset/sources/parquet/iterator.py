@@ -23,7 +23,6 @@ class _ParquetSourceIterator:
     resample: bool
     columns: Sequence[str] | None
     use_threads: bool
-    source_fingerprint: str
     shuffle_mode: ParquetShuffleMode = "chunk_aware"
     round_index: int = 0
     chunk_index: int = 0
@@ -77,7 +76,6 @@ class _ParquetSourceIterator:
         """Return the resumable state for this object."""
         return {
             "kind": "parquet",
-            "shuffle_mode": self.shuffle_mode,
             "round_index": self.round_index,
             "chunk_index": self.chunk_index,
             "row_group_index": self.row_group_index,
@@ -87,11 +85,7 @@ class _ParquetSourceIterator:
     def load_state_dict(self, state: dict[str, object]) -> None:
         """Restore this object from a resumable state dictionary."""
         if state.get("kind") != "parquet":
-            msg = f"[InvalidResumeState] expected source kind='parquet', got={state.get('kind')!r}"
-            raise ResumeStateError(msg)
-        if state.get("shuffle_mode") != self.shuffle_mode:
-            msg = "[InvalidResumeState] shuffle_mode does not match"
-            raise ResumeStateError(msg)
+            raise ResumeStateError(f"[InvalidResumeState] expected source kind='parquet', got={state.get('kind')!r}")
         round_index = state.get("round_index")
         if not isinstance(round_index, int) or round_index < 0:
             msg = "[InvalidResumeState] round_index must be a non-negative integer"
@@ -142,10 +136,6 @@ class _ParquetSourceIterator:
         self.row_group_index = row_group_index
         self.row_in_row_group = row_in_row_group
         self._row_group_iter = None
-
-    def fingerprint(self) -> str:
-        """Return a stable fingerprint for resume compatibility checks."""
-        return self.source_fingerprint
 
     def _current_chunk(self) -> ParquetChunk | None:
         """Return the currently active Parquet chunk."""

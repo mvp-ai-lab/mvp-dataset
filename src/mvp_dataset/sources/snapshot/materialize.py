@@ -83,7 +83,7 @@ def snapshot_lance_paths(entry: CacheEntry) -> tuple[Path, ...]:
 
 def validate_finite_pipeline(dataset: Dataset) -> None:
     """Reject known infinite pipelines before snapshot construction."""
-    if dataset._resume_state is not None:
+    if dataset._pending_state is not None:
         msg = "[SnapshotResumeUnsupported] snapshot() cannot materialize a pipeline with pending resume state"
         raise ValueError(msg)
     if dataset._resample:

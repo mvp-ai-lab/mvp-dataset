@@ -29,7 +29,6 @@ class _LanceSourceIterator:
     resample: bool
     columns: Sequence[str] | None
     read_batch_size: int
-    source_fingerprint: str
     shuffle_mode: LanceShuffleMode = "none"
     chunk_config: ChunkShuffleConfig | None = None
     selection: LanceSelection | None = None
@@ -81,10 +80,6 @@ class _LanceSourceIterator:
         """Return the resumable state for this source iterator."""
         return {
             "kind": "lance",
-            "shuffle_mode": self.shuffle_mode,
-            "chunk_shuffle_chunk_size": self._chunk_size,
-            "chunk_shuffle_k": self._chunk_k,
-            "chunk_row_order": self._chunk_row_order,
             "round_index": self.round_index,
             "position_in_round": self.position_in_round,
         }
@@ -92,22 +87,7 @@ class _LanceSourceIterator:
     def load_state_dict(self, state: dict[str, object]) -> None:
         """Restore this iterator from a resumable state dictionary."""
         if state.get("kind") != "lance":
-            msg = f"[InvalidResumeState] expected source kind='lance', got={state.get('kind')!r}"
-            raise ResumeStateError(msg)
-        if state.get("shuffle_mode") != self.shuffle_mode:
-            msg = "[InvalidResumeState] shuffle_mode does not match"
-            raise ResumeStateError(msg)
-        if self.shuffle_mode == "chunk":
-            if state.get("chunk_shuffle_chunk_size") != self._chunk_size:
-                msg = "[InvalidResumeState] chunk_shuffle_chunk_size does not match"
-                raise ResumeStateError(msg)
-            if state.get("chunk_shuffle_k") != self._chunk_k:
-                msg = "[InvalidResumeState] chunk_shuffle_k does not match"
-                raise ResumeStateError(msg)
-            if state.get("chunk_row_order") != self._chunk_row_order:
-                msg = "[InvalidResumeState] chunk_row_order does not match"
-                raise ResumeStateError(msg)
-
+            raise ResumeStateError(f"[InvalidResumeState] expected source kind='lance', got={state.get('kind')!r}")
         round_index = state.get("round_index")
         if not isinstance(round_index, int) or round_index < 0:
             msg = "[InvalidResumeState] round_index must be a non-negative integer"
@@ -128,10 +108,6 @@ class _LanceSourceIterator:
         self.position_in_round = position_in_round
         self._pending_samples.clear()
         self._pending_positions.clear()
-
-    def fingerprint(self) -> str:
-        """Return a stable fingerprint for resume compatibility checks."""
-        return self.source_fingerprint
 
     @property
     def _chunk_size(self) -> int | None:

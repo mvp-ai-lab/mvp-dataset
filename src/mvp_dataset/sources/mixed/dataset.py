@@ -7,7 +7,6 @@ from dataclasses import dataclass
 
 from mvp_dataset.core.context import RuntimeContext
 from mvp_dataset.core.dataset import Dataset
-from mvp_dataset.core.resume import stable_fingerprint
 
 from .iterator import _MixedSourceIterator
 from .types import MixedSourceSpec, MixedStrategy
@@ -72,10 +71,9 @@ class MixedDataset(Dataset):
             sources=self._source,
             context=context,
             strategy=self._strategy,
-            source_fingerprint=stable_fingerprint(self._source_fingerprint()),
         )
 
-    def _source_fingerprint(self) -> dict[str, object]:
+    def _source_identity(self) -> dict[str, object]:
         """Return the source portion of the pipeline fingerprint."""
         return {
             "kind": "mixed",
@@ -84,8 +82,7 @@ class MixedDataset(Dataset):
                 {
                     "name": source.name,
                     "weight": source.weight,
-                    "runtime": source.dataset.context.fingerprint(),
-                    "pipeline": source.dataset._pipeline_fingerprint(),
+                    "pipeline": source.dataset.identity(),
                 }
                 for source in self._source
             ],
@@ -126,8 +123,8 @@ def _normalize_sources(
 
 
 def _validate_contexts(sources: tuple[MixedSourceSpec, ...], context: RuntimeContext) -> None:
-    context_fingerprint = context.fingerprint()
+    context_identity = context.identity()
     for source in sources:
-        if source.dataset.context.fingerprint() != context_fingerprint:
+        if source.dataset.context.identity() != context_identity:
             msg = f"[MixedSourceContextMismatch] source={source.name!r} context does not match mixed context"
             raise ValueError(msg)

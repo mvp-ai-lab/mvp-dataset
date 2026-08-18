@@ -7,7 +7,7 @@ from dataclasses import replace as dataclass_replace
 
 from mvp_dataset.core.context import RuntimeContext
 from mvp_dataset.core.dataset import Dataset
-from mvp_dataset.core.resume import stable_fingerprint
+from mvp_dataset.core.resume import digest
 from mvp_dataset.core.stages import _AssembleStage
 from mvp_dataset.core.subset import split_offsets
 from mvp_dataset.core.types import ShardInput, StageSpec
@@ -128,14 +128,13 @@ class LanceDataset(Dataset):
             resample=self._resample,
             columns=self._columns,
             read_batch_size=self._read_batch_size,
-            source_fingerprint=stable_fingerprint(self._source_fingerprint()),
             shuffle_mode=self._shuffle_mode,
             chunk_config=self._chunk_shuffle,
             selection=self._selection,
             filter_index=filter_index,
         )
 
-    def _source_fingerprint(self) -> dict[str, object]:
+    def _source_identity(self) -> dict[str, object]:
         """Return the source portion of the pipeline fingerprint."""
         source = self._source[0]
         return {
@@ -144,7 +143,7 @@ class LanceDataset(Dataset):
             "shuffle_mode": self._shuffle_mode,
             "chunk_shuffle": self._chunk_shuffle_fingerprint(),
             "selection": self._selection_fingerprint(),
-            "filter": stable_fingerprint(self._filter_predicate_groups) if self._filter_predicate_groups else None,
+            "filter": digest(self._filter_predicate_groups) if self._filter_predicate_groups else None,
             "iter": {
                 "columns": list(self._columns) if self._columns else None,
                 "read_batch_size": self._read_batch_size,
@@ -246,7 +245,7 @@ class LanceDataset(Dataset):
         return dataclass_replace(
             self,
             _filter_predicate_groups=groups + (group,),
-            _resume_state=None,
+            _pending_state=None,
         )
 
     def _active_row_count(self) -> int:
@@ -286,7 +285,7 @@ class LanceDataset(Dataset):
                     count=offsets[index + 1] - offsets[index],
                     total=total,
                 ),
-                _resume_state=None,
+                _pending_state=None,
             )
             for index in range(len(offsets) - 1)
         )
@@ -317,7 +316,7 @@ class LanceDataset(Dataset):
         total = self._active_row_count()
         count = round(fraction * total)
         selection = LanceSelection(start=0, count=count, total=total, seed=seed)
-        return dataclass_replace(self, _selection=selection, _resume_state=None)
+        return dataclass_replace(self, _selection=selection, _pending_state=None)
 
     def resolve_ref(
         self,

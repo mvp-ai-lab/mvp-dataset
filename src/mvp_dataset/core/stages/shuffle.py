@@ -7,7 +7,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 
 from ..context import RuntimeContext
-from ..resume import ResumeStateError, stable_fingerprint
+from ..resume import ResumeStateError
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,15 +28,13 @@ class _ShuffleStage:
             rng=random.Random(runtime_context.sample_shuffle_seed),
         )
 
-    def fingerprint(self) -> str:
-        """Return a stable fingerprint for resume compatibility checks."""
-        return stable_fingerprint(
-            {
-                "kind": "shuffle",
-                "buffer_size": self.buffer_size,
-                "initial": self.initial,
-            }
-        )
+    def identity(self) -> dict[str, object]:
+        """Return a process-stable identity for this stage."""
+        return {
+            "kind": "shuffle",
+            "buffer_size": self.buffer_size,
+            "initial": self.initial,
+        }
 
 
 class _ShuffleStageIterator:
@@ -113,16 +111,6 @@ class _ShuffleStageIterator:
             raise ResumeStateError(msg) from error
         self.buffer = list(buffer)
         self.upstream_exhausted = upstream_exhausted
-
-    def fingerprint(self) -> str:
-        """Return a stable fingerprint for resume compatibility checks."""
-        return stable_fingerprint(
-            {
-                "kind": "shuffle",
-                "buffer_size": self.buffer_size,
-                "initial": self.initial_config,
-            }
-        )
 
     def _read_one(self) -> None:
         """Read one upstream item into the shuffle buffer if available."""

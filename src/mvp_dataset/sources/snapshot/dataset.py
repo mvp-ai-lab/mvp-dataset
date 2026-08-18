@@ -14,7 +14,7 @@ from mvp_dataset.cache import (
 )
 from mvp_dataset.core.context import RuntimeContext
 from mvp_dataset.core.dataset import Dataset
-from mvp_dataset.core.resume import stable_fingerprint
+from mvp_dataset.core.resume import digest
 from mvp_dataset.core.subset import split_offsets
 from mvp_dataset.core.types import FingerprintProvider
 from mvp_dataset.sources.lance.iterator import _LanceSourceIterator
@@ -65,7 +65,7 @@ class SnapshotDataset(Dataset):
         validate_finite_pipeline(upstream)
         identity_kind = "pipeline"
         if fingerprint_provider is None:
-            identity = upstream._pipeline_fingerprint()
+            identity = digest(upstream.identity())
         else:
             if not callable(fingerprint_provider):
                 msg = "[InvalidFingerprintProvider] fingerprint_provider must be callable"
@@ -116,13 +116,12 @@ class SnapshotDataset(Dataset):
                 resample=False,
                 columns=None,
                 read_batch_size=1024,
-                source_fingerprint=stable_fingerprint(self._source_fingerprint()),
                 shuffle_mode="none",
                 selection=self._resolve_selection(source.total_rows),
             )
         )
 
-    def _source_fingerprint(self) -> dict[str, object]:
+    def _source_identity(self) -> dict[str, object]:
         """Return the source portion of the pipeline fingerprint."""
         if self._snapshot_fingerprint is None:
             msg = "[InvalidSnapshotSource] snapshot fingerprint is missing"
@@ -148,7 +147,7 @@ class SnapshotDataset(Dataset):
             dataclass_replace(
                 self,
                 _snapshot_selection=_SnapshotSplitSelection(fractions=normalized, index=index),
-                _resume_state=None,
+                _pending_state=None,
             )
             for index in range(len(normalized))
         )
@@ -165,7 +164,7 @@ class SnapshotDataset(Dataset):
         return dataclass_replace(
             self,
             _snapshot_selection=_SnapshotSampleSelection(fraction=fraction, seed=seed),
-            _resume_state=None,
+            _pending_state=None,
         )
 
     def _resolve_selection(self, total_rows: int) -> LanceSelection | None:

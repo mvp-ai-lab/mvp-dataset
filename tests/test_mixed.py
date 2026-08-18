@@ -95,10 +95,10 @@ def test_mixed_source_resume_matches_continued_iteration(tmp_path) -> None:
     state = iterator.state_dict()
     continued = list(iterator)
 
-    with pytest.warns(UserWarning, match="Dataset.load_state_dict"):
-        resumed = dataset.load_state_dict(state)
+    dataset.load_state_dict(state)
+    resumed = list(dataset)
 
-    assert _ids(consumed + continued) == _ids(dataset)
+    assert _ids(consumed + continued) == _ids(_build_mixed_dataset(tmp_path))
     assert _ids(resumed) == _ids(continued)
 
 

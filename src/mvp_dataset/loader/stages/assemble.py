@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 
 from ...core import RuntimeContext
-from ...core.resume import UnsupportedResume, callable_fingerprint, stable_fingerprint
+from ...core.resume import UnsupportedResume, identity
 from ...core.stages import _AssembleStageIterator
 from ...core.types import Assembler, StatefulAssembler
 
@@ -33,20 +33,17 @@ class _LoaderAssembleStage:
         return _AssembleStageIterator(
             upstream=data,
             assembler=assembler,
-            factory=self.factory,
             drop_last=self.drop_last,
         )
 
-    def fingerprint(self) -> str:
-        """Return a stable fingerprint for resume compatibility checks."""
-        return stable_fingerprint(
-            {
-                "kind": self.kind,
-                "drop_last": self.drop_last,
-                "factory": callable_fingerprint(self.factory),
-                "assembler": self._build_assembler().fingerprint(),
-            }
-        )
+    def identity(self) -> dict[str, object]:
+        """Return a process-stable identity for this stage."""
+        return {
+            "kind": self.kind,
+            "drop_last": self.drop_last,
+            "factory": identity(self.factory),
+            "assembler": identity(self._build_assembler()),
+        }
 
     def _build_assembler(self) -> StatefulAssembler:
         """Build a stateful assembler for the loader stage."""

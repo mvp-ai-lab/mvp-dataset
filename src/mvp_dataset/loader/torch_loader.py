@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 import multiprocessing as mp
-import warnings
 from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
 from ..core import RuntimeContext
 from ..core.resume import (
-    RESUME_STATE_VERSION,
-    ResumeStateError,
-    StatefulStage,
     UnsupportedResume,
-    callable_fingerprint,
-    stable_fingerprint,
+    check_identity,
+    checkpoint_from_active_iter,
+    identity,
+    parse_checkpoint,
+    warn_if_iterator_replaced,
 )
 from ..core.torch_compat import TORCH_AVAILABLE, TorchDataLoader
 from ..core.types import Assembler
@@ -56,7 +55,7 @@ class TorchLoader:
         collate_fn: Callable[[list[object]], object] | None = None,
         drop_last: bool = False,
         _stages: tuple[LoaderStage, ...] | None = None,
-        _resume_state: dict[str, object] | None = None,
+        _pending_state: object | None = None,
         **loader_kwargs: Any,
     ) -> None:
         """Initialize a PyTorch-backed loader wrapper.
@@ -109,7 +108,8 @@ class TorchLoader:
         self._drop_last = drop_last
         self._loader_kwargs: dict[str, object] = dict(loader_kwargs)
         self._stages = tuple() if _stages is None else _stages
-        self._resume_state = _resume_state
+        self._pending_state = _pending_state
+        self._active_iter: object | None = None
 
     def _append_stage(self, stage: LoaderStage) -> TorchLoader:
         """Return a new loader with one additional post-merge stage.
@@ -133,7 +133,7 @@ class TorchLoader:
             collate_fn=self._collate_fn,
             drop_last=self._drop_last,
             _stages=self._stages + (stage,),
-            _resume_state=None,
+            _pending_state=None,
             **self._loader_kwargs,
         )
 
@@ -181,125 +181,59 @@ class TorchLoader:
     def _check_resume_supported(self) -> None:
         """Reject resume for unsupported loader configurations."""
         for index, stage in enumerate(self._stages):
-            if not hasattr(stage, "kind") or not hasattr(stage, "fingerprint"):
-                msg = f"[UnsupportedResume] loader stage index={index} is not resumable"
-                raise UnsupportedResume(msg)
+            if not hasattr(stage, "kind") or not hasattr(stage, "identity"):
+                raise UnsupportedResume(f"[UnsupportedResume] loader stage index={index} is not resumable")
 
-    def _stages_fingerprint(self) -> list[str]:
-        """Return the stage portion of the loader fingerprint."""
+    def identity(self) -> dict[str, object]:
+        """Return the process-stable identity of this loader configuration."""
         self._check_resume_supported()
-        return [stage.fingerprint() for stage in self._stages]
-
-    def _loader_fingerprint(self) -> str:
-        """Return a fingerprint for DataLoader-layer configuration."""
-        payload = {
-            "num_workers": self._num_workers,
-            "batch_size": self._batch_size,
-            "pin_memory": self._pin_memory,
-            "persistent_workers": self._persistent_workers,
-            "prefetch_factor": self._prefetch_factor,
-            "multiprocessing_context": self._multiprocessing_context,
-            "collate_fn": callable_fingerprint(self._collate_fn),
-            "drop_last": self._drop_last,
-            "loader_kwargs": repr(sorted(self._loader_kwargs.items())),
-            "stages": self._stages_fingerprint(),
+        dataset_identity_fn = getattr(self._dataset, "identity", None)
+        if not callable(dataset_identity_fn):
+            raise UnsupportedResume("[UnsupportedResume] TorchLoader dataset does not implement identity()")
+        dataset_identity = dataset_identity_fn()
+        if not isinstance(dataset_identity, dict):
+            raise UnsupportedResume("[UnsupportedResume] TorchLoader dataset identity() must return a mapping")
+        return {
+            "runtime": dataset_identity.get("runtime"),
+            "source": dataset_identity.get("source"),
+            "stages": dataset_identity.get("stages"),
+            "loader": {
+                "num_workers": self._num_workers,
+                "batch_size": self._batch_size,
+                "pin_memory": self._pin_memory,
+                "persistent_workers": self._persistent_workers,
+                "prefetch_factor": self._prefetch_factor,
+                "multiprocessing_context": self._multiprocessing_context,
+                "collate_fn": identity(self._collate_fn),
+                "drop_last": self._drop_last,
+                "loader_kwargs": identity(self._loader_kwargs),
+                "stages": [stage.identity() for stage in self._stages],
+            },
         }
-        return stable_fingerprint(payload)
 
     def state_dict(self) -> dict[str, object]:
-        """Return the initial resumable state without starting workers.
+        """Return identity plus the active iterator's live state, if any."""
+        return checkpoint_from_active_iter(self.identity(), self._active_iter)
 
-        Returns:
-            A dictionary that can be passed to load_state_dict()."""
-        warnings.warn(
-            "TorchLoader.state_dict() creates a fresh initial loader state. "
-            "Use iterator.state_dict() to checkpoint an in-progress iteration.",
-            UserWarning,
-            stacklevel=2,
-        )
-        return {
-            "version": RESUME_STATE_VERSION,
-            "loader_fingerprint": self._loader_fingerprint(),
-            "num_yielded": 0,
-            "next_worker": 0,
-            "workers": {},
-            "pending_outputs": {},
-            "stages": self._initial_stage_states(),
-        }
+    def load_state_dict(self, blob: dict[str, object]) -> None:
+        """Validate identity and stage pending live state on this loader."""
+        expected_identity, state = parse_checkpoint(blob)
+        check_identity(expected_identity, self.identity())
+        self._pending_state = state
 
-    def _initial_stage_states(self) -> list[dict[str, object]]:
-        """Return initial empty states for loader-side stages."""
-        stream: Iterable[object] = iter(())
-        stage_states: list[dict[str, object]] = []
-        for index, stage_factory in enumerate(self._stages):
-            stream = stage_factory(stream)
-            stage = stream if isinstance(stream, StatefulStage) else stage_factory
-            if not isinstance(stage, StatefulStage):
-                msg = f"[UnsupportedResume] loader stage kind={stage_factory.kind!r} index={index}"
-                raise UnsupportedResume(msg)
-            stage_states.append(
-                {
-                    "kind": stage_factory.kind,
-                    "fingerprint": stage.fingerprint(),
-                    "state": stage.state_dict(),
-                }
-            )
-        return stage_states
+    def load_live_state(self, state: object) -> None:
+        """Stage inner live state without an identity check."""
+        self._pending_state = state
 
-    def _validate_resume_state(self, state: dict[str, object]) -> None:
-        """Validate loader resume state and configuration fingerprints."""
-        self._check_resume_supported()
-        if not isinstance(state, dict):
-            msg = "[InvalidResumeState] state must be a dict"
-            raise ResumeStateError(msg)
-        version = state.get("version")
-        if version != RESUME_STATE_VERSION:
-            msg = f"[InvalidResumeStateVersion] expected={RESUME_STATE_VERSION} got={version!r}"
-            raise ResumeStateError(msg)
-        loader_fingerprint = state.get("loader_fingerprint")
-        if not isinstance(loader_fingerprint, str):
-            msg = "[InvalidResumeState] loader_fingerprint must be a string"
-            raise ResumeStateError(msg)
-        if loader_fingerprint != self._loader_fingerprint():
-            msg = "[ResumeLoaderMismatch] loader fingerprint does not match"
-            raise ResumeStateError(msg)
-        stages = state.get("stages")
-        if not isinstance(stages, list):
-            msg = "[InvalidResumeState] stages must be a list"
-            raise ResumeStateError(msg)
-        if len(stages) != len(self._stages):
-            msg = "[ResumeStageMismatch] loader stage count does not match"
-            raise ResumeStateError(msg)
+    def _peek_pending_state(self) -> object | None:
+        """Return pending live state without consuming it."""
+        return self._pending_state
 
-    def load_state_dict(self, state: dict[str, object]) -> TorchLoader:
-        """Return a loader with validated resume state attached.
-
-        Args:
-            state: Resume state dictionary to validate and load.
-
-        Returns:
-            None."""
-        self._validate_resume_state(state)
-        warnings.warn(
-            "TorchLoader.load_state_dict() stores pending resume state. "
-            "The state is applied when the returned loader is iterated.",
-            UserWarning,
-            stacklevel=2,
-        )
-        return TorchLoader(
-            self._dataset,
-            num_workers=self._num_workers,
-            batch_size=self._batch_size,
-            pin_memory=self._pin_memory,
-            persistent_workers=self._persistent_workers,
-            prefetch_factor=self._prefetch_factor,
-            multiprocessing_context=self._multiprocessing_context,
-            collate_fn=self._collate_fn,
-            drop_last=self._drop_last,
-            _stages=self._stages,
-            _resume_state=state,
-            **self._loader_kwargs,
-        )
+    def _take_pending_state(self) -> object | None:
+        """Return and clear pending live state."""
+        pending = self._pending_state
+        self._pending_state = None
+        return pending
 
     def _default_shuffle_seed(self) -> int:
         """Derive a deterministic shuffle seed from dataset runtime context.
@@ -452,4 +386,7 @@ class TorchLoader:
             stages have been applied in order.
         """
 
-        return _TorchLoaderIterator(self)
+        warn_if_iterator_replaced(self._active_iter)
+        iterator = _TorchLoaderIterator(self)
+        self._active_iter = iterator
+        return iterator

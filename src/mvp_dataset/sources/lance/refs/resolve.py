@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 
 from mvp_dataset.core.context import RuntimeContext
-from mvp_dataset.core.resume import ResumeStateError, stable_fingerprint
+from mvp_dataset.core.resume import ResumeStateError
 from mvp_dataset.core.types import Sample
 
 from ..order import map_global_indexes
@@ -193,19 +193,17 @@ class LanceRefResolverAssembler:
         self.batch = list(batch)
         self.queue_size = queue_size
 
-    def fingerprint(self) -> str:
-        """Return a stable fingerprint for resume compatibility checks."""
-        return stable_fingerprint(
-            {
-                "kind": "lance_ref_resolver",
-                "ref_names": list(self.ref_names),
-                "resolve_batch_size": self.config.resolve_batch_size,
-                "ref_index": {
-                    "build_strategy": self.config.index.build_strategy,
-                    "bucket_count": self.config.index.bucket_count,
-                },
-            }
-        )
+    def identity(self) -> dict[str, object]:
+        """Return a process-stable identity for this assembler."""
+        return {
+            "kind": "lance_ref_resolver",
+            "ref_names": list(self.ref_names),
+            "resolve_batch_size": self.config.resolve_batch_size,
+            "ref_index": {
+                "build_strategy": self.config.index.build_strategy,
+                "bucket_count": self.config.index.bucket_count,
+            },
+        }
 
     def _flush(self) -> Iterable[object]:
         """Resolve and emit pending reference samples."""

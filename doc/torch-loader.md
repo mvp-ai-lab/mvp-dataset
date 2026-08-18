@@ -102,11 +102,12 @@ it = iter(loader)
 batch = next(it)
 state = it.state_dict()
 
-resumed_loader = TorchLoader(dataset, num_workers=2, batch_size=4).load_state_dict(state)
+resumed_loader = TorchLoader(dataset, num_workers=2, batch_size=4)
+resumed_loader.load_state_dict(state)
 resumed_it = iter(resumed_loader)
 ```
 
-`TorchLoader.state_dict()` returns only an initial-state snapshot and emits a warning. It does not inspect an already-running iterator.
+`TorchLoader.state_dict()` saves the last `iter()` if it is still active; otherwise `state` is `None`. Pending state is consumed by the next `iter(...)` only.
 
 ## Practical Pattern
 

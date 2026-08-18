@@ -253,15 +253,8 @@ def test_lance_sample_resample_preserves_fixed_membership(tmp_path, shuffle_mode
     ).sample(0.25, seed=7)
 
     iterator = iter(sampled)
-    rounds = [
-        [int(normalize_sample(next(iterator))["value"]) for _ in range(25)]
-        for _ in range(3)
-    ]
-    expected = set(
-        _values(
-            Dataset.from_source("lance", shards=source, shuffle_mode="none").sample(0.25, seed=7)
-        )
-    )
+    rounds = [[int(normalize_sample(next(iterator))["value"]) for _ in range(25)] for _ in range(3)]
+    expected = set(_values(Dataset.from_source("lance", shards=source, shuffle_mode="none").sample(0.25, seed=7)))
 
     assert all(len(set(values)) == 25 for values in rounds)
     assert all(set(values) == expected for values in rounds)
@@ -311,11 +304,7 @@ def test_lance_filtered_sample_resample_preserves_fixed_membership(tmp_path) -> 
 def test_lance_sample_resample_distributed_rounds_match_fixed_subset(tmp_path, monkeypatch) -> None:
     records = build_records(count=100)
     source = _build_source(tmp_path, "lance", records)
-    expected = set(
-        _values(
-            Dataset.from_source("lance", shards=source, shuffle_mode="none").sample(0.4, seed=2)
-        )
-    )
+    expected = set(_values(Dataset.from_source("lance", shards=source, shuffle_mode="none").sample(0.4, seed=2)))
 
     def read_rank(rank: int) -> list[set[int]]:
         monkeypatch.setenv("WORLD_SIZE", "2")
@@ -328,10 +317,7 @@ def test_lance_sample_resample_distributed_rounds_match_fixed_subset(tmp_path, m
             shuffle_mode="global",
         ).sample(0.4, seed=2)
         iterator = iter(sampled)
-        return [
-            {int(normalize_sample(next(iterator))["value"]) for _ in range(20)}
-            for _ in range(2)
-        ]
+        return [{int(normalize_sample(next(iterator))["value"]) for _ in range(20)} for _ in range(2)]
 
     rank0 = read_rank(0)
     rank1 = read_rank(1)
@@ -358,7 +344,8 @@ def test_lance_sample_resample_resume_matches_continuation(tmp_path) -> None:
     state = iterator.state_dict()
     expected = [int(normalize_sample(next(iterator))["value"]) for _ in range(35)]
 
-    resumed = iter(sampled.load_state_dict(state))
+    sampled.load_state_dict(state)
+    resumed = iter(sampled)
     actual = [int(normalize_sample(next(resumed))["value"]) for _ in range(35)]
 
     assert actual == expected
@@ -372,8 +359,8 @@ def test_lance_split_resume_matches_continuation(tmp_path) -> None:
     consumed = [int(normalize_sample(next(iterator))["value"]) for _ in range(10)]
     state = iterator.state_dict()
 
-    resumed = train.load_state_dict(state)
-    remainder = _values(resumed)
+    train.load_state_dict(state)
+    remainder = _values(train)
 
     full = _values(train)
     assert consumed + remainder == full
