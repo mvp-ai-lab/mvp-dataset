@@ -50,9 +50,8 @@ class _ResumeMergeIterator:
                 self.next_worker = self._advance_worker(worker_id)
                 return item
 
-            if len(self.done) == self.num_workers and all(not buffer for buffer in self.buffers.values()):
-                raise StopIteration
-
+            # _WorkerDone precedes native DataLoader exhaustion; consume the
+            # native StopIteration so non-persistent workers are shut down.
             item = next(self.stream)
             if isinstance(item, _WorkerItem):
                 self.buffers[item.worker_id].append(item.item)
