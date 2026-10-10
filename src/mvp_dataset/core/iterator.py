@@ -67,16 +67,34 @@ class DatasetIterator:
 
     def live_state(self) -> dict[str, object]:
         """Return inner live state without the checkpoint envelope."""
-        stage_states: list[object] = []
-        for spec, stage in zip(self.dataset._stages, self.stages, strict=True):
-            if not isinstance(stage, Stateful):
-                raise UnsupportedResume(f"[UnsupportedResume] stage kind={spec.kind!r}")
-            stage_states.append(stage.state_dict())
-        return {
-            "num_yielded": self.num_yielded,
-            "source": self.source.state_dict(),
-            "stages": stage_states,
-        }
+        frozen = []
+        try:
+            # Quiesce downstream producers before reading any upstream cursor.
+            for stage in reversed(self.stages):
+                pause = getattr(stage, "pause_for_snapshot", None)
+                if pause is not None:
+                    pause()
+                    frozen.append(stage)
+            stage_states: list[object] = []
+            for spec, stage in zip(self.dataset._stages, self.stages, strict=True):
+                if not isinstance(stage, Stateful):
+                    raise UnsupportedResume(f"[UnsupportedResume] stage kind={spec.kind!r}")
+                stage_states.append(stage.state_dict())
+            return {
+                "num_yielded": self.num_yielded,
+                "source": self.source.state_dict(),
+                "stages": stage_states,
+            }
+        finally:
+            for stage in reversed(frozen):
+                stage.resume_after_snapshot()
+
+    def close(self) -> None:
+        """Stop any background stages when ending an iterator early."""
+        for stage in reversed(self.stages):
+            close = getattr(stage, "close", None)
+            if close is not None:
+                close()
 
     def load_state_dict(self, state: object) -> None:
         """Restore live source and stage state.
@@ -105,6 +123,10 @@ class DatasetIterator:
         if len(stages) != len(self.dataset._stages):
             raise ResumeStateError("[InvalidResumeState] stage count does not match")
 
+        for stage in reversed(self.stages):
+            stop = getattr(stage, "stop_for_restore", None)
+            if stop is not None:
+                stop()
         self.source.load_state_dict(source_state)
         self.num_yielded = num_yielded
         self._exhausted = False

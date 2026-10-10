@@ -22,6 +22,7 @@ from .stages import (
     _ShuffleStage,
     _UnbatchStage,
 )
+from .stages.prefetch import AssemblyPrefetch
 from .torch_compat import TorchIterableDataset
 from .types import Assembler, Consumer, FingerprintProvider, SourceKind, StageSpec
 
@@ -182,19 +183,22 @@ class Dataset(TorchIterableDataset):
         factory: Callable[[RuntimeContext], Assembler[object, object]],
         *,
         drop_last: bool = False,
+        prefetch: AssemblyPrefetch | None = None,
     ) -> Dataset:
         """Append a stateful assembly stage.
 
         Args:
             factory: Callable that builds a fresh assembler for the runtime context.
             drop_last: Whether to discard the final incomplete batch.
+            prefetch: Optional bounded background assembly. Upstream state must
+                support resume and be owned exclusively by this stage.
 
         Returns:
             A new object with the assemble stage appended."""
 
         spec = StageSpec(
             kind="assemble",
-            apply=_AssembleStage(factory=factory, context=self.context, drop_last=drop_last),
+            apply=_AssembleStage(factory=factory, context=self.context, drop_last=drop_last, prefetch=prefetch),
         )
         return self._append_stage(spec)
 

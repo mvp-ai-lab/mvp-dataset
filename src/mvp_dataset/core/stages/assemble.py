@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from ..context import RuntimeContext
 from ..resume import ResumeStateError, UnsupportedResume, identity
 from ..types import Assembler, StatefulAssembler
+from .prefetch import AssemblyPrefetch, _PrefetchAssembleIterator
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,6 +18,7 @@ class _AssembleStage:
     factory: Callable[[RuntimeContext], Assembler[object, object]]
     context: RuntimeContext
     drop_last: bool = False
+    prefetch: AssemblyPrefetch | None = None
 
     def __call__(self, data: Iterable[object]) -> Iterable[object]:
         """Apply this callable object."""
@@ -25,11 +27,12 @@ class _AssembleStage:
         if not isinstance(assembler, StatefulAssembler):
             msg = "[UnsupportedResume] stage kind='assemble' requires a stateful assembler"
             raise UnsupportedResume(msg)
-        return _AssembleStageIterator(
+        iterator = _AssembleStageIterator(
             upstream=data,
             assembler=assembler,
             drop_last=self.drop_last,
         )
+        return iterator if self.prefetch is None else _PrefetchAssembleIterator(iterator, self.prefetch)
 
     def identity(self) -> dict[str, object]:
         """Return a process-stable identity for this stage."""
