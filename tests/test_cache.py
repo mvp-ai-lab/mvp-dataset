@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import socket
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -76,7 +78,7 @@ def _hold_cache_lock_until_killed(cache_root: str, ready) -> None:
     if lease is None:
         ready.put(False)
         return
-    partial = entry.temporary_parent / "crashed-build"
+    partial = entry.temporary_parent / f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex}"
     partial.mkdir(parents=True)
     (partial / "partial.bin").write_bytes(b"partial")
     ready.put(True)
@@ -233,7 +235,7 @@ def test_cache_manager_recovers_lock_and_partial_directory_after_sigkill(tmp_pat
     )
 
     assert manager.is_valid(recovered)
-    assert not (entry.temporary_parent / "crashed-build").exists()
+    assert not any(entry.temporary_parent.glob(f"{socket.gethostname()}-{process.pid}-*"))
     assert entry.lock_path.is_file()
 
 
@@ -286,6 +288,71 @@ def test_cache_manager_serializes_concurrent_builds(tmp_path) -> None:
 
     assert entries[0].path == entries[1].path
     assert calls == 1
+
+
+def test_cache_manager_keeps_live_builders_when_locks_are_client_local(tmp_path, monkeypatch) -> None:
+    from mvp_dataset.cache import manager as cache_manager
+
+    # Separate NFS clients can both hold a client-local flock on this key.
+    monkeypatch.setattr(cache_manager.fcntl, "flock", lambda *_: None)
+    manager = CacheManager(_cache_config(tmp_path / "cache"))
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    first_written = threading.Event()
+
+    def first_build(root: Path) -> CacheBuildResult:
+        first_entered.set()
+        assert second_entered.wait(5)
+        try:
+            return _write_payload(root)
+        finally:
+            first_written.set()
+
+    def second_build(root: Path) -> CacheBuildResult:
+        second_entered.set()
+        assert first_written.wait(5)
+        return _write_payload(root)
+
+    def ensure(build):
+        return manager.ensure(source=_source(), kind="test-artifact", format_version=1, parameters={}, build=build)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(ensure, first_build)
+        assert first_entered.wait(5)
+        second = executor.submit(ensure, second_build)
+        entries = [first.result(timeout=10), second.result(timeout=10)]
+
+    assert entries[0].path == entries[1].path
+    assert all(manager.is_valid(entry) for entry in entries)
+    assert (entries[0].path / "payload.bin").read_bytes() == b"value"
+
+
+def test_temporary_cleanup_only_removes_proven_dead_local_builders(tmp_path, monkeypatch) -> None:
+    from mvp_dataset.cache import manager as cache_manager
+
+    manager = CacheManager(_cache_config(tmp_path / "cache"))
+    key = CacheKey.create(source_fingerprint=_source().value, kind="test-artifact", format_version=1, parameters={})
+    parent = manager.entry(key).temporary_parent
+    host = socket.gethostname()
+    names = {
+        "dead": f"{host}-424242-{uuid.uuid4().hex}",
+        "alive": f"{host}-{os.getpid()}-{uuid.uuid4().hex}",
+        "foreign": f"foreign-{host}-424242-{uuid.uuid4().hex}",
+        "unknown": "unrecognized-owner",
+    }
+    for name in names.values():
+        (parent / name).mkdir(parents=True)
+
+    def check_alive(pid, signal):
+        assert signal == 0
+        if pid == 424242:
+            raise ProcessLookupError
+        assert pid == os.getpid()
+
+    monkeypatch.setattr(cache_manager.os, "kill", check_alive)
+    manager._remove_temporary_directories(manager.entry(key))
+    assert not (parent / names["dead"]).exists()
+    assert all((parent / names[k]).is_dir() for k in ("alive", "foreign", "unknown"))
 
 
 def test_cache_manager_builds_parts_concurrently(tmp_path) -> None:

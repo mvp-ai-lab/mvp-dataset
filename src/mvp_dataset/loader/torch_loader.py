@@ -172,11 +172,9 @@ class TorchLoader:
         """Return the number of worker states expected for resume."""
         return max(1, self._num_workers)
 
-    def _multiprocessing_event(self) -> object:
-        """Create an event using the loader multiprocessing context."""
-        if self._multiprocessing_context is None:
-            return mp.Event()
-        return mp.get_context(self._multiprocessing_context).Event()
+    def _multiprocessing_snapshot_request(self) -> object:
+        """Share a snapshot generation; zero releases workers to produce data."""
+        return mp.get_context(self._multiprocessing_context).Value("q", 0)
 
     def _check_resume_supported(self) -> None:
         """Reject resume for unsupported loader configurations."""

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,11 +31,11 @@ class CacheConfig:
         if self.fingerprint_mode not in ("metadata", "content"):
             msg = f"[InvalidCacheFingerprintMode] mode={self.fingerprint_mode!r}"
             raise ValueError(msg)
-        if self.wait_timeout_seconds <= 0:
-            msg = "[InvalidCacheWaitTimeout] wait_timeout_seconds must be > 0"
+        if not math.isfinite(self.wait_timeout_seconds) or self.wait_timeout_seconds <= 0:
+            msg = "[InvalidCacheWaitTimeout] wait_timeout_seconds must be finite and > 0"
             raise ValueError(msg)
-        if self.poll_interval_seconds <= 0:
-            msg = "[InvalidCachePollInterval] poll_interval_seconds must be > 0"
+        if not math.isfinite(self.poll_interval_seconds) or self.poll_interval_seconds <= 0:
+            msg = "[InvalidCachePollInterval] poll_interval_seconds must be finite and > 0"
             raise ValueError(msg)
 
     @classmethod

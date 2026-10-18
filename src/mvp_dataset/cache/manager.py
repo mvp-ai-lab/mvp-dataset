@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import os
@@ -11,7 +12,7 @@ import socket
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, BinaryIO, cast, overload
 
@@ -233,7 +234,12 @@ class CacheManager:
         parts: Callable[[], Sequence[str]] | None = None,
         assigned_parts: Sequence[str] | None = None,
     ) -> CacheEntry:
-        """Return a valid entry using either one builder or distributed part builders."""
+        """Return a valid entry using either one builder or distributed part builders.
+
+        Existing publications get the configured visibility wait before corrupt
+        entries are rebuilt. Single-builder staging is reclaimed only after its
+        same-host owner has exited.
+        """
         key = CacheKey.create(
             source_fingerprint=source.value,
             kind=kind,
@@ -304,6 +310,8 @@ class CacheManager:
             attempt = self._ensure_partition_attempt(entry, partition_names, deadline)
             if attempt is None:
                 return entry
+            # Visibility checks may consume the initialization wait budget.
+            deadline = time.monotonic() + self.config.wait_timeout_seconds
             completed = self._run_partition_attempt(
                 entry,
                 attempt,
@@ -502,7 +510,8 @@ class CacheManager:
                 try:
                     if self.is_valid(entry):
                         return None
-                    self._discard_invalid_entry(entry)
+                    if self._existing_entry_is_valid(entry):
+                        return None
                     attempt = self._read_partition_attempt(entry, parts)
                     return attempt if attempt is not None else self._create_partition_attempt(entry, parts)
                 finally:
@@ -744,16 +753,7 @@ class CacheManager:
                 return None
             if not self._lock_is_owned(entry, lease):
                 return None
-            self._discard_invalid_entry(entry)
-            entry.path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                attempt.payload_path.replace(entry.path)
-            except OSError:
-                if not self.is_valid(entry):
-                    raise
-            if not self.is_valid(entry):
-                msg = f"[InvalidPublishedCache] cache publication failed validation at {entry.path}"
-                raise RuntimeError(msg)
+            self._publish_entry(entry, attempt.payload_path)
             if self._partition_attempt_is_active(entry, attempt):
                 remove_temporary_parent = True
             return entry
@@ -788,7 +788,8 @@ class CacheManager:
         build: Callable[[Path], CacheBuildResult],
         lease: _FileLease,
     ) -> CacheEntry:
-        self._discard_invalid_entry(entry)
+        if self._existing_entry_is_valid(entry):
+            return entry
         self._remove_temporary_directories(entry)
         entry.temporary_parent.mkdir(parents=True, exist_ok=True)
         temporary = entry.temporary_parent / f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex}"
@@ -813,35 +814,83 @@ class CacheManager:
                     return entry
                 msg = f"[CacheBuildLeaseLost] build lease was released for {entry.path}"
                 raise RuntimeError(msg)
-            entry.path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                temporary.replace(entry.path)
-            except OSError:
-                if not self.is_valid(entry):
-                    raise
-            if not self.is_valid(entry):
-                msg = f"[InvalidPublishedCache] cache publication failed validation at {entry.path}"
-                raise RuntimeError(msg)
+            self._publish_entry(entry, temporary)
             return entry
         finally:
             self._remove_path(temporary)
 
-    def _discard_invalid_entry(self, entry: CacheEntry) -> None:
-        if not entry.path.exists() or self.is_valid(entry):
-            return
-        entry.temporary_parent.mkdir(parents=True, exist_ok=True)
-        invalid_path = entry.temporary_parent / f"invalid-{uuid.uuid4().hex}"
+    def _wait_for_publication(self, entry: CacheEntry) -> bool:
+        # A rename can be visible before its children on another NFS client.
+        # Never quarantine an immutable publication on a transient stat miss.
+        deadline = time.monotonic() + self.config.wait_timeout_seconds
+        while not self.is_valid(entry):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(self.config.poll_interval_seconds, remaining))
+        return True
+
+    def _existing_entry_is_valid(self, entry: CacheEntry) -> bool:
         try:
-            entry.path.replace(invalid_path)
+            observed = entry.path.stat()
+        except FileNotFoundError:
+            return False
+        if self._wait_for_publication(entry):
+            return True
+        self._discard_invalid_entry(entry, observed)
+        return self.is_valid(entry)
+
+    def _discard_invalid_entry(self, entry: CacheEntry, observed: os.stat_result) -> None:
+        if self.is_valid(entry):
+            return
+        try:
+            if not os.path.samestat(observed, entry.path.stat()):
+                return
         except FileNotFoundError:
             return
-        self._remove_path(invalid_path)
+        entry.temporary_parent.mkdir(parents=True, exist_ok=True)
+        quarantined = replace(entry, path=entry.temporary_parent / f"invalid-{uuid.uuid4().hex}")
+        try:
+            entry.path.replace(quarantined.path)
+        except FileNotFoundError:
+            return
+        # A client-local lock cannot exclude a replacement between stat and
+        # rename. Restore a new or now-valid publication instead of deleting it.
+        if not os.path.samestat(observed, quarantined.path.stat()) or self.is_valid(quarantined):
+            self._publish_entry(entry, quarantined.path)
+            self._remove_path(quarantined.path)
+        else:
+            self._remove_path(quarantined.path)
+
+    def _publish_entry(self, entry: CacheEntry, temporary: Path) -> None:
+        entry.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            temporary.replace(entry.path)
+        except OSError as error:
+            # Some shared mounts provide only client-local flock. Atomic rename
+            # still selects a winner; a loser must validate that publication.
+            if error.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                raise
+        if not self._wait_for_publication(entry):
+            msg = f"[InvalidPublishedCache] cache publication failed validation at {entry.path}"
+            raise RuntimeError(msg)
 
     def _remove_temporary_directories(self, entry: CacheEntry) -> None:
         if not entry.temporary_parent.is_dir():
             return
+        prefix = f"{socket.gethostname()}-"
         for path in entry.temporary_parent.iterdir():
-            self._remove_path(path)
+            if not path.name.startswith(prefix):
+                continue
+            owner = path.name[len(prefix) :].split("-", 1)[0]
+            if not owner.isdigit() or int(owner) <= 0:
+                continue
+            try:
+                os.kill(int(owner), 0)
+            except ProcessLookupError:
+                self._remove_path(path)
+            except PermissionError:
+                pass
 
     @staticmethod
     def _remove_path(path: Path) -> None:

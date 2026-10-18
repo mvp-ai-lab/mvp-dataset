@@ -872,7 +872,7 @@ def test_torch_loader_resume_full_pipeline_matches_continued_stream(tmp_path, nu
 
 
 @pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
-def test_torch_loader_state_dict_is_initial_not_active_iterator_state(tmp_path) -> None:
+def test_torch_loader_state_dict_tracks_active_iterator_state(tmp_path) -> None:
     build_dataset = _source_factory(tmp_path, "jsonl", seed=43)
     loader = _resume_torch_loader(build_dataset(), num_workers=0, batch_size=None)
     iterator = iter(loader)
@@ -882,7 +882,13 @@ def test_torch_loader_state_dict_is_initial_not_active_iterator_state(tmp_path) 
     loader_state = loader.state_dict()
 
     assert iterator_state["state"]["num_yielded"] == 1
-    assert loader_state["state"] is None
+    assert loader_state["state"]["num_yielded"] == 1
+    remaining = _remaining(iterator)
+    for state in (iterator_state, loader_state):
+        restored = _resume_torch_loader(build_dataset(), num_workers=0, batch_size=None)
+        restored.load_state_dict(state)
+        assert _remaining(iter(restored)) == remaining
+    assert loader.state_dict()["state"] is None
 
 
 @pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
