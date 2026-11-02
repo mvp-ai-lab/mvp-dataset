@@ -73,6 +73,11 @@ class LanceDataset(Dataset):
                 ``uri``: reference Lance dataset URI, or a list of URIs.
                 ``key_column``: column in the reference dataset containing lookup keys.
                 ``value_column``: column in the reference dataset containing resolved values.
+                ``ref_locator``: optional dotted path saying where the main table records its keys,
+                whose first segment is the column, such as ``info.links.images.id``. A list on the way
+                is walked, so one row may yield several keys, and the column is left intact. Without
+                it the output column's own value is the key. The output column need not be a column of
+                the main table when a locator is given.
 
         Returns:
             A dataset configured for the requested source."""

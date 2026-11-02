@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import pickle
 
 import pytest
@@ -505,3 +506,149 @@ def test_lance_ref_index_rejects_removed_scope_config(tmp_path) -> None:
 
     with pytest.raises(ValueError, match=r"\[InvalidLanceRefIndexConfig\].*scope"):
         dataset.resolve_ref(["image_ref"], index={"scope": "shared"})
+
+
+@pytest.mark.parametrize("build_strategy", ["in_memory", "bucketed"])
+def test_lance_ref_locator_reads_nested_keys(tmp_path, build_strategy: str) -> None:
+    pytest.importorskip("lance")
+
+    main_records = [
+        {
+            "id": "sample-0",
+            "info": json.dumps({"links": {"images": [{"id": "img-0"}, {"id": "img-1"}]}}),
+        },
+        {"id": "sample-1", "info": json.dumps({"links": {"images": [{"id": "img-2"}]}})},
+        {"id": "sample-2", "info": json.dumps({"links": {}})},
+    ]
+    ref_records = [{"image_id": f"img-{index}", "image_value": f"resolved-{index}"} for index in range(3)]
+    main_path = write_lance_table(tmp_path, "main.lance", main_records)
+    ref_path = write_lance_table(tmp_path, "refs.lance", ref_records)
+
+    dataset = Dataset.from_source(
+        "lance",
+        shards=main_path,
+        ref_columns={
+            "images": {
+                "uri": ref_path,
+                "key_column": "image_id",
+                "value_column": "image_value",
+                "ref_locator": "info.links.images.id",
+            }
+        },
+    ).resolve_ref(["images"], index={"build_strategy": build_strategy, "bucket_count": 2})
+
+    observed = {sample["id"]: sample["images"] for sample in dataset}
+
+    assert observed["sample-0"] == ["resolved-0", "resolved-1"]
+    assert observed["sample-1"] == ["resolved-2"]
+    assert observed["sample-2"] == []
+
+
+def test_lance_ref_locator_leaves_the_key_column_intact(tmp_path) -> None:
+    pytest.importorskip("lance")
+
+    info = json.dumps({"links": {"images": [{"id": "img-0", "width": 64}]}})
+    main_path = write_lance_table(tmp_path, "main.lance", [{"id": "sample-0", "info": info}])
+    ref_path = write_lance_table(tmp_path, "refs.lance", [{"image_id": "img-0", "image_value": "resolved-0"}])
+
+    dataset = Dataset.from_source(
+        "lance",
+        shards=main_path,
+        ref_columns={
+            "images": {
+                "uri": ref_path,
+                "key_column": "image_id",
+                "value_column": "image_value",
+                "ref_locator": "info.links.images.id",
+            }
+        },
+    ).resolve_ref(["images"])
+
+    sample = next(iter(dataset))
+
+    assert sample["images"] == ["resolved-0"]
+    # The keys were read from `info`, so resolution must not overwrite what else it carries.
+    assert json.loads(sample["info"])["links"]["images"][0]["width"] == 64
+
+
+def test_lance_ref_locator_changes_the_index_fingerprint(tmp_path, monkeypatch) -> None:
+    pytest.importorskip("lance")
+
+    cache_dir = tmp_path / "cache"
+    monkeypatch.setenv("MVP_DATASET_CACHE_DIR", str(cache_dir))
+
+    main_records = [
+        {
+            "id": "sample-0",
+            "info": json.dumps({"a": [{"id": "img-0"}], "b": [{"id": "img-1"}]}),
+        }
+    ]
+    ref_records = [{"image_id": f"img-{index}", "image_value": f"resolved-{index}"} for index in range(2)]
+    main_path = write_lance_table(tmp_path, "main.lance", main_records)
+    ref_path = write_lance_table(tmp_path, "refs.lance", ref_records)
+
+    def resolved(ref_locator: str) -> object:
+        dataset = Dataset.from_source(
+            "lance",
+            shards=main_path,
+            ref_columns={
+                "images": {
+                    "uri": ref_path,
+                    "key_column": "image_id",
+                    "value_column": "image_value",
+                    "ref_locator": ref_locator,
+                }
+            },
+        ).resolve_ref(["images"])
+        return next(iter(dataset))["images"]
+
+    assert resolved("info.a.id") == ["resolved-0"]
+    # A different locator must not reuse the index cached for the first one.
+    assert resolved("info.b.id") == ["resolved-1"]
+    assert len(list(cache_dir.glob("*/lance-ref-index-v1/*"))) == 2
+
+
+def test_lance_ref_columns_reject_blank_ref_locator(tmp_path) -> None:
+    pytest.importorskip("lance")
+
+    main_path = write_lance_table(tmp_path, "main.lance", [{"id": "sample-0", "info": "{}"}])
+
+    with pytest.raises(ValueError, match=r"\[InvalidLanceRefColumn\].*ref_locator"):
+        Dataset.from_source(
+            "lance",
+            shards=main_path,
+            ref_columns={
+                "images": {
+                    "uri": main_path,
+                    "key_column": "id",
+                    "value_column": "info",
+                    "ref_locator": "",
+                }
+            },
+        )
+
+
+def test_lance_ref_locator_without_a_path_reads_the_column_whole(tmp_path) -> None:
+    pytest.importorskip("lance")
+
+    main_path = write_lance_table(tmp_path, "main.lance", [{"id": "sample-0", "refs": ["img-0", "img-1"]}])
+    ref_records = [{"image_id": f"img-{index}", "image_value": f"resolved-{index}"} for index in range(2)]
+    ref_path = write_lance_table(tmp_path, "refs.lance", ref_records)
+
+    dataset = Dataset.from_source(
+        "lance",
+        shards=main_path,
+        ref_columns={
+            "images": {
+                "uri": ref_path,
+                "key_column": "image_id",
+                "value_column": "image_value",
+                "ref_locator": "refs",
+            }
+        },
+    ).resolve_ref(["images"])
+
+    sample = next(iter(dataset))
+
+    assert sample["images"] == ["resolved-0", "resolved-1"]
+    assert sample["refs"] == ["img-0", "img-1"]
