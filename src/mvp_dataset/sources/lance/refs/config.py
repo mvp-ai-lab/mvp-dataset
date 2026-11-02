@@ -16,6 +16,8 @@ def parse_lance_ref_columns(ref_columns: object) -> tuple[LanceRefSpec, ...]:
     Args:
         ref_columns: Mapping from output column name to a config dict with ``uri``, ``key_column``, and
             ``value_column``. ``uri`` may be one reference Lance URI or a non-empty list of URIs.
+            ``ref_locator`` optionally says where the main table records its keys, as a dotted path
+            whose first segment is the column, for keys nested inside a JSON string or a struct.
 
     Returns:
         Normalized Lance reference specifications."""
@@ -53,12 +55,17 @@ def parse_lance_ref_columns(ref_columns: object) -> tuple[LanceRefSpec, ...]:
             msg = f"[InvalidLanceRefColumn] config for {column!r}.uri must be a string or list of strings"
             raise ValueError(msg)
 
+        if "ref_locator" in config and not (isinstance(config["ref_locator"], str) and config["ref_locator"]):
+            msg = f"[InvalidLanceRefColumn] config for {column!r}.ref_locator must be a non-empty string"
+            raise ValueError(msg)
+
         specs.append(
             LanceRefSpec(
                 column=column,
                 uri=uri,
                 key_column=str(config["key_column"]),
                 value_column=str(config["value_column"]),
+                ref_locator=config.get("ref_locator"),
             )
         )
     return tuple(specs)

@@ -92,8 +92,14 @@ def _apply_ref_columns(
                     resolved_values[sample_position][value_position] = row[ref.value_column]
 
         for sample, ref_row_indices, values in zip(batch, per_sample_row_indices, resolved_values, strict=True):
-            original_value = _get_ref_field(sample, ref.column)
-            is_multi_value = isinstance(original_value, (list, tuple, np.ndarray))
+            if ref.ref_locator is None:
+                # The values replace the keys in place, so the field's own shape says how many it holds.
+                original_value = _get_ref_field(sample, ref.column)
+                is_multi_value = isinstance(original_value, (list, tuple, np.ndarray))
+            else:
+                # A locator reads the keys from elsewhere, so the output field need not exist yet and
+                # its shape cannot be read. A locator selects a list of keys, so the field is a list.
+                is_multi_value = True
             if len(ref_row_indices) == 0:
                 _set_ref_field(sample, ref.column, [] if is_multi_value else None)
                 continue

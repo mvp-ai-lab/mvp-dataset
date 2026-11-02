@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +36,44 @@ def _iter_ref_keys(value: Any) -> tuple[Any, ...]:
     if isinstance(value, (list, tuple)):
         return tuple(item for item in value if item is not None)
     return (value,)
+
+
+def _walk_key_path(value: Any, path: Sequence[str]) -> tuple[Any, ...]:
+    """Yield the keys a dotted path selects, walking any list on the way."""
+    if value is None:
+        return ()
+    if isinstance(value, (list, tuple, np.ndarray)):
+        items = value.tolist() if isinstance(value, np.ndarray) else value
+        return tuple(key for item in items for key in _walk_key_path(item, path))
+    if not path:
+        return _iter_ref_keys(value)
+    if not isinstance(value, Mapping):
+        return ()
+    return _walk_key_path(value.get(path[0]), path[1:])
+
+
+def _row_ref_keys(value: Any, ref: LanceRefSpec) -> tuple[Any, ...]:
+    """Yield one row's reference keys, reading through ``ref_locator`` when it names a path."""
+    path = _locator_path(ref)
+    if not path:
+        return _iter_ref_keys(value)
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8")
+    if isinstance(value, str):
+        value = json.loads(value) if value.strip() else None
+    return _walk_key_path(value, path)
+
+
+def ref_key_column(ref: LanceRefSpec) -> str:
+    """Return the main-table column one ref reads its keys from."""
+    return (ref.ref_locator or ref.column).split(".")[0]
+
+
+def _locator_path(ref: LanceRefSpec) -> tuple[str, ...]:
+    """Return the path inside the key column, empty when the column's value is the key itself."""
+    if ref.ref_locator is None:
+        return ()
+    return tuple(ref.ref_locator.split(".")[1:])
 
 
 def _key_token(key: Any) -> str:
@@ -137,7 +175,7 @@ def _build_ref_index_in_memory(
         offsets_by_column[ref.column][0] = 0
 
     global_row_index = 0
-    main_columns = [ref.column for ref in active_refs]
+    main_columns = sorted({ref_key_column(ref) for ref in active_refs})
     for dataset in source.datasets:
         for batch in _iter_table_record_batches(
             lance.dataset(dataset.uri, version=dataset.version), columns=main_columns
@@ -145,7 +183,7 @@ def _build_ref_index_in_memory(
             for row in batch.to_pylist():
                 global_row_index += 1
                 for ref in active_refs:
-                    for key in _iter_ref_keys(row[ref.column]):
+                    for key in _row_ref_keys(row[ref_key_column(ref)], ref):
                         requested_positions[ref.column].setdefault(key, []).append(entry_counts[ref.column])
                         entry_counts[ref.column] += 1
                     offsets_by_column[ref.column][global_row_index] = entry_counts[ref.column]
@@ -218,7 +256,7 @@ def _build_ref_index_bucketed(
     main_writers = {ref.column: _BucketWriter(bucket_root / ref.column / "main") for ref in active_refs}
     try:
         global_row_index = 0
-        main_columns = [ref.column for ref in active_refs]
+        main_columns = sorted({ref_key_column(ref) for ref in active_refs})
         for dataset in source.datasets:
             for batch in _iter_table_record_batches(
                 lance.dataset(dataset.uri, version=dataset.version), columns=main_columns
@@ -226,7 +264,7 @@ def _build_ref_index_bucketed(
                 for row in batch.to_pylist():
                     global_row_index += 1
                     for ref in active_refs:
-                        for key in _iter_ref_keys(row[ref.column]):
+                        for key in _row_ref_keys(row[ref_key_column(ref)], ref):
                             key_token = _key_token(key)
                             bucket_id = _bucket_id_for_key_token(key_token, bucket_count=bucket_count)
                             main_writers[ref.column].write(
@@ -371,6 +409,9 @@ def prepare_ref_indexes(
                 "ref_dataset": _ref_manifest_fingerprint(ref),
                 "key_column": ref.key_column,
                 "value_column": ref.value_column,
+                # It changes which keys a row yields, so a cached index built under one locator must
+                # not be reused under another.
+                "ref_locator": ref.ref_locator,
             }
             for ref in active_refs
         },
@@ -428,6 +469,7 @@ def prepare_ref_indexes(
                 uri=ref.uri,
                 key_column=ref.key_column,
                 value_column=ref.value_column,
+                ref_locator=ref.ref_locator,
                 datasets=ref.datasets,
                 index_uri=str(index_dir),
                 index_offsets_path=str(offsets_path),

@@ -32,12 +32,25 @@ class LanceFilterIndex:
 
 @dataclass(frozen=True, slots=True)
 class LanceRefSpec:
-    """Configuration for one Lance reference column."""
+    """Configuration for one Lance reference column.
+
+    Attributes:
+        column: Field the resolved values are written to. It need not be a column of the main table.
+        uri: Reference dataset URI, or several read as one merged row space.
+        key_column: Key column of the reference dataset.
+        value_column: Value column of the reference dataset.
+        ref_locator: Where the main table records its keys, as a dotted path whose first segment is
+            the column, such as ``info.links.images.id``. A list on the way is walked, so one row may
+            yield several keys, and the column itself is left intact so it can keep carrying whatever
+            else it holds. Defaults to ``column``, taken whole: the case where a row names its
+            references in the same field the resolved values replace.
+    """
 
     column: str
     uri: str | tuple[str, ...]
     key_column: str
     value_column: str
+    ref_locator: str | None = None
     datasets: tuple[LanceDatasetSpec, ...] = ()
     index_uri: str | None = None
     index_offsets_path: str | None = None
